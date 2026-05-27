@@ -1320,6 +1320,266 @@ function CardModal({ mode, card, employees, onClose, onSaved, showToast }) {
   );
 }
 
+// ── Trucks (standalone module) ────────────────────────────────────────────────
+function TrucksPage({ user, employees, setEmployees, trucks, setTrucks, showToast }) {
+  const [truckModalOpen, setTruckModalOpen] = useState(false);
+  const [truckEditing, setTruckEditing] = useState(null);
+  const [truckBranch, setTruckBranch] = useState(user.branch === "All" || ["super_admin","manager"].includes(user.access_level) ? "All" : user.branch);
+  const [q, setQ] = useState("");
+
+  async function reloadTrucks() {
+    try {
+      const t = await sb("trucks", "?select=*,assigned_employee:employees(name)&order=truck_number");
+      setTrucks(t);
+      const e = await sb("employees", "?select=*&order=name");
+      setEmployees(e);
+    } catch (err) { showToast("Error refreshing: " + (err.message || err), "error"); }
+  }
+
+  async function removeTruck(t) {
+    if (!window.confirm(`Remove truck ${t.truck_number} (${t.year || ""} ${t.make || ""} ${t.model || ""})? This cannot be undone.`)) return;
+    try {
+      const driver = employees.find(e => e.truck_id === t.id);
+      if (driver) await sbPatch("employees", driver.id, { truck_id: null });
+      await sbDelete("trucks", t.id);
+      showToast("Truck removed");
+      reloadTrucks();
+    } catch (err) { showToast("Error removing truck: " + (err.message || err), "error"); }
+  }
+
+  const filtered = trucks.filter(t =>
+    (truckBranch === "All" || t.branch === truckBranch) &&
+    (!q ||
+      t.truck_number?.toString().toLowerCase().includes(q.toLowerCase()) ||
+      t.plate?.toLowerCase().includes(q.toLowerCase()) ||
+      t.vin?.toLowerCase().includes(q.toLowerCase()) ||
+      t.assigned_employee?.name?.toLowerCase().includes(q.toLowerCase()))
+  );
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+        <select className="branch-select" value={truckBranch} onChange={e=>setTruckBranch(e.target.value)}>
+          <option value="All">All branches ({trucks.length})</option>
+          {["DFW","OKC","ATX","CStat","Office"].map(b => (
+            <option key={b} value={b}>{b} ({trucks.filter(t => t.branch === b).length})</option>
+          ))}
+        </select>
+        <div style={{flex:1,minWidth:200,display:"flex",alignItems:"center",gap:8,background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:"6px 11px"}}>
+          <span style={{color:"#4A5568"}}>⌕</span>
+          <input style={{background:"none",border:"none",outline:"none",color:"#E8EDF5",fontSize:13,flex:1,fontFamily:"DM Sans,sans-serif"}} placeholder="Search by truck number, plate, VIN, or driver..." value={q} onChange={e=>setQ(e.target.value)} />
+        </div>
+        <Btn variant="primary" onClick={() => { setTruckEditing(null); setTruckModalOpen(true); }}>
+          + New truck
+        </Btn>
+      </div>
+      <div className="table-wrap">
+        <div className="table-head"><span className="table-title">Fleet ({filtered.length} trucks)</span></div>
+        <table>
+          <thead><tr><th>Truck #</th><th>Year/Make/Model</th><th>VIN</th><th>Plate</th><th>Branch</th><th>Driver</th><th>Actions</th></tr></thead>
+          <tbody>
+            {filtered.length === 0 ? (
+              <tr><td colSpan={7}><div className="empty-state">No trucks {truckBranch === "All" ? "added yet" : "for this branch"} — click "+ New truck" to add one</div></td></tr>
+            ) : filtered.map(t => (
+              <tr key={t.id}>
+                <td><strong>{t.truck_number}</strong></td>
+                <td>{[t.year, t.make, t.model].filter(Boolean).join(" ") || <span style={{color:"#8A95A8"}}>—</span>}</td>
+                <td style={{fontFamily:"monospace",fontSize:11}}>{t.vin || <span style={{color:"#8A95A8"}}>—</span>}</td>
+                <td style={{fontFamily:"monospace"}}>{t.plate || <span style={{color:"#8A95A8"}}>—</span>}</td>
+                <td>{t.branch}</td>
+                <td>{t.assigned_employee?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
+                <td>
+                  <div style={{display:"flex",gap:6}}>
+                    <Btn onClick={() => { setTruckEditing(t); setTruckModalOpen(true); }}>Edit</Btn>
+                    <Btn variant="red" onClick={() => removeTruck(t)}>Remove</Btn>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {truckModalOpen && (
+        <NewTruckModal
+          employees={employees}
+          trucks={trucks}
+          editing={truckEditing}
+          onClose={() => { setTruckModalOpen(false); setTruckEditing(null); }}
+          onSaved={reloadTrucks}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Credit Cards (standalone module) ──────────────────────────────────────────
+function CardsPage({ user, employees, showToast }) {
+  const [cardsTab, setCardsTab] = useState("assigned");
+  const [creditCards, setCreditCards] = useState([]);
+  const [cardInventory, setCardInventory] = useState([]);
+  const [cardsLoaded, setCardsLoaded] = useState(false);
+  const [cardModal, setCardModal] = useState(null);
+  const [cardProgFilter, setCardProgFilter] = useState("All");
+  const [cardSearch, setCardSearch] = useState("");
+
+  async function loadCards() {
+    try {
+      const [cc, inv] = await Promise.all([
+        sb("credit_cards", "?select=*&order=assigned_to"),
+        sb("card_inventory", "?select=*&order=name_on_card")
+      ]);
+      setCreditCards(cc);
+      setCardInventory(inv);
+      setCardsLoaded(true);
+    } catch (err) {
+      showToast("Error loading cards: " + (err.message || err), "error");
+      setCardsLoaded(true);
+    }
+  }
+
+  useEffect(() => { loadCards(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function removeCard(c, table) {
+    if (!window.confirm(`Remove this ${table === "credit_cards" ? "assigned card" : "inventory card"}? This cannot be undone.`)) return;
+    try {
+      await sbDelete(table, c.id);
+      showToast("Card removed");
+      loadCards();
+    } catch (err) { showToast("Error removing card: " + (err.message || err), "error"); }
+  }
+
+  async function moveCardToInventory(c) {
+    if (!window.confirm(`Move ${c.assigned_to}'s card (${c.name_on_card}${c.last4 ? " ••••" + c.last4 : ""}) to inventory?`)) return;
+    try {
+      await sbPost("card_inventory", { name_on_card: c.name_on_card, last4: c.last4, program: c.program, notes: c.notes });
+      await sbDelete("credit_cards", c.id);
+      showToast("Card moved to inventory");
+      loadCards();
+    } catch (err) { showToast("Error moving card: " + (err.message || err), "error"); }
+  }
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        💳 Credit cards are visible to managers and leads only. {creditCards.length} assigned · {cardInventory.length} in inventory.
+      </div>
+      <div className="tabs" style={{marginBottom:14}}>
+        {[["assigned",`Assigned (${creditCards.length})`],["inventory",`Inventory (${cardInventory.length})`]].map(([t,l]) => (
+          <button key={t} className={"tab-btn"+(cardsTab===t?" active":"")} onClick={()=>setCardsTab(t)}>{l}</button>
+        ))}
+      </div>
+
+      {!cardsLoaded ? (
+        <div className="loading">Loading cards...</div>
+      ) : cardsTab === "assigned" ? (
+        <div>
+          <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+            <div style={{flex:1,minWidth:180,display:"flex",alignItems:"center",gap:8,background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:"6px 11px"}}>
+              <span style={{color:"#4A5568"}}>⌕</span>
+              <input style={{background:"none",border:"none",outline:"none",color:"#E8EDF5",fontSize:13,flex:1,fontFamily:"DM Sans,sans-serif"}} placeholder="Search by name or last 4..." value={cardSearch} onChange={e=>setCardSearch(e.target.value)} />
+            </div>
+            <select className="branch-select" value={cardProgFilter} onChange={e=>setCardProgFilter(e.target.value)}>
+              <option value="All">All programs</option>
+              <option value="Capital One">Capital One</option>
+              <option value="BILL Spend & Expense">BILL Spend & Expense</option>
+            </select>
+            <Btn variant="primary" onClick={() => setCardModal({ mode: "add-assigned", card: null })}>+ Add card</Btn>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Assigned to</th><th>Name on card</th><th>Last 4</th><th>Program</th><th>Notes</th><th>Actions</th></tr></thead>
+              <tbody>
+                {(() => {
+                  const filtered = creditCards.filter(c =>
+                    (cardProgFilter === "All" || c.program === cardProgFilter) &&
+                    (!cardSearch ||
+                      c.assigned_to?.toLowerCase().includes(cardSearch.toLowerCase()) ||
+                      c.name_on_card?.toLowerCase().includes(cardSearch.toLowerCase()) ||
+                      c.last4?.includes(cardSearch))
+                  );
+                  if (filtered.length === 0) return (
+                    <tr><td colSpan={6}><div className="empty-state">No cards match the current filters</div></td></tr>
+                  );
+                  return filtered.map(c => (
+                    <tr key={c.id}>
+                      <td><strong>{c.assigned_to}</strong></td>
+                      <td>{c.name_on_card}</td>
+                      <td style={{fontFamily:"monospace"}}>{c.last4 ? "•••• " + c.last4 : <span style={{color:"#EF4444"}}>missing</span>}</td>
+                      <td><Badge color={c.program === "Capital One" ? "blue" : "purple"}>{c.program}</Badge></td>
+                      <td style={{fontSize:11,color:"#8A95A8"}}>{c.notes || "—"}</td>
+                      <td>
+                        <div style={{display:"flex",gap:6}}>
+                          <Btn onClick={() => setCardModal({ mode: "edit-assigned", card: c })}>Edit</Btn>
+                          <Btn onClick={() => moveCardToInventory(c)}>→ Inventory</Btn>
+                          <Btn variant="red" onClick={() => removeCard(c, "credit_cards")}>Remove</Btn>
+                        </div>
+                      </td>
+                    </tr>
+                  ));
+                })()}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+            <div style={{flex:1,minWidth:180,display:"flex",alignItems:"center",gap:8,background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:"6px 11px"}}>
+              <span style={{color:"#4A5568"}}>⌕</span>
+              <input style={{background:"none",border:"none",outline:"none",color:"#E8EDF5",fontSize:13,flex:1,fontFamily:"DM Sans,sans-serif"}} placeholder="Search inventory..." value={cardSearch} onChange={e=>setCardSearch(e.target.value)} />
+            </div>
+            <Btn variant="primary" onClick={() => setCardModal({ mode: "add-inventory", card: null })}>+ Add to inventory</Btn>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Name on card</th><th>Last 4</th><th>Program</th><th>Notes</th><th>Actions</th></tr></thead>
+              <tbody>
+                {(() => {
+                  const filtered = cardInventory.filter(c =>
+                    !cardSearch ||
+                    c.name_on_card?.toLowerCase().includes(cardSearch.toLowerCase()) ||
+                    c.last4?.includes(cardSearch)
+                  );
+                  if (filtered.length === 0) return (
+                    <tr><td colSpan={5}><div className="empty-state">Inventory is empty</div></td></tr>
+                  );
+                  return filtered.map(c => (
+                    <tr key={c.id}>
+                      <td><strong>{c.name_on_card}</strong></td>
+                      <td style={{fontFamily:"monospace"}}>{c.last4 ? "•••• " + c.last4 : <span style={{color:"#EF4444"}}>missing</span>}</td>
+                      <td><Badge color={c.program === "Capital One" ? "blue" : "purple"}>{c.program}</Badge></td>
+                      <td style={{fontSize:11,color:"#8A95A8"}}>{c.notes || "—"}</td>
+                      <td>
+                        <div style={{display:"flex",gap:6}}>
+                          <Btn variant="primary" onClick={() => setCardModal({ mode: "assign-from-inventory", card: c })}>Assign to person</Btn>
+                          <Btn onClick={() => setCardModal({ mode: "edit-inventory", card: c })}>Edit</Btn>
+                          <Btn variant="red" onClick={() => removeCard(c, "card_inventory")}>Remove</Btn>
+                        </div>
+                      </td>
+                    </tr>
+                  ));
+                })()}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {cardModal && (
+        <CardModal
+          mode={cardModal.mode}
+          card={cardModal.card}
+          employees={employees}
+          onClose={() => setCardModal(null)}
+          onSaved={loadCards}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 function Settings({ user, employees, setEmployees, products, setProducts, trucks, setTrucks, showToast }) {
   const [tab, setTab] = useState("users");
@@ -1454,7 +1714,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
   return (
     <div>
       <div className="tabs">
-        {[["users","Users & PINs"],["products","Products"],["employees","Employees"],["trucks","Trucks"],["cards","Cards"]].map(([t,l]) => (
+        {[["users","Users & PINs"],["products","Products"],["employees","Employees"]].map(([t,l]) => (
           <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
         ))}
       </div>
@@ -1869,7 +2129,7 @@ export default function App() {
 
   const isManager = currentUser && ["super_admin","manager","lead"].includes(currentUser.access_level);
   const isSuperAdmin = currentUser && ["super_admin"].includes(currentUser.access_level);
-  const MANAGER_PAGES = ["home","people","hr","fleet","slack","settings"];
+  const MANAGER_PAGES = ["home","people","hr","fleet","trucks","cards","slack","settings"];
 
   function navItem(id, label, icon, badge) {
     if (!currentUser) return null;
@@ -1883,7 +2143,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",fleet:"Fleet",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",fleet:"Fleet",trucks:"Trucks",cards:"Credit Cards",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -1905,6 +2165,8 @@ export default function App() {
               {navItem("timeoff","Time Off & Callouts","◈")}
               {navItem("inventory","Inventory","◧")}
               {navItem("fleet","Fleet","◉")}
+              {navItem("trucks","Trucks","◐")}
+              {navItem("cards","Credit Cards","◆")}
             </div>
             {isManager && <div className="sb-section"><div className="sb-section-label">Comms & Admin</div>{navItem("slack","Slack Alerts","◫")}{navItem("settings","Settings","⚙")}</div>}
             <div className="sb-footer">
@@ -1931,6 +2193,8 @@ export default function App() {
             {page === "timeoff" && <TimeOff user={currentUser} employees={employees} showToast={showToast} />}
             {page === "inventory" && <Inventory user={currentUser} products={products} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
+            {dataLoaded && page === "trucks" && <TrucksPage user={currentUser} employees={employees} setEmployees={setEmployees} trucks={trucks} setTrucks={setTrucks} showToast={showToast} />}
+            {dataLoaded && page === "cards" && <CardsPage user={currentUser} employees={employees} showToast={showToast} />}
             {page === "slack" && (
               <div className="table-wrap">
                 <div className="table-head"><span className="table-title">Slack integration</span><Btn variant="primary">Send alerts now</Btn></div>
