@@ -1079,6 +1079,530 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
   );
 }
 
+// ── Inspections (standalone module) ───────────────────────────────────────────
+function InspectionsPage({ user, trucks, employees, showToast }) {
+  const [inspections, setInspections] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modalTruck, setModalTruck] = useState(null);
+  const [branch, setBranch] = useState(user.branch === "All" || ["super_admin","manager"].includes(user.access_level) ? "All" : user.branch);
+  const [q, setQ] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all"); // all | pass | fail | needs-inspection
+
+  const canInspect = ["super_admin","manager","lead"].includes(user.access_level);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await sb("inspections", "?select=*,truck:trucks(truck_number,branch,year,make,model,plate,vin,assigned_employee:employees(name))&order=inspected_at.desc");
+      setInspections(data);
+    } catch (err) { showToast("Error loading inspections: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+
+  useEffect(() => { load(); }, []); // eslint-disable-line
+
+  // Build latest-per-truck map
+  const latestByTruck = {};
+  for (const i of inspections) {
+    if (!i.truck_id) continue;
+    if (!latestByTruck[i.truck_id] || new Date(i.inspected_at) > new Date(latestByTruck[i.truck_id].inspected_at)) {
+      latestByTruck[i.truck_id] = i;
+    }
+  }
+
+  const branchTrucks = trucks.filter(t => branch === "All" || t.branch === branch);
+
+  const filteredTrucks = branchTrucks.filter(t => {
+    const latest = latestByTruck[t.id];
+    if (statusFilter === "pass" && !(latest && latest.overall_status === "PASS")) return false;
+    if (statusFilter === "fail" && !(latest && latest.fail_count > 0)) return false;
+    if (statusFilter === "needs-inspection" && latest) return false;
+    if (q) {
+      const hay = `${t.truck_number} ${t.plate} ${t.year} ${t.make} ${t.model} ${t.assigned_employee?.name || ""}`.toLowerCase();
+      if (!hay.includes(q.toLowerCase())) return false;
+    }
+    return true;
+  });
+
+  const stats = {
+    total: branchTrucks.length,
+    needsInspection: branchTrucks.filter(t => !latestByTruck[t.id]).length,
+    failing: branchTrucks.filter(t => { const l = latestByTruck[t.id]; return l && l.fail_count > 0; }).length,
+    passing: branchTrucks.filter(t => { const l = latestByTruck[t.id]; return l && l.overall_status === "PASS"; }).length,
+  };
+
+  return (
+    <div>
+      {!canInspect && (
+        <div className="alert blue" style={{marginBottom:14}}>
+          ℹ Only managers, leads, and super admins can perform truck inspections. You can view inspection history below.
+        </div>
+      )}
+
+      <BranchBar value={branch} onChange={setBranch} disabled={user.access_level === "employee"} />
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:14}}>
+        <KpiTile label="Total trucks" value={stats.total} color="#3B82F6" />
+        <KpiTile label="No inspection" value={stats.needsInspection} color="#F59E0B" />
+        <KpiTile label="Failing" value={stats.failing} color="#EF4444" />
+        <KpiTile label="Passing" value={stats.passing} color="#22C55E" />
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+        <div style={{flex:1,minWidth:180,display:"flex",alignItems:"center",gap:8,background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:"6px 11px"}}>
+          <span style={{color:"#4A5568"}}>⌕</span>
+          <input style={{background:"none",border:"none",outline:"none",color:"#E8EDF5",fontSize:13,flex:1,fontFamily:"DM Sans,sans-serif"}} placeholder="Search by truck #, plate, or driver..." value={q} onChange={e=>setQ(e.target.value)} />
+        </div>
+        <select className="branch-select" value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}>
+          <option value="all">All status</option>
+          <option value="needs-inspection">No inspection on file</option>
+          <option value="fail">Latest = FAIL</option>
+          <option value="pass">Latest = PASS</option>
+        </select>
+      </div>
+
+      {loading ? (
+        <div className="loading">Loading inspections...</div>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Truck</th><th>Driver</th><th>Branch</th><th>Last inspected</th><th>Inspector</th><th>Status</th><th>Issues</th><th>Actions</th></tr></thead>
+            <tbody>
+              {filteredTrucks.length === 0 ? (
+                <tr><td colSpan={8}><div className="empty-state">No trucks match the filters</div></td></tr>
+              ) : filteredTrucks.map(t => {
+                const latest = latestByTruck[t.id];
+                const dot = !latest ? "#F59E0B" : latest.fail_count > 0 ? "#EF4444" : "#22C55E";
+                return (
+                  <tr key={t.id}>
+                    <td><div style={{display:"flex",alignItems:"center",gap:7}}><div style={{width:8,height:8,borderRadius:"50%",background:dot,flexShrink:0}} /><strong>{t.truck_number}</strong> <span style={{color:"#8A95A8",fontSize:11}}>{t.year} {t.make} {t.model}</span></div></td>
+                    <td>{t.assigned_employee?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
+                    <td>{t.branch}</td>
+                    <td style={{fontSize:12}}>{latest ? new Date(latest.inspected_at).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : <span style={{color:"#F59E0B"}}>Never</span>}</td>
+                    <td style={{fontSize:12}}>{latest?.inspector_name || "—"}</td>
+                    <td>{latest ? <Badge color={latest.fail_count > 0 ? "red" : "green"}>{latest.overall_status}</Badge> : <Badge color="amber">No inspection</Badge>}</td>
+                    <td style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>{latest?.notes || "—"}</td>
+                    <td>
+                      {canInspect && (
+                        <Btn variant="primary" onClick={() => setModalTruck(t)}>
+                          {latest ? "Re-inspect" : "Start inspection"}
+                        </Btn>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {modalTruck && (
+        <InspectionModal
+          truck={modalTruck}
+          user={user}
+          employees={employees}
+          onClose={() => setModalTruck(null)}
+          onSaved={() => { load(); setModalTruck(null); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function KpiTile({ label, value, color }) {
+  return (
+    <div style={{background:"#1E2535",border:"1px solid #2A3348",borderRadius:8,padding:"12px 14px"}}>
+      <div style={{fontSize:11,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>{label}</div>
+      <div style={{fontSize:22,fontWeight:600,color}}>{value}</div>
+    </div>
+  );
+}
+
+// ── Inspection Modal (the form leads/managers fill out) ───────────────────────
+function InspectionModal({ truck, user, employees, onClose, onSaved, showToast }) {
+  const [template, setTemplate] = useState([]);
+  const [loadingTpl, setLoadingTpl] = useState(true);
+  const [form, setForm] = useState({
+    service_line: "",
+    inspection_mileage: "",
+    next_oil_change: "",
+    registration_current: "yes",
+    registration_expires: truck.reg_expires || "",
+    notes: "",
+    results: {} // {key: "pass" | "fail"}
+  });
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    sb("inspection_template", "?select=*&active=eq.true&order=display_order")
+      .then(t => { setTemplate(t); setLoadingTpl(false); })
+      .catch(err => { showToast("Error loading template: " + (err.message || err), "error"); setLoadingTpl(false); });
+  }, []); // eslint-disable-line
+
+  function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+  function setResult(key, value) {
+    setForm(prev => ({ ...prev, results: { ...prev.results, [key]: value } }));
+  }
+
+  async function save() {
+    if (!form.inspection_mileage) { showToast("Current mileage is required", "error"); return; }
+    if (!form.next_oil_change.trim()) { showToast("Next oil change info is required", "error"); return; }
+    // Verify all required items have a result
+    const missing = template.filter(t => t.required && !form.results[t.key]);
+    if (missing.length > 0) {
+      showToast(`Missing: ${missing.map(m => m.label).join(", ")}`, "error");
+      return;
+    }
+    setSaving(true);
+    try {
+      const failCount = Object.values(form.results).filter(v => v === "fail").length;
+      const payload = {
+        truck_id: truck.id,
+        inspector_id: user.id,
+        inspector_name: user.name,
+        service_line: form.service_line || null,
+        inspection_mileage: parseInt(form.inspection_mileage, 10),
+        next_oil_change: form.next_oil_change.trim(),
+        registration_current: form.registration_current === "yes",
+        registration_expires: form.registration_expires || null,
+        results: form.results,
+        notes: form.notes.trim() || null,
+        overall_status: failCount > 0 ? `FAIL (${failCount})` : "PASS",
+        fail_count: failCount
+      };
+      await sbPost("inspections", payload);
+      // Also update the truck mileage if higher than current
+      if (parseInt(form.inspection_mileage, 10) > (truck.mileage || 0)) {
+        await sbPatch("trucks", truck.id, {
+          mileage: parseInt(form.inspection_mileage, 10),
+          mileage_reading_date: new Date().toISOString().slice(0,10)
+        });
+      }
+      showToast(`Inspection saved · ${payload.overall_status}`, failCount > 0 ? "error" : "success");
+      onSaved();
+    } catch (err) {
+      showToast("Error saving inspection: " + (err.message || err), "error");
+    }
+    setSaving(false);
+  }
+
+  // Group template items by category
+  const categories = {};
+  for (const item of template) {
+    if (!categories[item.category]) categories[item.category] = [];
+    categories[item.category].push(item);
+  }
+  const catLabels = {
+    safety: "Safety",
+    cleanliness: "Cleanliness",
+    gear: "Gear & Equipment",
+    documentation: "Documentation"
+  };
+  const catOrder = ["safety", "cleanliness", "gear", "documentation"];
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:640, maxHeight:"90vh", overflowY:"auto"}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">Truck Inspection — #{truck.truck_number}</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+              {truck.year} {truck.make} {truck.model} · Plate {truck.plate} · Driver: {truck.assigned_employee?.name || "Unassigned"}
+            </div>
+            <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
+              Inspector: <strong style={{color:"#E8EDF5"}}>{user.name}</strong>
+            </div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          {loadingTpl ? <div className="loading">Loading inspection form...</div> : (
+            <>
+              <div className="form-group">
+                <label className="form-label">Service line</label>
+                <select className="form-input" value={form.service_line}
+                  onChange={e => update("service_line", e.target.value)}>
+                  <option value="">— Select —</option>
+                  <option value="Wildlife">Wildlife</option>
+                  <option value="Pest">Pest</option>
+                  <option value="Insulation">Insulation</option>
+                  <option value="All 3">All 3</option>
+                </select>
+              </div>
+
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Current mileage *</label>
+                  <input className="form-input" type="number" value={form.inspection_mileage}
+                    onChange={e => update("inspection_mileage", e.target.value)}
+                    placeholder="e.g. 87,452" />
+                </div>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Next oil change *</label>
+                  <input className="form-input" value={form.next_oil_change}
+                    onChange={e => update("next_oil_change", e.target.value)}
+                    placeholder="e.g. 92,000 or 7/15/2026 or ASAP" />
+                </div>
+              </div>
+
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Registration up to date</label>
+                  <select className="form-input" value={form.registration_current}
+                    onChange={e => update("registration_current", e.target.value)}>
+                    <option value="yes">Yes</option>
+                    <option value="no">No</option>
+                  </select>
+                </div>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Registration expires</label>
+                  <input className="form-input" type="date" value={form.registration_expires}
+                    onChange={e => update("registration_expires", e.target.value)} />
+                </div>
+              </div>
+
+              {catOrder.filter(c => categories[c]).map(cat => (
+                <div key={cat} style={{marginBottom:16}}>
+                  <div style={{fontSize:12,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:8}}>
+                    {catLabels[cat] || cat}
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                    {categories[cat].map(item => (
+                      <div key={item.key} style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:"8px 12px"}}>
+                        <div style={{fontSize:13}}>{item.label}{item.required && <span style={{color:"#EF4444"}}> *</span>}</div>
+                        <div style={{display:"flex",gap:6}}>
+                          <button
+                            onClick={() => setResult(item.key, "pass")}
+                            style={{
+                              padding:"4px 12px",
+                              borderRadius:4,
+                              border:"1px solid " + (form.results[item.key] === "pass" ? "#22C55E" : "#2A3348"),
+                              background: form.results[item.key] === "pass" ? "rgba(34,197,94,0.15)" : "transparent",
+                              color: form.results[item.key] === "pass" ? "#22C55E" : "#8A95A8",
+                              fontSize:12, fontWeight:600, cursor:"pointer"
+                            }}>PASS</button>
+                          <button
+                            onClick={() => setResult(item.key, "fail")}
+                            style={{
+                              padding:"4px 12px",
+                              borderRadius:4,
+                              border:"1px solid " + (form.results[item.key] === "fail" ? "#EF4444" : "#2A3348"),
+                              background: form.results[item.key] === "fail" ? "rgba(239,68,68,0.15)" : "transparent",
+                              color: form.results[item.key] === "fail" ? "#EF4444" : "#8A95A8",
+                              fontSize:12, fontWeight:600, cursor:"pointer"
+                            }}>FAIL</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+
+              <div className="form-group">
+                <label className="form-label">Notes on the vehicle</label>
+                <textarea className="form-input" rows={3} value={form.notes}
+                  onChange={e => update("notes", e.target.value)}
+                  placeholder="Any additional notes or observations..." />
+              </div>
+
+              <div style={{display:"flex",gap:8,marginTop:6}}>
+                <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+                <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+                  {saving ? "Saving..." : "Submit inspection"}
+                </Btn>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Inspection Template Editor (Settings → Inspection Form) ───────────────────
+function InspectionTemplateEditor({ showToast }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(null);
+  const [newOpen, setNewOpen] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await sb("inspection_template", "?select=*&order=display_order");
+      setItems(data);
+    } catch (err) { showToast("Error loading: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+
+  useEffect(() => { load(); }, []); // eslint-disable-line
+
+  async function remove(item) {
+    if (!window.confirm(`Remove "${item.label}" from inspection form? Existing inspection records keep their data.`)) return;
+    try {
+      await sbDelete("inspection_template", item.id);
+      showToast("Item removed");
+      load();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+  }
+
+  async function toggleActive(item) {
+    try {
+      await sbPatch("inspection_template", item.id, { active: !item.active });
+      load();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+  }
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        ✏ Edit, add, or remove items that appear on the truck inspection form. Inactive items stay in the database but don't show on new inspections.
+      </div>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}>
+        <Btn variant="primary" onClick={() => setNewOpen(true)}>+ Add inspection item</Btn>
+      </div>
+      {loading ? <div className="loading">Loading...</div> : (
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Order</th><th>Label</th><th>Category</th><th>Required</th><th>Active</th><th>Actions</th></tr></thead>
+            <tbody>
+              {items.map(item => (
+                <tr key={item.id}>
+                  <td style={{fontFamily:"monospace"}}>{item.display_order}</td>
+                  <td><strong>{item.label}</strong><div style={{fontSize:11,color:"#8A95A8"}}>{item.key}</div></td>
+                  <td>{item.category}</td>
+                  <td>{item.required ? <Badge color="blue">Required</Badge> : <Badge color="gray">Optional</Badge>}</td>
+                  <td>{item.active ? <Badge color="green">Active</Badge> : <Badge color="gray">Inactive</Badge>}</td>
+                  <td>
+                    <div style={{display:"flex",gap:6}}>
+                      <Btn onClick={() => setEditing(item)}>Edit</Btn>
+                      <Btn onClick={() => toggleActive(item)}>{item.active ? "Disable" : "Enable"}</Btn>
+                      <Btn variant="red" onClick={() => remove(item)}>Remove</Btn>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {(editing || newOpen) && (
+        <InspectionItemModal
+          item={editing}
+          onClose={() => { setEditing(null); setNewOpen(false); }}
+          onSaved={() => { setEditing(null); setNewOpen(false); load(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function InspectionItemModal({ item, onClose, onSaved, showToast }) {
+  const isEdit = !!item;
+  const [form, setForm] = useState({
+    key: item?.key || "",
+    label: item?.label || "",
+    category: item?.category || "safety",
+    required: item?.required ?? true,
+    display_order: item?.display_order || 100,
+    active: item?.active ?? true
+  });
+  const [saving, setSaving] = useState(false);
+
+  function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+
+  async function save() {
+    if (!form.label.trim()) { showToast("Label is required", "error"); return; }
+    if (!form.key.trim()) { showToast("Key is required", "error"); return; }
+    if (!/^[a-z0-9_]+$/.test(form.key)) { showToast("Key must be lowercase letters, numbers, or underscores only", "error"); return; }
+    setSaving(true);
+    try {
+      const payload = {
+        key: form.key.trim(),
+        label: form.label.trim(),
+        category: form.category,
+        required: form.required,
+        display_order: parseInt(form.display_order, 10) || 100,
+        active: form.active
+      };
+      if (isEdit) await sbPatch("inspection_template", item.id, payload);
+      else await sbPost("inspection_template", payload);
+      showToast(isEdit ? "Item updated" : "Item added");
+      onSaved();
+    } catch (err) {
+      showToast("Error: " + (err.message || err), "error");
+    }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:460}}>
+        <div className="modal-top">
+          <div><div className="modal-title">{isEdit ? "Edit inspection item" : "+ Add inspection item"}</div></div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Label *</label>
+            <input className="form-input" value={form.label}
+              onChange={e => {
+                update("label", e.target.value);
+                if (!isEdit) update("key", e.target.value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, ""));
+              }}
+              placeholder="e.g. Spare Tire Present" autoFocus />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Key (auto from label) *</label>
+            <input className="form-input" value={form.key}
+              onChange={e => update("key", e.target.value)}
+              style={{fontFamily:"monospace"}}
+              placeholder="e.g. spare_tire" />
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Category</label>
+              <select className="form-input" value={form.category}
+                onChange={e => update("category", e.target.value)}>
+                <option value="safety">Safety</option>
+                <option value="cleanliness">Cleanliness</option>
+                <option value="gear">Gear & Equipment</option>
+                <option value="documentation">Documentation</option>
+              </select>
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Order (lower = first)</label>
+              <input className="form-input" type="number" value={form.display_order}
+                onChange={e => update("display_order", e.target.value)} />
+            </div>
+          </div>
+          <div style={{display:"flex",gap:18,marginBottom:14}}>
+            <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,cursor:"pointer"}}>
+              <input type="checkbox" checked={form.required}
+                onChange={e => update("required", e.target.checked)} />
+              Required
+            </label>
+            <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,cursor:"pointer"}}>
+              <input type="checkbox" checked={form.active}
+                onChange={e => update("active", e.target.checked)} />
+              Active (shows on form)
+            </label>
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+              {saving ? "Saving..." : isEdit ? "Save changes" : "Add item"}
+            </Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Add Employee Modal ────────────────────────────────────────────────────────
 function AddEmployeeModal({ onClose, onSaved, showToast }) {
   const [form, setForm] = useState({
@@ -1868,7 +2392,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
   return (
     <div>
       <div className="tabs">
-        {[["users","Users & PINs"],["products","Products"],["employees","Employees"]].map(([t,l]) => (
+        {[["users","Users & PINs"],["products","Products"],["employees","Employees"],["inspection","Inspection Form"]].map(([t,l]) => (
           <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
         ))}
       </div>
@@ -2005,6 +2529,8 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
           </div>
         </div>
       )}
+
+      {tab === "inspection" && <InspectionTemplateEditor showToast={showToast} />}
 
       {tab === "trucks" && (
         <div>
@@ -2284,7 +2810,7 @@ export default function App() {
 
   const isManager = currentUser && ["super_admin","manager","lead"].includes(currentUser.access_level);
   const isSuperAdmin = currentUser && ["super_admin"].includes(currentUser.access_level);
-  const MANAGER_PAGES = ["home","people","hr","fleet","cards","slack","settings"];
+  const MANAGER_PAGES = ["home","people","hr","fleet","inspections","cards","slack","settings"];
 
   function navItem(id, label, icon, badge) {
     if (!currentUser) return null;
@@ -2298,7 +2824,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",fleet:"Fleet",cards:"Credit Cards",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -2320,6 +2846,7 @@ export default function App() {
               {navItem("timeoff","Time Off & Callouts","◈")}
               {navItem("inventory","Inventory","◧")}
               {navItem("fleet","Fleet","◉")}
+              {navItem("inspections","Inspections","✓")}
               {navItem("cards","Credit Cards","◆")}
             </div>
             {isManager && <div className="sb-section"><div className="sb-section-label">Comms & Admin</div>{navItem("slack","Slack Alerts","◫")}{navItem("settings","Settings","⚙")}</div>}
@@ -2347,6 +2874,7 @@ export default function App() {
             {page === "timeoff" && <TimeOff user={currentUser} employees={employees} showToast={showToast} />}
             {page === "inventory" && <Inventory user={currentUser} products={products} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
+            {dataLoaded && page === "inspections" && <InspectionsPage user={currentUser} trucks={trucks} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "cards" && <CardsPage user={currentUser} employees={employees} showToast={showToast} />}
             {page === "slack" && (
               <div className="table-wrap">
