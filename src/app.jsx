@@ -487,6 +487,85 @@ function HR({ user, employees, setEmployees, onProfile, showToast }) {
   );
 }
 
+// ── Callout Modal ─────────────────────────────────────────────────────────────
+function CalloutModal({ form, setForm, isManager, user, employees, branch, onClose, onSubmit }) {
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal modal-sm">
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">Log a call-out</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+              For payroll tracking. This is logged by a manager, not the employee.
+            </div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Employee</label>
+            <select className="form-input" value={form.employee_id}
+              onChange={e => setForm(f => ({...f, employee_id: e.target.value}))}>
+              <option value="">Select employee...</option>
+              {(isManager ? employees.filter(e => branch === "All" || e.branch === branch) : [user])
+                .sort((a,b) => a.name.localeCompare(b.name))
+                .map(e => (
+                  <option key={e.id} value={e.id}>{e.name} ({e.branch})</option>
+                ))}
+            </select>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Date</label>
+              <input type="date" className="form-input" value={form.start_date}
+                onChange={e => setForm(f => ({...f, start_date: e.target.value}))} />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Type</label>
+              <select className="form-input" value={form.callout_type}
+                onChange={e => setForm(f => ({...f, callout_type: e.target.value}))}>
+                <option value="sick">Sick</option>
+                <option value="personal">Personal</option>
+                <option value="family">Family emergency</option>
+                <option value="no_show">No-show</option>
+                <option value="late">Late</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Reason / notes</label>
+            <textarea className="form-input" rows={3} value={form.reason}
+              onChange={e => setForm(f => ({...f, reason: e.target.value}))}
+              placeholder="What did they say? Any context for payroll." />
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:14}}>
+            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,cursor:"pointer",fontSize:13}}>
+              <input type="checkbox" checked={form.paid}
+                onChange={e => setForm(f => ({...f, paid: e.target.checked}))} />
+              Paid? (counts as paid time off vs unpaid)
+            </label>
+            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,cursor:"pointer",fontSize:13}}>
+              <input type="checkbox" checked={form.coverage_found}
+                onChange={e => setForm(f => ({...f, coverage_found: e.target.checked}))} />
+              Coverage was found
+            </label>
+            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,cursor:"pointer",fontSize:13}}>
+              <input type="checkbox" checked={form.called_in_on_time}
+                onChange={e => setForm(f => ({...f, called_in_on_time: e.target.checked}))} />
+              Called in on time (uncheck for late call-in)
+            </label>
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <Btn style={{flex:1}} onClick={onClose}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={onSubmit}>Save call-out</Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Time Off ──────────────────────────────────────────────────────────────────
 function TimeOff({ user, employees, showToast }) {
   const [requests, setRequests] = useState([]);
@@ -494,7 +573,7 @@ function TimeOff({ user, employees, showToast }) {
   const [tab, setTab] = useState("requests");
   const [branch, setBranch] = useState(user.branch === "All" ? "All" : user.branch);
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ employee_id:"", type:"pto_request", start_date:"", end_date:"", reason:"", notes:"" });
+  const [form, setForm] = useState({ employee_id:"", type:"pto_request", start_date:"", end_date:"", reason:"", notes:"", callout_type:"sick", paid:false, coverage_found:false, called_in_on_time:true });
 
   const isManager = ["super_admin","manager","lead"].includes(user.access_level);
 
@@ -507,13 +586,31 @@ function TimeOff({ user, employees, showToast }) {
   async function submitRequest() {
     if (!form.employee_id || !form.start_date) { showToast("Please fill required fields", "error"); return; }
     try {
-      const newReq = await sbPost("time_off", { ...form, status: "pending" });
+      // For callouts: end_date defaults to start_date if blank (single-day callout)
+      const payload = {
+        employee_id: form.employee_id,
+        type: form.type,
+        start_date: form.start_date,
+        end_date: form.end_date || form.start_date,
+        reason: form.reason,
+        notes: form.notes,
+        status: "pending"
+      };
+      // Attach callout-specific fields if it's a callout
+      if (form.type === "callout") {
+        payload.callout_type = form.callout_type;
+        payload.paid = form.paid;
+        payload.coverage_found = form.coverage_found;
+        payload.called_in_on_time = form.called_in_on_time;
+        payload.status = "logged"; // callouts don't need approval
+      }
+      const newReq = await sbPost("time_off", payload);
       const emp = employees.find(e => e.id === form.employee_id);
       setRequests(prev => [{ ...newReq[0], employee: emp }, ...prev]);
       setShowForm(false);
-      setForm({ employee_id:"", type:"pto_request", start_date:"", end_date:"", reason:"", notes:"" });
-      showToast("Request submitted");
-    } catch { showToast("Error submitting request", "error"); }
+      setForm({ employee_id:"", type:"pto_request", start_date:"", end_date:"", reason:"", notes:"", callout_type:"sick", paid:false, coverage_found:false, called_in_on_time:true });
+      showToast(form.type === "callout" ? "Call-out logged" : "Request submitted");
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
   }
 
   async function updateStatus(id, status) {
@@ -599,52 +696,58 @@ function TimeOff({ user, employees, showToast }) {
               </div>
             </>
           )}
-          {showForm && (
-            <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowForm(false)}>
-              <div className="modal modal-sm">
-                <div className="modal-top">
-                  <div className="modal-title">Request time off / log callout</div>
-                  <div className="modal-close" onClick={() => setShowForm(false)}>✕</div>
+        </div>
+      )}
+
+      {showForm && form.type === "callout" && (
+        <CalloutModal
+          form={form}
+          setForm={setForm}
+          isManager={isManager}
+          user={user}
+          employees={employees}
+          branch={branch}
+          onClose={() => setShowForm(false)}
+          onSubmit={submitRequest}
+        />
+      )}
+      {showForm && form.type !== "callout" && (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowForm(false)}>
+          <div className="modal modal-sm">
+            <div className="modal-top">
+              <div className="modal-title">Request time off</div>
+              <div className="modal-close" onClick={() => setShowForm(false)}>✕</div>
+            </div>
+            <div className="modal-body">
+              <div className="form-group">
+                <label className="form-label">Employee</label>
+                <select className="form-input" value={form.employee_id} onChange={e => setForm(f => ({...f, employee_id: e.target.value}))}>
+                  <option value="">Select employee...</option>
+                  {(isManager ? employees.filter(e => branch === "All" || e.branch === branch) : [user]).map(e => (
+                    <option key={e.id} value={e.id}>{e.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label">Start date</label>
+                  <input type="date" className="form-input" value={form.start_date} onChange={e => setForm(f => ({...f, start_date: e.target.value}))} />
                 </div>
-                <div className="modal-body">
-                  <div className="form-group">
-                    <label className="form-label">Employee</label>
-                    <select className="form-input" value={form.employee_id} onChange={e => setForm(f => ({...f, employee_id: e.target.value}))}>
-                      <option value="">Select employee...</option>
-                      {(isManager ? employees.filter(e => branch === "All" || e.branch === branch) : [user]).map(e => (
-                        <option key={e.id} value={e.id}>{e.name}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Type</label>
-                    <select className="form-input" value={form.type} onChange={e => setForm(f => ({...f, type: e.target.value}))}>
-                      <option value="pto_request">Time Off Request</option>
-                      <option value="callout">Callout</option>
-                    </select>
-                  </div>
-                  <div className="form-row">
-                    <div className="form-group">
-                      <label className="form-label">Start date</label>
-                      <input type="date" className="form-input" value={form.start_date} onChange={e => setForm(f => ({...f, start_date: e.target.value}))} />
-                    </div>
-                    <div className="form-group">
-                      <label className="form-label">End date</label>
-                      <input type="date" className="form-input" value={form.end_date} onChange={e => setForm(f => ({...f, end_date: e.target.value}))} />
-                    </div>
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Reason</label>
-                    <input type="text" className="form-input" placeholder="Vacation, medical, personal..." value={form.reason} onChange={e => setForm(f => ({...f, reason: e.target.value}))} />
-                  </div>
-                  <div style={{display:"flex",gap:8}}>
-                    <Btn style={{flex:1}} onClick={() => setShowForm(false)}>Cancel</Btn>
-                    <Btn variant="primary" style={{flex:1}} onClick={submitRequest}>Submit</Btn>
-                  </div>
+                <div className="form-group">
+                  <label className="form-label">End date</label>
+                  <input type="date" className="form-input" value={form.end_date} onChange={e => setForm(f => ({...f, end_date: e.target.value}))} />
                 </div>
               </div>
+              <div className="form-group">
+                <label className="form-label">Reason</label>
+                <input type="text" className="form-input" placeholder="Vacation, medical, personal..." value={form.reason} onChange={e => setForm(f => ({...f, reason: e.target.value}))} />
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                <Btn style={{flex:1}} onClick={() => setShowForm(false)}>Cancel</Btn>
+                <Btn variant="primary" style={{flex:1}} onClick={submitRequest}>Submit</Btn>
+              </div>
             </div>
-          )}
+          </div>
         </div>
       )}
 
@@ -2710,14 +2813,58 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
 }
 
 // ── Profile Modal ─────────────────────────────────────────────────────────────
-function ProfileModal({ person, onClose }) {
+function ProfileModal({ person, trucks, creditCards, onClose, onSaved, showToast, canEdit }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({
+    name: person?.name || "",
+    email: person?.email || "",
+    phone: person?.phone || "",
+    branch: person?.branch || "",
+    start_date: person?.start_date || "",
+    access_level: person?.access_level || "employee",
+    status: person?.status || "active"
+  });
+  const [saving, setSaving] = useState(false);
+
   if (!person) return null;
+
   const initials = person.name.split(" ").map(w=>w[0]).join("").substring(0,2);
   const colors = ["#A855F7","#3B82F6","#14B8A6","#22C55E","#F59E0B","#EF4444"];
   const color = colors[person.name.charCodeAt(0) % colors.length];
+
+  // Truck assigned to this person
+  const truck = trucks?.find(t => t.id === person.truck_id);
+  // Credit cards assigned to this person (by name match)
+  const personCards = (creditCards || []).filter(c => c.assigned_to === person.name);
+
+  function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+
+  async function save() {
+    if (!form.name.trim()) { showToast("Name is required", "error"); return; }
+    setSaving(true);
+    try {
+      const payload = {
+        name: form.name.trim(),
+        email: form.email.trim() || null,
+        phone: form.phone.trim() || null,
+        branch: form.branch,
+        start_date: form.start_date || null,
+        access_level: form.access_level,
+        status: form.status
+      };
+      await sbPatch("employees", person.id, payload);
+      showToast("Profile updated");
+      if (onSaved) onSaved();
+      setEditing(false);
+    } catch (err) {
+      showToast("Error saving: " + (err.message || err), "error");
+    }
+    setSaving(false);
+  }
+
   return (
     <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="modal">
+      <div className="modal" style={{maxWidth:680, maxHeight:"90vh", overflowY:"auto"}}>
         <div className="modal-top">
           <div style={{display:"flex",alignItems:"center",gap:12}}>
             <div style={{width:44,height:44,borderRadius:11,background:color,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:600,color:"white"}}>{initials}</div>
@@ -2729,36 +2876,121 @@ function ProfileModal({ person, onClose }) {
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
             <Badge color={statusColor(person.status)}>{person.status}</Badge>
             <Badge color={accessColor(person.access_level)}>{accessLabel(person.access_level)}</Badge>
+            {canEdit && !editing && <Btn onClick={() => setEditing(true)}>Edit</Btn>}
             <div className="modal-close" onClick={onClose}>✕</div>
           </div>
         </div>
         <div className="modal-body">
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-            <div className="mod-card">
-              <div className="mod-card-title"><span style={{width:7,height:7,borderRadius:2,background:"#22C55E",display:"inline-block"}} />HR Info</div>
-              <div className="kv"><span className="kv-key">Branch</span><span className="kv-val">{person.branch}</span></div>
-              <div className="kv"><span className="kv-key">Start date</span><span className="kv-val">{person.start_date ? new Date(person.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</span></div>
-              <div className="kv"><span className="kv-key">Access level</span><span className="kv-val">{accessLabel(person.access_level)}</span></div>
-              <div className="kv"><span className="kv-key">Email</span><span className="kv-val" style={{fontSize:10}}>{person.email || "—"}</span></div>
-            </div>
-            <div className="mod-card">
-              <div className="mod-card-title"><span style={{width:7,height:7,borderRadius:2,background:"#3B82F6",display:"inline-block"}} />Fleet</div>
-              <div className="kv"><span className="kv-key">Truck assigned</span><span className="kv-val">{person.truck_id ? "See fleet tab" : "Unassigned"}</span></div>
-              <div className="kv"><span className="kv-key">Status</span><span className="kv-val">{person.status}</span></div>
-            </div>
-          </div>
-          <div style={{marginTop:12}}>
-            <div className="mod-card">
-              <div className="mod-card-title"><span style={{width:7,height:7,borderRadius:2,background:"#F59E0B",display:"inline-block"}} />Documents</div>
-              <div style={{padding:"8px 0",fontSize:13,color:"#8A95A8"}}>
-                Document upload and management will be available after connecting Supabase Storage.
+          {editing ? (
+            <div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Full name *</label>
+                  <input className="form-input" value={form.name} onChange={e => update("name", e.target.value)} />
+                </div>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Branch</label>
+                  <select className="form-input" value={form.branch} onChange={e => update("branch", e.target.value)}>
+                    {["DFW","OKC","ATX","CStat","Office"].map(b => <option key={b} value={b}>{b}</option>)}
+                  </select>
+                </div>
               </div>
-              <div style={{display:"flex",gap:8,marginTop:8}}>
-                <Btn style={{flex:1}}>Upload document</Btn>
-                <Btn variant="primary" style={{flex:1}}>Issue write-up</Btn>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Email</label>
+                  <input className="form-input" type="email" value={form.email} onChange={e => update("email", e.target.value)} />
+                </div>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Phone</label>
+                  <input className="form-input" type="tel" value={form.phone} onChange={e => update("phone", e.target.value)} placeholder="(555) 123-4567" />
+                </div>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:14}}>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Start date</label>
+                  <input className="form-input" type="date" value={form.start_date} onChange={e => update("start_date", e.target.value)} />
+                </div>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Access level</label>
+                  <select className="form-input" value={form.access_level} onChange={e => update("access_level", e.target.value)}>
+                    <option value="employee">Employee</option>
+                    <option value="lead">Lead</option>
+                    <option value="manager">Manager</option>
+                    <option value="super_admin">Super admin</option>
+                  </select>
+                </div>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Status</label>
+                  <select className="form-input" value={form.status} onChange={e => update("status", e.target.value)}>
+                    <option value="active">Active</option>
+                    <option value="onboarding">Onboarding</option>
+                    <option value="inactive">Inactive</option>
+                  </select>
+                </div>
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                <Btn style={{flex:1}} onClick={() => setEditing(false)} disabled={saving}>Cancel</Btn>
+                <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>{saving ? "Saving..." : "Save changes"}</Btn>
               </div>
             </div>
-          </div>
+          ) : (
+            <>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+                <div className="mod-card">
+                  <div className="mod-card-title"><span style={{width:7,height:7,borderRadius:2,background:"#22C55E",display:"inline-block"}} />HR Info</div>
+                  <div className="kv"><span className="kv-key">Branch</span><span className="kv-val">{person.branch}</span></div>
+                  <div className="kv"><span className="kv-key">Start date</span><span className="kv-val">{person.start_date ? new Date(person.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</span></div>
+                  <div className="kv"><span className="kv-key">Access level</span><span className="kv-val">{accessLabel(person.access_level)}</span></div>
+                  <div className="kv"><span className="kv-key">Email</span><span className="kv-val" style={{fontSize:10}}>{person.email || "—"}</span></div>
+                  <div className="kv"><span className="kv-key">Phone</span><span className="kv-val">{person.phone || <span style={{color:"#8A95A8"}}>—</span>}</span></div>
+                </div>
+                <div className="mod-card">
+                  <div className="mod-card-title"><span style={{width:7,height:7,borderRadius:2,background:"#3B82F6",display:"inline-block"}} />Fleet</div>
+                  {truck ? (
+                    <>
+                      <div className="kv"><span className="kv-key">Truck</span><span className="kv-val"><strong>#{truck.truck_number}</strong></span></div>
+                      <div className="kv"><span className="kv-key">Vehicle</span><span className="kv-val">{[truck.year, truck.make, truck.model].filter(Boolean).join(" ")}</span></div>
+                      <div className="kv"><span className="kv-key">Plate</span><span className="kv-val" style={{fontFamily:"monospace"}}>{truck.plate || "—"}</span></div>
+                      <div className="kv"><span className="kv-key">Mileage</span><span className="kv-val">{truck.mileage ? truck.mileage.toLocaleString() : "—"}</span></div>
+                      <div className="kv"><span className="kv-key">GPS</span><span className="kv-val">{truck.has_gps ? "Active" : "No GPS"}</span></div>
+                    </>
+                  ) : (
+                    <div style={{padding:"8px 0",fontSize:13,color:"#8A95A8"}}>No truck assigned</div>
+                  )}
+                </div>
+              </div>
+
+              <div className="mod-card" style={{marginBottom:12}}>
+                <div className="mod-card-title"><span style={{width:7,height:7,borderRadius:2,background:"#A855F7",display:"inline-block"}} />Credit cards ({personCards.length})</div>
+                {personCards.length === 0 ? (
+                  <div style={{padding:"8px 0",fontSize:13,color:"#8A95A8"}}>No credit cards assigned</div>
+                ) : (
+                  <div style={{display:"flex",flexDirection:"column",gap:6,marginTop:6}}>
+                    {personCards.map(c => (
+                      <div key={c.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,fontSize:12}}>
+                        <div>
+                          <strong>{c.name_on_card}</strong>
+                          <div style={{color:"#8A95A8",fontSize:11,marginTop:2}}>{c.program}</div>
+                        </div>
+                        <div style={{fontFamily:"monospace",fontSize:13}}>{c.last4 ? "•••• " + c.last4 : <span style={{color:"#EF4444"}}>missing</span>}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="mod-card">
+                <div className="mod-card-title"><span style={{width:7,height:7,borderRadius:2,background:"#F59E0B",display:"inline-block"}} />Documents</div>
+                <div style={{padding:"8px 0",fontSize:13,color:"#8A95A8"}}>
+                  Document upload coming next — Supabase Storage will host write-ups, certifications, and IDs per employee.
+                </div>
+                <div style={{display:"flex",gap:8,marginTop:8}}>
+                  <Btn style={{flex:1}} disabled>Upload document</Btn>
+                  <Btn variant="primary" style={{flex:1}} disabled>Issue write-up</Btn>
+                </div>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -2773,6 +3005,7 @@ export default function App() {
   const [employees, setEmployees] = useState([]);
   const [trucks, setTrucks] = useState([]);
   const [products, setProducts] = useState([]);
+  const [creditCards, setCreditCards] = useState([]);
   const [toast, setToast] = useState(null);
   const [dataLoaded, setDataLoaded] = useState(false);
 
@@ -2786,10 +3019,12 @@ export default function App() {
       sb("employees", "?select=*&order=name").catch(() => []),
       sb("trucks", "?select=*,assigned_employee:employees(name)&order=truck_number").catch(() => []),
       sb("products", "?select=*&order=category,name").catch(() => []),
-    ]).then(([e, t, p]) => {
+      sb("credit_cards", "?select=*&order=assigned_to").catch(() => []),
+    ]).then(([e, t, p, cc]) => {
       setEmployees(e);
       setTrucks(t);
       setProducts(p);
+      setCreditCards(cc);
       setDataLoaded(true);
     });
   }, [currentUser]);
@@ -2806,6 +3041,7 @@ export default function App() {
     setEmployees([]);
     setTrucks([]);
     setProducts([]);
+    setCreditCards([]);
   }
 
   const isManager = currentUser && ["super_admin","manager","lead"].includes(currentUser.access_level);
@@ -2888,7 +3124,20 @@ export default function App() {
             )}
             {isManager && page === "settings" && dataLoaded && <Settings user={currentUser} employees={employees} setEmployees={setEmployees} products={products} setProducts={setProducts} trucks={trucks} setTrucks={setTrucks} showToast={showToast} />}
           </div>
-          {profile && <ProfileModal person={profile} onClose={() => setProfile(null)} />}
+          {profile && (
+            <ProfileModal
+              person={employees.find(e => e.id === profile.id) || profile}
+              trucks={trucks}
+              creditCards={creditCards}
+              canEdit={isManager}
+              onSaved={async () => {
+                const e = await sb("employees", "?select=*&order=name").catch(() => null);
+                if (e) setEmployees(e);
+              }}
+              onClose={() => setProfile(null)}
+              showToast={showToast}
+            />
+          )}
         </div>
       )}
     </>
