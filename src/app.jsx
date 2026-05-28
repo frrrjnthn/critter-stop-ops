@@ -342,10 +342,18 @@ function Dashboard({ user, employees, trucks, inventory }) {
 }
 
 // ── People ────────────────────────────────────────────────────────────────────
-function People({ user, employees, onProfile }) {
+function People({ user, employees, setEmployees, onProfile, showToast }) {
   const [branch, setBranch] = useState(user.access_level === "super_admin" || user.access_level === "manager" ? "All" : user.branch);
   const [q, setQ] = useState("");
   const [statusFilter, setStatusFilter] = useState("active");
+  const [addOpen, setAddOpen] = useState(false);
+
+  async function reload() {
+    try {
+      const e = await sb("employees", "?select=*&order=name");
+      setEmployees(e);
+    } catch (err) { showToast("Error refreshing: " + (err.message || err), "error"); }
+  }
 
   const list = employees.filter(e =>
     (branch === "All" || e.branch === branch) &&
@@ -369,7 +377,7 @@ function People({ user, employees, onProfile }) {
           <option value="inactive">Inactive</option>
         </select>
         {(user.access_level === "super_admin" || user.access_level === "manager") && (
-          <Btn variant="primary" onClick={() => {}}>+ Add employee</Btn>
+          <Btn variant="primary" onClick={() => setAddOpen(true)}>+ Add employee</Btn>
         )}
       </div>
       <div className="table-wrap">
@@ -393,16 +401,25 @@ function People({ user, employees, onProfile }) {
           </tbody>
         </table>
       </div>
+      {addOpen && <AddEmployeeModal onClose={() => setAddOpen(false)} onSaved={reload} showToast={showToast} />}
     </div>
   );
 }
 
 // ── HR ────────────────────────────────────────────────────────────────────────
-function HR({ user, employees, onProfile }) {
+function HR({ user, employees, setEmployees, onProfile, showToast }) {
   const [branch, setBranch] = useState(user.branch === "All" ? "All" : user.branch);
   const [tab, setTab] = useState("onboarding");
+  const [addOpen, setAddOpen] = useState(false);
   const list = employees.filter(e => branch === "All" || e.branch === branch);
   const onboarding = list.filter(e => e.status === "onboarding");
+
+  async function reload() {
+    try {
+      const e = await sb("employees", "?select=*&order=name");
+      setEmployees(e);
+    } catch (err) { showToast("Error refreshing: " + (err.message || err), "error"); }
+  }
 
   return (
     <div>
@@ -427,7 +444,7 @@ function HR({ user, employees, onProfile }) {
       </div>
       {tab === "onboarding" && (
         <div className="table-wrap">
-          <div className="table-head"><span className="table-title">Active onboarding ({onboarding.length})</span><Btn variant="primary">+ Add employee</Btn></div>
+          <div className="table-head"><span className="table-title">Active onboarding ({onboarding.length})</span><Btn variant="primary" onClick={() => setAddOpen(true)}>+ Add employee</Btn></div>
           <table>
             <thead><tr><th>Employee</th><th>Branch</th><th>Start date</th><th>Access level</th><th>Status</th></tr></thead>
             <tbody>
@@ -465,6 +482,7 @@ function HR({ user, employees, onProfile }) {
       {tab === "documents" && (
         <div className="alert blue">📄 Document storage is configured in Supabase Storage. Click any employee profile to upload documents for that person.</div>
       )}
+      {addOpen && <AddEmployeeModal onClose={() => setAddOpen(false)} onSaved={reload} showToast={showToast} />}
     </div>
   );
 }
@@ -544,7 +562,7 @@ function TimeOff({ user, employees, showToast }) {
                           <td>{r.employee?.branch}</td>
                           <td>{r.start_date}{r.end_date && r.end_date !== r.start_date ? " → " + r.end_date : ""}</td>
                           <td>{r.reason || "—"}</td>
-                          <td><Badge color={r.type==="callout"?"red":"blue"}>{r.type==="callout"?"Callout":"PTO"}</Badge></td>
+                          <td><Badge color={r.type==="callout"?"red":"blue"}>{r.type==="callout"?"Callout":"Time Off"}</Badge></td>
                           {isManager && (
                             <td>
                               <div style={{display:"flex",gap:6}}>
@@ -573,7 +591,7 @@ function TimeOff({ user, employees, showToast }) {
                         <td style={{fontSize:12,color:"#8A95A8"}}>{r.start_date}{r.end_date && r.end_date !== r.start_date ? " → " + r.end_date : ""}</td>
                         <td>{r.reason || "—"}</td>
                         <td><Badge color={r.status==="approved"?"green":r.status==="denied"?"red":"amber"}>{r.status}</Badge></td>
-                        <td><Badge color={r.type==="callout"?"red":"blue"}>{r.type==="callout"?"Callout":"PTO"}</Badge></td>
+                        <td><Badge color={r.type==="callout"?"red":"blue"}>{r.type==="callout"?"Callout":"Time Off"}</Badge></td>
                       </tr>
                     ))}
                   </tbody>
@@ -601,7 +619,7 @@ function TimeOff({ user, employees, showToast }) {
                   <div className="form-group">
                     <label className="form-label">Type</label>
                     <select className="form-input" value={form.type} onChange={e => setForm(f => ({...f, type: e.target.value}))}>
-                      <option value="pto_request">PTO Request</option>
+                      <option value="pto_request">Time Off Request</option>
                       <option value="callout">Callout</option>
                     </select>
                   </div>
@@ -658,7 +676,7 @@ function TimeOff({ user, employees, showToast }) {
 
       {tab === "calendar" && (
         <div>
-          <div className="alert blue">📅 Calendar view — approved PTO and callouts for {branch === "All" ? "all branches" : branch}</div>
+          <div className="alert blue">📅 Calendar view — approved time off and callouts for {branch === "All" ? "all branches" : branch}</div>
           <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3}}>
             {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d => (
               <div key={d} style={{textAlign:"center",fontSize:10,color:"#4A5568",padding:"4px 0",fontWeight:500}}>{d}</div>
@@ -885,6 +903,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
   const [tab, setTab] = useState("all");
   const [q, setQ] = useState("");
   const [truckModalOpen, setTruckModalOpen] = useState(false);
+  const [truckEditing, setTruckEditing] = useState(null);
 
   async function reloadTrucks() {
     try {
@@ -893,6 +912,17 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
       const e = await sb("employees", "?select=*&order=name");
       setEmployees(e);
     } catch (err) { showToast("Error refreshing: " + (err.message || err), "error"); }
+  }
+
+  async function removeTruck(t) {
+    if (!window.confirm(`Remove truck ${t.truck_number} (${t.year || ""} ${t.make || ""} ${t.model || ""})? This cannot be undone.`)) return;
+    try {
+      const driver = employees.find(e => e.truck_id === t.id);
+      if (driver) await sbPatch("employees", driver.id, { truck_id: null });
+      await sbDelete("trucks", t.id);
+      showToast("Truck removed");
+      reloadTrucks();
+    } catch (err) { showToast("Error removing truck: " + (err.message || err), "error"); }
   }
 
   const list = trucks.filter(t =>
@@ -950,10 +980,10 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
               {["super_admin","manager","lead"].includes(user.access_level) && <Btn variant="primary" onClick={() => setTruckModalOpen(true)}>+ Add truck</Btn>}
             </div>
             <table>
-              <thead><tr><th>Truck</th><th>Branch</th><th>Driver</th><th>Plate</th><th>Mileage</th><th>Next oil</th><th>Reg expires</th><th>GPS</th></tr></thead>
+              <thead><tr><th>Truck</th><th>Branch</th><th>Driver</th><th>Plate</th><th>Mileage</th><th>Next oil</th><th>Reg expires</th><th>GPS</th><th>Actions</th></tr></thead>
               <tbody>
                 {list.length === 0 ? (
-                  <tr><td colSpan={8}><div className="empty-state">No trucks added yet — add your first truck in Settings</div></td></tr>
+                  <tr><td colSpan={9}><div className="empty-state">No trucks added yet — click "+ Add truck" to get started</div></td></tr>
                 ) : list.map(t => {
                   const oil = oilStatus(t);
                   const regExp = t.reg_expires && new Date(t.reg_expires) < new Date();
@@ -968,6 +998,14 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                       <td style={{color:oil.color,fontFamily:"monospace",fontSize:12}}>{oil.label}</td>
                       <td><Badge color={regExp?"red":!t.reg_expires?"gray":"green"}>{t.reg_expires ? new Date(t.reg_expires).toLocaleDateString("en-US",{month:"short",year:"numeric"}) : "—"}</Badge></td>
                       <td><Badge color={t.has_gps?"green":"gray"}>{t.has_gps?"Active":"No GPS"}</Badge></td>
+                      <td>
+                        {["super_admin","manager","lead"].includes(user.access_level) ? (
+                          <div style={{display:"flex",gap:6}}>
+                            <Btn onClick={() => { setTruckEditing(t); setTruckModalOpen(true); }}>Edit</Btn>
+                            <Btn variant="red" onClick={() => removeTruck(t)}>Remove</Btn>
+                          </div>
+                        ) : <span style={{color:"#8A95A8"}}>—</span>}
+                      </td>
                     </tr>
                   );
                 })}
@@ -1031,12 +1069,120 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
         <NewTruckModal
           employees={employees}
           trucks={trucks}
-          editing={null}
-          onClose={() => setTruckModalOpen(false)}
+          editing={truckEditing}
+          onClose={() => { setTruckModalOpen(false); setTruckEditing(null); }}
           onSaved={reloadTrucks}
           showToast={showToast}
         />
       )}
+    </div>
+  );
+}
+
+// ── Add Employee Modal ────────────────────────────────────────────────────────
+function AddEmployeeModal({ onClose, onSaved, showToast }) {
+  const [form, setForm] = useState({
+    name: "",
+    email: "",
+    branch: "DFW",
+    access_level: "employee",
+    start_date: new Date().toISOString().slice(0,10),
+    status: "onboarding"
+  });
+  const [saving, setSaving] = useState(false);
+
+  function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+
+  async function save() {
+    if (!form.name.trim()) { showToast("Name is required", "error"); return; }
+    setSaving(true);
+    try {
+      const payload = {
+        name: form.name.trim(),
+        email: form.email.trim() || null,
+        branch: form.branch,
+        access_level: form.access_level,
+        start_date: form.start_date || null,
+        status: form.status
+      };
+      await sbPost("employees", payload);
+      showToast(`${form.name.trim()} added`);
+      onSaved();
+      onClose();
+    } catch (err) {
+      showToast("Error adding employee: " + (err.message || err), "error");
+    }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:480}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">+ Add employee</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+              Add a new team member to the database
+            </div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Full name *</label>
+            <input className="form-input" value={form.name}
+              onChange={e => update("name", e.target.value)}
+              placeholder="First Last" autoFocus />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Email</label>
+            <input className="form-input" type="email" value={form.email}
+              onChange={e => update("email", e.target.value)}
+              placeholder="name@critterstop.com" />
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Branch *</label>
+              <select className="form-input" value={form.branch}
+                onChange={e => update("branch", e.target.value)}>
+                {["DFW","OKC","ATX","CStat","Office"].map(b => <option key={b} value={b}>{b}</option>)}
+              </select>
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Access level *</label>
+              <select className="form-input" value={form.access_level}
+                onChange={e => update("access_level", e.target.value)}>
+                <option value="employee">Employee</option>
+                <option value="lead">Lead</option>
+                <option value="manager">Manager</option>
+                <option value="super_admin">Super admin</option>
+              </select>
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Start date</label>
+              <input className="form-input" type="date" value={form.start_date}
+                onChange={e => update("start_date", e.target.value)} />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Status</label>
+              <select className="form-input" value={form.status}
+                onChange={e => update("status", e.target.value)}>
+                <option value="onboarding">Onboarding</option>
+                <option value="active">Active</option>
+                <option value="inactive">Inactive</option>
+              </select>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,marginTop:6}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+              {saving ? "Saving..." : "Add employee"}
+            </Btn>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1588,6 +1734,14 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
   const [pinTarget, setPinTarget] = useState(null);
   const [newPin, setNewPin] = useState("");
   const [empBranch, setEmpBranch] = useState("All");
+  const [settingsAddEmpOpen, setSettingsAddEmpOpen] = useState(false);
+
+  async function reloadEmployees() {
+    try {
+      const e = await sb("employees", "?select=*&order=name");
+      setEmployees(e);
+    } catch (err) { showToast("Error refreshing: " + (err.message || err), "error"); }
+  }
 
   // Trucks tab state
   const [truckModalOpen, setTruckModalOpen] = useState(false);
@@ -1829,7 +1983,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
               <option value="All">All branches</option>
               {["DFW","OKC","ATX","CStat","Office"].map(b=><option key={b} value={b}>{b}</option>)}
             </select>
-            <Btn variant="primary" onClick={()=>{}}>+ Add employee</Btn>
+            <Btn variant="primary" onClick={() => setSettingsAddEmpOpen(true)}>+ Add employee</Btn>
           </div>
           <div className="table-wrap">
             <table>
@@ -2024,6 +2178,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
           )}
         </div>
       )}
+      {settingsAddEmpOpen && <AddEmployeeModal onClose={() => setSettingsAddEmpOpen(false)} onSaved={reloadEmployees} showToast={showToast} />}
     </div>
   );
 }
@@ -2129,7 +2284,7 @@ export default function App() {
 
   const isManager = currentUser && ["super_admin","manager","lead"].includes(currentUser.access_level);
   const isSuperAdmin = currentUser && ["super_admin"].includes(currentUser.access_level);
-  const MANAGER_PAGES = ["home","people","hr","fleet","trucks","cards","slack","settings"];
+  const MANAGER_PAGES = ["home","people","hr","fleet","cards","slack","settings"];
 
   function navItem(id, label, icon, badge) {
     if (!currentUser) return null;
@@ -2143,7 +2298,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",fleet:"Fleet",trucks:"Trucks",cards:"Credit Cards",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",fleet:"Fleet",cards:"Credit Cards",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -2165,7 +2320,6 @@ export default function App() {
               {navItem("timeoff","Time Off & Callouts","◈")}
               {navItem("inventory","Inventory","◧")}
               {navItem("fleet","Fleet","◉")}
-              {navItem("trucks","Trucks","◐")}
               {navItem("cards","Credit Cards","◆")}
             </div>
             {isManager && <div className="sb-section"><div className="sb-section-label">Comms & Admin</div>{navItem("slack","Slack Alerts","◫")}{navItem("settings","Settings","⚙")}</div>}
@@ -2188,12 +2342,11 @@ export default function App() {
             )}
             {!dataLoaded && page !== "inventory" && <div className="loading">Loading data from database...</div>}
             {dataLoaded && page === "home" && <Dashboard user={currentUser} employees={employees} trucks={trucks} inventory={[]} />}
-            {dataLoaded && page === "people" && <People user={currentUser} employees={employees} onProfile={setProfile} />}
-            {dataLoaded && page === "hr" && <HR user={currentUser} employees={employees} onProfile={setProfile} />}
+            {dataLoaded && page === "people" && <People user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
+            {dataLoaded && page === "hr" && <HR user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {page === "timeoff" && <TimeOff user={currentUser} employees={employees} showToast={showToast} />}
             {page === "inventory" && <Inventory user={currentUser} products={products} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
-            {dataLoaded && page === "trucks" && <TrucksPage user={currentUser} employees={employees} setEmployees={setEmployees} trucks={trucks} setTrucks={setTrucks} showToast={showToast} />}
             {dataLoaded && page === "cards" && <CardsPage user={currentUser} employees={employees} showToast={showToast} />}
             {page === "slack" && (
               <div className="table-wrap">
