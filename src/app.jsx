@@ -212,6 +212,40 @@ tr:hover td{background:#1E2535;cursor:pointer}
 `;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+const BASE_BRANCHES = ["DFW","OKC","ATX","CStat","Office"];
+const DEPARTMENTS = ["Pest","Wildlife","Insulation"];
+
+// The 6-way branch filter: DFW splits into three by department, others stay as-is
+const BRANCH_OPTIONS = [
+  { value: "DFW|Pest",       label: "DFW Pest" },
+  { value: "DFW|Wildlife",   label: "DFW Wildlife" },
+  { value: "DFW|Insulation", label: "DFW Insulation" },
+  { value: "OKC",            label: "OKC" },
+  { value: "ATX",            label: "ATX" },
+  { value: "CStat",          label: "CStat" },
+  { value: "Office",         label: "Office" },
+];
+
+// Compose "DFW|Pest" style key from a row that has branch + (optional) department
+function branchKey(row) {
+  if (!row?.branch) return "";
+  if (row.branch === "DFW" && row.department) return "DFW|" + row.department;
+  return row.branch;
+}
+
+// Display label like "DFW · Pest" or just "OKC"
+function branchLabel(row) {
+  if (!row?.branch) return "—";
+  if (row.branch === "DFW" && row.department) return "DFW · " + row.department;
+  return row.branch;
+}
+
+// Filter helper — match a row against a selected BRANCH_OPTIONS value (or "All")
+function matchBranchFilter(row, filter) {
+  if (!filter || filter === "All") return true;
+  return branchKey(row) === filter;
+}
+
 function Badge({ color = "gray", children }) {
   return <span className={"badge " + color}>{children}</span>;
 }
@@ -224,7 +258,7 @@ function BranchBar({ value, onChange, disabled }) {
       <span className="branch-label">Branch</span>
       <select className="branch-select" value={value} onChange={e => onChange(e.target.value)} disabled={disabled}>
         <option value="All">All branches</option>
-        {["DFW","OKC","ATX","CStat","Office"].map(b => <option key={b} value={b}>{b}</option>)}
+        {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
       </select>
     </div>
   );
@@ -237,6 +271,9 @@ function accessColor(a) {
 }
 function accessLabel(a) {
   return a === "super_admin" ? "Super Admin" : a === "manager" ? "Manager" : a === "lead" ? "Lead" : "Employee";
+}
+function deptColor(d) {
+  return d === "Pest" ? "amber" : d === "Wildlife" ? "green" : d === "Insulation" ? "blue" : "gray";
 }
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
@@ -688,7 +725,9 @@ function TimeOff({ user, employees, showToast }) {
     <div>
       {isManager && <BranchBar value={branch} onChange={setBranch} />}
       <div className="tabs">
-        {[["requests","Requests"],["callouts","Callout log"],["calendar","Calendar"]].map(([t,l]) => (
+        {([["requests","Requests"],["callouts","Callout log"],["calendar","Calendar"]]
+            .concat(isManager ? [["overtime","Overtime"]] : [])
+         ).map(([t,l]) => (
           <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
         ))}
       </div>
@@ -854,205 +893,1277 @@ function TimeOff({ user, employees, showToast }) {
           </div>
         </div>
       )}
+
+      {tab === "overtime" && isManager && (
+        <OvertimeTab user={user} employees={employees} branch={branch} showToast={showToast} />
+      )}
+    </div>
+  );
+}
+
+// ── Overtime tab (inside TimeOff) ────────────────────────────────────────────
+function OvertimeTab({ user, employees, branch, showToast }) {
+  const [shifts, setShifts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [empFilter, setEmpFilter] = useState("All");
+  const [periodStart, setPeriodStart] = useState(() => {
+    // Default to first day of current month
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth(), 1).toISOString().slice(0,10);
+  });
+  const [periodEnd, setPeriodEnd] = useState(() => {
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth() + 1, 0).toISOString().slice(0,10);
+  });
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await sb("shifts",
+        `?select=*,employee:employees(name,branch,department)&shift_date=gte.${periodStart}&shift_date=lte.${periodEnd}&order=shift_date.desc`);
+      setShifts(data);
+    } catch (err) { showToast("Error loading shifts: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+
+  useEffect(() => { load(); }, [periodStart, periodEnd]); // eslint-disable-line
+
+  async function removeShift(s) {
+    if (!window.confirm(`Delete this shift entry (${s.employee?.name || "?"}, ${s.shift_date}, ${s.hours}h)?`)) return;
+    try {
+      await sbDelete("shifts", s.id);
+      showToast("Shift removed");
+      load();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+  }
+
+  // Filter by branch + employee
+  const filtered = shifts.filter(s =>
+    matchBranchFilter(s.employee, branch) &&
+    (empFilter === "All" || s.employee_id === empFilter)
+  );
+
+  // Aggregate per employee: total hours, regular hours (≤40/wk), overtime hours (>40/wk)
+  // Group by employee, then by ISO week (year + week number)
+  function isoWeekKey(dateStr) {
+    const d = new Date(dateStr + "T00:00:00");
+    // Move to nearest Thursday (ISO week trick)
+    d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+    return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2,"0")}`;
+  }
+
+  const perEmployee = {};
+  for (const s of filtered) {
+    const eid = s.employee_id;
+    if (!perEmployee[eid]) {
+      perEmployee[eid] = { name: s.employee?.name || "—", branch: s.employee?.branch, dept: s.employee?.department, total: 0, regular: 0, ot: 0, weeks: {} };
+    }
+    perEmployee[eid].total += parseFloat(s.hours) || 0;
+    const wk = isoWeekKey(s.shift_date);
+    perEmployee[eid].weeks[wk] = (perEmployee[eid].weeks[wk] || 0) + (parseFloat(s.hours) || 0);
+  }
+  // Compute regular vs OT per week
+  for (const eid of Object.keys(perEmployee)) {
+    const emp = perEmployee[eid];
+    for (const wk of Object.keys(emp.weeks)) {
+      const wkHours = emp.weeks[wk];
+      emp.regular += Math.min(wkHours, 40);
+      emp.ot      += Math.max(wkHours - 40, 0);
+    }
+  }
+  const employeeRows = Object.entries(perEmployee).sort((a,b) => b[1].total - a[1].total);
+
+  const totalAllHours = employeeRows.reduce((sum, [_, e]) => sum + e.total, 0);
+  const totalAllOT    = employeeRows.reduce((sum, [_, e]) => sum + e.ot, 0);
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        ⏱ Overtime calculated per ISO week (Mon–Sun). Hours above 40 per week count as OT. {filtered.length} shifts logged this period.
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+        <div className="form-group" style={{marginBottom:0}}>
+          <label className="form-label" style={{fontSize:10}}>Period start</label>
+          <input className="form-input" type="date" value={periodStart}
+            onChange={e => setPeriodStart(e.target.value)} style={{padding:"6px 9px"}} />
+        </div>
+        <div className="form-group" style={{marginBottom:0}}>
+          <label className="form-label" style={{fontSize:10}}>Period end</label>
+          <input className="form-input" type="date" value={periodEnd}
+            onChange={e => setPeriodEnd(e.target.value)} style={{padding:"6px 9px"}} />
+        </div>
+        <div className="form-group" style={{marginBottom:0,flex:1,minWidth:160}}>
+          <label className="form-label" style={{fontSize:10}}>Filter by employee</label>
+          <select className="form-input" value={empFilter}
+            onChange={e => setEmpFilter(e.target.value)} style={{padding:"6px 9px"}}>
+            <option value="All">All employees</option>
+            {employees
+              .filter(e => matchBranchFilter(e, branch))
+              .sort((a,b) => a.name.localeCompare(b.name))
+              .map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+          </select>
+        </div>
+        <Btn variant="primary" onClick={() => { setEditing(null); setShowAdd(true); }}>+ Log shift</Btn>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:14}}>
+        <KpiTile label="Total hours" value={totalAllHours.toFixed(1)} color="#3B82F6" />
+        <KpiTile label="Overtime hours" value={totalAllOT.toFixed(1)} color="#F59E0B" />
+        <KpiTile label="People worked" value={employeeRows.length} color="#22C55E" />
+        <KpiTile label="Shifts logged" value={filtered.length} color="#A855F7" />
+      </div>
+
+      {/* Summary by employee */}
+      <div className="table-wrap" style={{marginBottom:16}}>
+        <div className="table-head"><span className="table-title">Summary by employee</span></div>
+        <table>
+          <thead><tr><th>Employee</th><th>Branch</th><th>Total hours</th><th>Regular</th><th>Overtime</th></tr></thead>
+          <tbody>
+            {employeeRows.length === 0 ? (
+              <tr><td colSpan={5}><div className="empty-state">No shifts logged for this period</div></td></tr>
+            ) : employeeRows.map(([eid, e]) => (
+              <tr key={eid}>
+                <td><strong>{e.name}</strong></td>
+                <td style={{fontSize:12}}>{branchLabel({branch:e.branch, department:e.dept})}</td>
+                <td style={{fontFamily:"monospace"}}>{e.total.toFixed(1)}</td>
+                <td style={{fontFamily:"monospace",color:"#8A95A8"}}>{e.regular.toFixed(1)}</td>
+                <td style={{fontFamily:"monospace"}}>{e.ot > 0 ? <Badge color="amber">{e.ot.toFixed(1)} h</Badge> : <span style={{color:"#8A95A8"}}>0</span>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Detail: every shift row */}
+      <div className="table-wrap">
+        <div className="table-head"><span className="table-title">Shift entries ({filtered.length})</span></div>
+        {loading ? <div className="loading">Loading...</div> : (
+          <table>
+            <thead><tr><th>Date</th><th>Employee</th><th>Start</th><th>End</th><th>Hours</th><th>Notes</th><th>Logged by</th><th>Actions</th></tr></thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr><td colSpan={8}><div className="empty-state">No shifts in this period — click "+ Log shift" to add one</div></td></tr>
+              ) : filtered.map(s => (
+                <tr key={s.id}>
+                  <td style={{fontSize:12}}>{new Date(s.shift_date + "T12:00:00").toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}</td>
+                  <td><strong>{s.employee?.name || "—"}</strong></td>
+                  <td style={{fontFamily:"monospace",fontSize:11}}>{s.start_time ? s.start_time.slice(0,5) : "—"}</td>
+                  <td style={{fontFamily:"monospace",fontSize:11}}>{s.end_time ? s.end_time.slice(0,5) : "—"}</td>
+                  <td style={{fontFamily:"monospace"}}>{parseFloat(s.hours).toFixed(2)}</td>
+                  <td style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>{s.notes || "—"}</td>
+                  <td style={{fontSize:11,color:"#8A95A8"}}>{s.logger_name || "—"}</td>
+                  <td>
+                    <div style={{display:"flex",gap:6}}>
+                      <Btn onClick={() => { setEditing(s); setShowAdd(true); }}>Edit</Btn>
+                      <Btn variant="red" onClick={() => removeShift(s)}>Delete</Btn>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {showAdd && (
+        <ShiftModal
+          shift={editing}
+          user={user}
+          employees={employees}
+          branch={branch}
+          onClose={() => { setShowAdd(false); setEditing(null); }}
+          onSaved={() => { setShowAdd(false); setEditing(null); load(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Shift Add/Edit Modal ─────────────────────────────────────────────────────
+function ShiftModal({ shift, user, employees, branch, onClose, onSaved, showToast }) {
+  const isEdit = !!shift;
+
+  // Auto-compute hours from start/end if both provided
+  function computeHours(start, end) {
+    if (!start || !end) return null;
+    const [sh, sm] = start.split(":").map(Number);
+    const [eh, em] = end.split(":").map(Number);
+    let mins = (eh*60 + em) - (sh*60 + sm);
+    if (mins < 0) mins += 24*60; // overnight shift
+    return Math.round(mins/60 * 100) / 100;
+  }
+
+  const [form, setForm] = useState({
+    employee_id: shift?.employee_id || "",
+    shift_date: shift?.shift_date || new Date().toISOString().slice(0,10),
+    start_time: shift?.start_time ? shift.start_time.slice(0,5) : "",
+    end_time: shift?.end_time ? shift.end_time.slice(0,5) : "",
+    hours: shift?.hours ? String(shift.hours) : "",
+    notes: shift?.notes || ""
+  });
+  const [hoursManuallyEdited, setHoursManuallyEdited] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  function update(k, v) {
+    setForm(prev => {
+      const next = { ...prev, [k]: v };
+      // Auto-fill hours when both times present, unless user manually overrode hours
+      if ((k === "start_time" || k === "end_time") && !hoursManuallyEdited) {
+        const h = computeHours(k === "start_time" ? v : prev.start_time, k === "end_time" ? v : prev.end_time);
+        if (h !== null) next.hours = String(h);
+      }
+      if (k === "hours") setHoursManuallyEdited(true);
+      return next;
+    });
+  }
+
+  async function save() {
+    if (!form.employee_id) { showToast("Select an employee", "error"); return; }
+    if (!form.shift_date) { showToast("Pick a date", "error"); return; }
+    if (!form.hours || isNaN(parseFloat(form.hours)) || parseFloat(form.hours) <= 0) {
+      showToast("Hours must be a positive number", "error"); return;
+    }
+    setSaving(true);
+    try {
+      const payload = {
+        employee_id: form.employee_id,
+        shift_date: form.shift_date,
+        start_time: form.start_time || null,
+        end_time: form.end_time || null,
+        hours: parseFloat(form.hours),
+        notes: form.notes.trim() || null,
+        logged_by: user.id,
+        logger_name: user.name
+      };
+      if (isEdit) await sbPatch("shifts", shift.id, payload);
+      else await sbPost("shifts", payload);
+      showToast(isEdit ? "Shift updated" : "Shift logged");
+      onSaved();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:480}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">{isEdit ? "Edit shift" : "+ Log shift"}</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+              {isEdit ? "Update shift details" : "Record a worked shift for overtime tracking"}
+            </div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Employee *</label>
+            <select className="form-input" value={form.employee_id}
+              onChange={e => update("employee_id", e.target.value)}>
+              <option value="">Select employee...</option>
+              {employees
+                .filter(e => e.status !== "inactive")
+                .filter(e => matchBranchFilter(e, branch))
+                .sort((a,b) => a.name.localeCompare(b.name))
+                .map(e => <option key={e.id} value={e.id}>{e.name} ({branchLabel(e)})</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Date *</label>
+            <input className="form-input" type="date" value={form.shift_date}
+              onChange={e => update("shift_date", e.target.value)} />
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Start time</label>
+              <input className="form-input" type="time" value={form.start_time}
+                onChange={e => update("start_time", e.target.value)} />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">End time</label>
+              <input className="form-input" type="time" value={form.end_time}
+                onChange={e => update("end_time", e.target.value)} />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Hours *</label>
+              <input className="form-input" type="number" step="0.25" min="0" value={form.hours}
+                onChange={e => update("hours", e.target.value)}
+                style={{fontFamily:"monospace"}}
+                placeholder="0.00" />
+            </div>
+          </div>
+          <div style={{fontSize:11,color:"#8A95A8",marginTop:-6,marginBottom:10}}>
+            Hours auto-calculate from start/end times — override manually if needed.
+          </div>
+          <div className="form-group">
+            <label className="form-label">Notes</label>
+            <textarea className="form-input" rows={2} value={form.notes}
+              onChange={e => update("notes", e.target.value)}
+              placeholder="Job site, special circumstances..." />
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+              {saving ? "Saving..." : isEdit ? "Save changes" : "Log shift"}
+            </Btn>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
 
 // ── Inventory ─────────────────────────────────────────────────────────────────
-function Inventory({ user, products, showToast }) {
-  const [branch, setBranch] = useState(user.branch === "All" ? "All" : user.branch);
-  const [tab, setTab] = useState("log");
-  const [catFilter, setCatFilter] = useState("All");
+// Shop & truck inventory with Load Truck / Return / Add Stock / Adjust flows.
+// Uses existing `inventory` (product_id, location_type, location_id, quantity)
+// and `inventory_transactions` tables created by the standalone dashboard.
+function Inventory({ user, products, trucks, employees, showToast }) {
+  const [tab, setTab] = useState("shops");
   const [inventory, setInventory] = useState([]);
   const [loadingInv, setLoadingInv] = useState(true);
-  const [form, setForm] = useState({ product_id:"", quantity:1, action:"load_truck", notes:"" });
+  const [history, setHistory] = useState([]);
+  const [branchFilter, setBranchFilter] = useState("All");
+  const [catFilter, setCatFilter] = useState("All");
+  const [q, setQ] = useState("");
+  const [moveModal, setMoveModal] = useState(null); // { action, ... }
+
   const isManager = ["super_admin","manager","lead"].includes(user.access_level);
 
-  useEffect(() => {
-    sb("inventory", "?select=*,product:products(name,category,unit_cost)")
-      .then(data => { setInventory(data); setLoadingInv(false); })
-      .catch(() => setLoadingInv(false));
-  }, []);
-
-  async function logMove() {
-    if (!form.product_id) { showToast("Select a product", "error"); return; }
+  async function loadInventory() {
+    setLoadingInv(true);
     try {
-      await sbPost("inventory_transactions", {
-        product_id: form.product_id,
-        employee_id: user.id,
-        action: form.action,
-        quantity: parseInt(form.quantity),
-        from_location: branch === "All" ? "DFW" : branch,
-        to_location: branch === "All" ? "DFW" : branch,
-        notes: form.notes
-      });
-      setForm({ product_id:"", quantity:1, action:"load_truck", notes:"" });
-      showToast("Move logged successfully");
-    } catch { showToast("Error logging move", "error"); }
+      const data = await sb("inventory", "?select=*,product:products(name,category,unit_cost,unit_of_measure)");
+      setInventory(data);
+    } catch (err) { showToast("Error loading inventory: " + (err.message || err), "error"); }
+    setLoadingInv(false);
   }
 
-  const filteredProducts = products.filter(p =>
-    p.active &&
-    (catFilter === "All" || p.category === catFilter)
+  async function loadHistory() {
+    try {
+      const data = await sb("inventory_transactions",
+        "?select=*,product:products(name,category),employee:employees(name)&order=created_at.desc&limit=200");
+      setHistory(data);
+    } catch (err) { showToast("Error loading history: " + (err.message || err), "error"); }
+  }
+
+  useEffect(() => { loadInventory(); }, []); // eslint-disable-line
+  useEffect(() => { if (tab === "history") loadHistory(); }, [tab]); // eslint-disable-line
+
+  // Build location maps for fast lookup
+  // shopLocations: branchKey → totals { itemCount, totalValue }
+  const shopLocations = {};
+  for (const opt of BRANCH_OPTIONS) {
+    shopLocations[opt.value] = { label: opt.label, items: 0, value: 0, products: {} };
+  }
+  for (const row of inventory) {
+    if (row.location_type === "shop" && row.quantity > 0) {
+      const key = row.location_id;
+      if (!shopLocations[key]) {
+        shopLocations[key] = { label: key, items: 0, value: 0, products: {} };
+      }
+      shopLocations[key].items += row.quantity;
+      shopLocations[key].value += (row.quantity * (row.product?.unit_cost || 0));
+      shopLocations[key].products[row.product_id] = row;
+    }
+  }
+
+  // truckLocations: truck.id → { truck, products }
+  const truckLocations = {};
+  for (const t of trucks) {
+    truckLocations[t.id] = { truck: t, items: 0, value: 0, products: {} };
+  }
+  for (const row of inventory) {
+    if (row.location_type === "truck" && row.quantity > 0 && truckLocations[row.location_id]) {
+      truckLocations[row.location_id].items += row.quantity;
+      truckLocations[row.location_id].value += (row.quantity * (row.product?.unit_cost || 0));
+      truckLocations[row.location_id].products[row.product_id] = row;
+    }
+  }
+
+  const filteredShops = Object.entries(shopLocations).filter(([k]) =>
+    branchFilter === "All" || k === branchFilter
+  );
+  const filteredTrucks = Object.entries(truckLocations).filter(([_, t]) =>
+    matchBranchFilter(t.truck, branchFilter) &&
+    (!q || t.truck.truck_number?.toString().toLowerCase().includes(q.toLowerCase()) ||
+      t.truck.assigned_employee?.name?.toLowerCase().includes(q.toLowerCase()))
   );
 
-  const cats = ["All","Pest","Wildlife","Rodent","Mosquito","Termite","Insulation"];
-  const catColors = {Pest:"#F59E0B",Wildlife:"#22C55E",Rodent:"#EF4444",Mosquito:"#14B8A6",Termite:"#A855F7",Insulation:"#3B82F6"};
+  function openMove(action) {
+    if (!isManager && action !== "usage") {
+      showToast("Only managers and leads can perform this action", "error");
+      return;
+    }
+    setMoveModal({ action });
+  }
 
   return (
-    <div style={{padding:0,maxWidth:"100%"}}>
-      <div style={{background:"#1a6b3c",color:"white",padding:"13px 18px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <div style={{background:"rgba(255,255,255,.15)",borderRadius:8,width:30,height:30,display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>📦</div>
-          <div>
-            <div style={{fontSize:14,fontWeight:600}}>Critter Stop Inventory</div>
-            <div style={{fontSize:11,opacity:.75}}>{branch === "All" ? "All branches" : branch} · {products.filter(p=>p.active).length} products</div>
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        📦 Inventory across shops and trucks · {products.filter(p => p.active).length} active products · {Object.keys(shopLocations).length} shops · {trucks.length} trucks
+      </div>
+
+      <div className="tabs" style={{marginBottom:14}}>
+        {[["shops","Shops"],["trucks","Trucks"],["log","Log Move"],["history","History"]].map(([t,l]) => (
+          <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
+        ))}
+      </div>
+
+      {/* Shops tab */}
+      {tab === "shops" && (
+        <div>
+          <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
+            <select className="branch-select" value={branchFilter} onChange={e=>setBranchFilter(e.target.value)}>
+              <option value="All">All branches</option>
+              {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+            </select>
+            {isManager && <div style={{flex:1}} />}
+            {isManager && <Btn variant="primary" onClick={() => openMove("add_stock")}>+ Add shop stock</Btn>}
+          </div>
+          {loadingInv ? <div className="loading">Loading...</div> : (
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12}}>
+              {filteredShops.map(([key, shop]) => (
+                <div key={key} className="mod-card" style={{cursor:"pointer"}}
+                  onClick={() => setMoveModal({ action: "view_shop", location: key, label: shop.label })}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+                    <div style={{fontSize:14,fontWeight:600}}>🏪 {shop.label}</div>
+                    <Badge color={shop.items > 0 ? "green" : "gray"}>{shop.items > 0 ? `${shop.items} items` : "Empty"}</Badge>
+                  </div>
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:4}}>
+                    {Object.keys(shop.products).length} SKUs · ${shop.value.toFixed(2)} value
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Trucks tab */}
+      {tab === "trucks" && (
+        <div>
+          <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
+            <select className="branch-select" value={branchFilter} onChange={e=>setBranchFilter(e.target.value)}>
+              <option value="All">All branches</option>
+              {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+            </select>
+            <div style={{flex:1,minWidth:180,display:"flex",alignItems:"center",gap:8,background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:"6px 11px"}}>
+              <span style={{color:"#4A5568"}}>⌕</span>
+              <input style={{background:"none",border:"none",outline:"none",color:"#E8EDF5",fontSize:13,flex:1,fontFamily:"DM Sans,sans-serif"}} placeholder="Search by truck # or driver..." value={q} onChange={e=>setQ(e.target.value)} />
+            </div>
+            {isManager && <Btn variant="primary" onClick={() => openMove("load_truck")}>+ Load truck</Btn>}
+          </div>
+          {loadingInv ? <div className="loading">Loading...</div> : (
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12}}>
+              {filteredTrucks.length === 0 ? (
+                <div className="empty-state" style={{gridColumn:"1/-1"}}>No trucks match the current filter</div>
+              ) : filteredTrucks.map(([id, t]) => (
+                <div key={id} className="mod-card" style={{cursor:"pointer"}}
+                  onClick={() => setMoveModal({ action: "view_truck", location: id, label: `Truck #${t.truck.truck_number}` })}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+                    <div style={{fontSize:14,fontWeight:600}}>🚛 #{t.truck.truck_number}</div>
+                    <Badge color={t.items > 0 ? "green" : "gray"}>{t.items > 0 ? `${t.items} items` : "Empty"}</Badge>
+                  </div>
+                  <div style={{fontSize:11,color:"#8A95A8"}}>
+                    {t.truck.assigned_employee?.name || "Unassigned"} · {branchLabel(t.truck)}
+                  </div>
+                  {t.items > 0 && (
+                    <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
+                      {Object.keys(t.products).length} SKUs · ${t.value.toFixed(2)} value
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Log Move tab — quick action buttons */}
+      {tab === "log" && (
+        <div>
+          <div className="alert blue" style={{marginBottom:14}}>
+            ✏ Quick inventory moves. {isManager ? "Choose an action below." : "Only the 'Log usage' action is available to employees."}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:10}}>
+            {isManager && (
+              <>
+                <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("load_truck")}>
+                  <div style={{fontSize:22,marginBottom:6}}>🚛</div>
+                  <div style={{fontSize:13,fontWeight:600}}>Load truck</div>
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Move stock from shop to a truck</div>
+                </div>
+                <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("return")}>
+                  <div style={{fontSize:22,marginBottom:6}}>↩</div>
+                  <div style={{fontSize:13,fontWeight:600}}>Return to shop</div>
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Pull stock off a truck back to shop</div>
+                </div>
+                <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("add_stock")}>
+                  <div style={{fontSize:22,marginBottom:6}}>📥</div>
+                  <div style={{fontSize:13,fontWeight:600}}>Add shop stock</div>
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Receive a delivery into a shop</div>
+                </div>
+                <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("adjust")}>
+                  <div style={{fontSize:22,marginBottom:6}}>⚠</div>
+                  <div style={{fontSize:13,fontWeight:600}}>Adjust / write-off</div>
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Correct quantities or write off damaged stock</div>
+                </div>
+                <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("distributor_purchase")}>
+                  <div style={{fontSize:22,marginBottom:6}}>🏬</div>
+                  <div style={{fontSize:13,fontWeight:600}}>Distributor purchase</div>
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Tech bought direct from distributor → adds to their truck</div>
+                </div>
+              </>
+            )}
+            <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("usage")}>
+              <div style={{fontSize:22,marginBottom:6}}>📊</div>
+              <div style={{fontSize:13,fontWeight:600}}>Log usage</div>
+              <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Record product used on a job</div>
+            </div>
           </div>
         </div>
-        <select style={{background:"rgba(255,255,255,.15)",border:"1px solid rgba(255,255,255,.3)",borderRadius:7,padding:"5px 9px",color:"white",fontSize:12,outline:"none",cursor:"pointer"}}
-          value={branch} onChange={e => setBranch(e.target.value)} disabled={!isManager}>
-          <option value="All" style={{background:"#1a6b3c"}}>All branches</option>
-          {["DFW","OKC","ATX","CStat"].map(b => <option key={b} value={b} style={{background:"#1a6b3c"}}>{b}</option>)}
-        </select>
-      </div>
+      )}
 
-      <div style={{display:"flex",background:"#f7f8f6",borderBottom:"1px solid #e5e7e3"}}>
-        {[["Total products",products.filter(p=>p.active).length,"#1a6b3c"],
-          ["Categories",6,"#1a6b3c"],
-          ["Pest items",products.filter(p=>p.category==="Pest"&&p.active).length,"#d68910"],
-          ["Wildlife items",products.filter(p=>p.category==="Wildlife"&&p.active).length,"#1a6b3c"]].map(([l,v,c]) => (
-          <div key={l} style={{flex:1,padding:"9px 12px",textAlign:"center",borderRight:"1px solid #e5e7e3"}}>
-            <div style={{fontSize:18,fontWeight:700,color:c,fontFamily:"monospace"}}>{v}</div>
-            <div style={{fontSize:10,color:"#8a8d85",textTransform:"uppercase",letterSpacing:".05em",marginTop:2}}>{l}</div>
+      {/* History tab */}
+      {tab === "history" && (
+        <div>
+          <div className="alert blue" style={{marginBottom:14}}>
+            🕓 Last 200 inventory transactions across all branches and trucks.
           </div>
-        ))}
-      </div>
-
-      <div style={{display:"flex",background:"white",borderBottom:"2px solid #e5e7e3",overflowX:"auto"}}>
-        {(isManager ? ["log","products","reorder"] : ["log","products"]).map(t => (
-          <button key={t} onClick={() => setTab(t)} style={{flex:1,minWidth:80,padding:"11px 8px",border:"none",background:"none",fontSize:12,fontWeight:tab===t?600:500,color:tab===t?"#1a6b3c":"#555750",borderBottom:tab===t?"2px solid #1a6b3c":"2px solid transparent",marginBottom:-2,cursor:"pointer",fontFamily:"DM Sans,sans-serif"}}>
-            {t==="log"?"Log Move":t==="products"?"Products":"Reorder"}
-          </button>
-        ))}
-      </div>
-
-      <div style={{padding:16,background:"#f7f8f6",minHeight:300}}>
-        {tab === "log" && (
-          <div style={{background:"white",border:"1px solid #e5e7e3",borderRadius:11,padding:16}}>
-            <div style={{fontSize:13,fontWeight:600,color:"#1a1a18",marginBottom:12}}>Log inventory move</div>
-            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16}}>
-              {(isManager
-                ? [["load_truck","🚛 Load truck"],["return","↩ Return to shop"],["add_stock","+ Add shop stock"],["usage","📊 Monthly usage"],["adjust","⚠ Adjust / write-off"]]
-                : [["load_truck","🚛 Load truck"],["return","↩ Return to shop"]]
-              ).map(([val, label]) => (
-                <button key={val} onClick={() => setForm(f => ({...f, action:val}))}
-                  style={{padding:"7px 14px",borderRadius:20,border:"1.5px solid " + (form.action===val?"#1a6b3c":"#e5e7e3"),background:form.action===val?"#e8f5ee":"white",color:form.action===val?"#1a6b3c":"#555750",fontSize:13,fontWeight:500,cursor:"pointer",fontFamily:"DM Sans,sans-serif"}}>
-                  {label}
-                </button>
-              ))}
-            </div>
-            <div style={{display:"flex",flexDirection:"column",gap:11}}>
-              <div>
-                <div style={{fontSize:11,fontWeight:500,color:"#8a8d85",textTransform:"uppercase",letterSpacing:".06em",marginBottom:5}}>Category</div>
-                <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
-                  {cats.map(c => (
-                    <button key={c} onClick={() => setCatFilter(c)}
-                      style={{padding:"4px 10px",borderRadius:12,border:"1px solid " + (catFilter===c?"#1a6b3c":"#e5e7e3"),background:catFilter===c?"#e8f5ee":"white",color:catFilter===c?"#1a6b3c":"#555750",fontSize:12,cursor:"pointer",fontFamily:"DM Sans,sans-serif"}}>
-                      {c}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div>
-                <div style={{fontSize:11,fontWeight:500,color:"#8a8d85",textTransform:"uppercase",letterSpacing:".06em",marginBottom:5}}>Product</div>
-                <select style={{width:"100%",background:"#f7f8f6",border:"1px solid #e5e7e3",borderRadius:8,padding:"8px 11px",fontSize:13,color:"#1a1a18",fontFamily:"DM Sans,sans-serif",outline:"none"}}
-                  value={form.product_id} onChange={e => setForm(f => ({...f, product_id: e.target.value}))}>
-                  <option value="">Select product...</option>
-                  {filteredProducts.map(p => (
-                    <option key={p.id} value={p.id}>{p.name} — ${p.unit_cost}/{p.unit_of_measure}</option>
-                  ))}
-                </select>
-              </div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11}}>
-                <div>
-                  <div style={{fontSize:11,fontWeight:500,color:"#8a8d85",textTransform:"uppercase",letterSpacing:".06em",marginBottom:5}}>Quantity</div>
-                  <input type="number" min="1" value={form.quantity} onChange={e => setForm(f => ({...f, quantity: e.target.value}))}
-                    style={{width:"100%",background:"#f7f8f6",border:"1px solid #e5e7e3",borderRadius:8,padding:"8px 11px",fontSize:13,color:"#1a1a18",fontFamily:"DM Sans,sans-serif",outline:"none"}} />
-                </div>
-                <div>
-                  <div style={{fontSize:11,fontWeight:500,color:"#8a8d85",textTransform:"uppercase",letterSpacing:".06em",marginBottom:5}}>Notes (optional)</div>
-                  <input type="text" value={form.notes} onChange={e => setForm(f => ({...f, notes: e.target.value}))}
-                    style={{width:"100%",background:"#f7f8f6",border:"1px solid #e5e7e3",borderRadius:8,padding:"8px 11px",fontSize:13,color:"#1a1a18",fontFamily:"DM Sans,sans-serif",outline:"none"}}
-                    placeholder="Optional notes..." />
-                </div>
-              </div>
-              <button onClick={logMove} style={{background:"#1a6b3c",color:"white",border:"none",borderRadius:10,padding:12,fontSize:14,fontWeight:600,cursor:"pointer",fontFamily:"DM Sans,sans-serif"}}>
-                Submit move
-              </button>
-            </div>
-          </div>
-        )}
-
-        {tab === "products" && (
-          <div>
-            <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:12}}>
-              {cats.map(c => (
-                <button key={c} onClick={() => setCatFilter(c)}
-                  style={{padding:"5px 12px",borderRadius:12,border:"1px solid " + (catFilter===c?"#1a6b3c":"#e5e7e3"),background:catFilter===c?"#e8f5ee":"white",color:catFilter===c?"#1a6b3c":"#555750",fontSize:12,cursor:"pointer",fontFamily:"DM Sans,sans-serif",fontWeight:catFilter===c?600:400}}>
-                  {c === "All" ? "All categories" : c}{c !== "All" ? ` (${products.filter(p=>p.category===c&&p.active).length})` : ""}
-                </button>
-              ))}
-            </div>
-            {filteredProducts.length === 0 ? (
-              <div className="empty-state">No products in this category</div>
-            ) : (
-              <div style={{background:"white",borderRadius:11,overflow:"hidden",border:"1px solid #e5e7e3"}}>
-                {filteredProducts.map((p, idx) => (
-                  <div key={p.id} style={{padding:"11px 15px",display:"flex",alignItems:"center",gap:12,borderBottom:idx<filteredProducts.length-1?"1px solid #e5e7e3":"none"}}>
-                    <div style={{width:8,height:8,borderRadius:"50%",background:catColors[p.category]||"#888",flexShrink:0}} />
-                    <div style={{flex:1,minWidth:0}}>
-                      <div style={{fontSize:13,fontWeight:500,color:"#1a1a18",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</div>
-                      <div style={{fontSize:11,color:"#8a8d85",marginTop:2}}>{p.category} · {p.unit_of_measure}{p.notes ? " · " + p.notes : ""}</div>
-                    </div>
-                    <div style={{textAlign:"right",flexShrink:0}}>
-                      <div style={{fontSize:14,fontWeight:700,color:"#1a6b3c",fontFamily:"monospace"}}>${p.unit_cost > 0 ? p.unit_cost.toFixed(2) : "—"}</div>
-                      <div style={{fontSize:10,color:"#8a8d85",marginTop:2}}>per {p.unit_of_measure}</div>
-                    </div>
-                  </div>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Date</th><th>Action</th><th>Product</th><th>Qty</th><th>From → To</th><th>By</th><th>Notes</th></tr></thead>
+              <tbody>
+                {history.length === 0 ? (
+                  <tr><td colSpan={7}><div className="empty-state">No transactions yet</div></td></tr>
+                ) : history.map(tx => (
+                  <tr key={tx.id}>
+                    <td style={{fontSize:11,color:"#8A95A8"}}>{new Date(tx.created_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</td>
+                    <td><Badge color={tx.action === "load_truck" ? "blue" : tx.action === "return" ? "amber" : tx.action === "usage" ? "green" : tx.action === "adjust" ? "red" : tx.action === "distributor_purchase" ? "purple" : "gray"}>{tx.action}</Badge></td>
+                    <td><strong>{tx.product?.name || "—"}</strong></td>
+                    <td style={{fontFamily:"monospace"}}>{tx.quantity}</td>
+                    <td style={{fontSize:11,color:"#8A95A8"}}>{tx.from_location || "—"} → {tx.to_location || "—"}</td>
+                    <td style={{fontSize:12}}>{tx.employee?.name || "—"}</td>
+                    <td style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>
+                      {tx.action === "distributor_purchase" && tx.vendor && (
+                        <div style={{color:"#A855F7",fontSize:11,fontWeight:600}}>🏬 {tx.vendor}{tx.invoice_number ? ` · #${tx.invoice_number}` : ""}{tx.total_cost ? ` · $${parseFloat(tx.total_cost).toFixed(2)}` : ""}</div>
+                      )}
+                      {tx.notes || (tx.action === "distributor_purchase" ? "" : "—")}
+                    </td>
+                  </tr>
                 ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {moveModal && (
+        <InventoryMoveModal
+          modal={moveModal}
+          inventory={inventory}
+          products={products}
+          trucks={trucks}
+          shopLocations={shopLocations}
+          truckLocations={truckLocations}
+          user={user}
+          onClose={() => setMoveModal(null)}
+          onSaved={() => { loadInventory(); if (tab === "history") loadHistory(); setMoveModal(null); }}
+          showToast={showToast}
+          catFilter={catFilter}
+          setCatFilter={setCatFilter}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Inventory Move Modal ─────────────────────────────────────────────────────
+function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations, truckLocations, user, onClose, onSaved, showToast, catFilter, setCatFilter }) {
+  const action = modal.action;
+  const isView = action === "view_shop" || action === "view_truck";
+
+  const [form, setForm] = useState({
+    from_location: "",
+    to_location:   "",
+    product_id: "",
+    quantity: 1,
+    notes: "",
+    vendor: "",
+    invoice_number: "",
+    total_cost: ""
+  });
+  const [saving, setSaving] = useState(false);
+
+  function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+
+  // View modes: just show what's at the location, no form
+  if (isView) {
+    const loc = action === "view_shop" ? shopLocations[modal.location] : truckLocations[modal.location];
+    const productRows = loc ? Object.values(loc.products) : [];
+    productRows.sort((a, b) => (a.product?.name || "").localeCompare(b.product?.name || ""));
+    return (
+      <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+        <div className="modal" style={{maxWidth:560, maxHeight:"90vh", overflowY:"auto"}}>
+          <div className="modal-top">
+            <div>
+              <div className="modal-title">{action === "view_shop" ? "🏪" : "🚛"} {modal.label}</div>
+              <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+                {productRows.length} SKUs · {loc?.items || 0} items · ${(loc?.value || 0).toFixed(2)} value
+              </div>
+            </div>
+            <div className="modal-close" onClick={onClose}>✕</div>
+          </div>
+          <div className="modal-body">
+            {productRows.length === 0 ? (
+              <div className="empty-state">No inventory at this location</div>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead><tr><th>Product</th><th>Category</th><th>Qty</th><th>Value</th></tr></thead>
+                  <tbody>
+                    {productRows.map(r => (
+                      <tr key={r.id}>
+                        <td><strong>{r.product?.name || "—"}</strong></td>
+                        <td><Badge color="gray">{r.product?.category || "—"}</Badge></td>
+                        <td style={{fontFamily:"monospace"}}>{r.quantity} {r.product?.unit_of_measure || ""}</td>
+                        <td style={{fontFamily:"monospace",fontSize:11,color:"#8A95A8"}}>${(r.quantity * (r.product?.unit_cost || 0)).toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
-        )}
+        </div>
+      </div>
+    );
+  }
 
-        {tab === "reorder" && isManager && (
+  // Choices for from/to depending on action
+  const shopOptions = BRANCH_OPTIONS.map(b => b.value);
+  const truckOptions = trucks.map(t => ({
+    value: t.id,
+    label: `Truck #${t.truck_number} · ${t.assigned_employee?.name || "Unassigned"}`
+  }));
+
+  const titles = {
+    load_truck:           "🚛 Load truck",
+    return:               "↩ Return to shop",
+    add_stock:            "📥 Add shop stock",
+    adjust:               "⚠ Adjust / write-off",
+    usage:                "📊 Log product usage",
+    distributor_purchase: "🏬 Distributor purchase"
+  };
+  const titleHint = {
+    load_truck:           "Move stock from a shop to a truck",
+    return:               "Pull stock off a truck back to a shop",
+    add_stock:            "Add new stock to a shop (e.g. delivery received)",
+    adjust:               "Correct quantities or write off damaged/lost stock",
+    usage:                "Record product used on a job (subtracts from a truck or shop)",
+    distributor_purchase: "Tech bought direct from a distributor — adds to the chosen truck. Captures vendor + invoice + actual cost."
+  };
+
+  async function save() {
+    if (!form.product_id) { showToast("Select a product", "error"); return; }
+    const qty = parseInt(form.quantity, 10);
+    if (!qty || qty < 1) { showToast("Quantity must be at least 1", "error"); return; }
+
+    let fromType = null, fromId = null, toType = null, toId = null;
+    if (action === "load_truck") {
+      if (!form.from_location || !form.to_location) { showToast("Choose both shop and truck", "error"); return; }
+      fromType = "shop";  fromId = form.from_location;
+      toType   = "truck"; toId   = form.to_location;
+    } else if (action === "return") {
+      if (!form.from_location || !form.to_location) { showToast("Choose both truck and shop", "error"); return; }
+      fromType = "truck"; fromId = form.from_location;
+      toType   = "shop";  toId   = form.to_location;
+    } else if (action === "add_stock") {
+      if (!form.to_location) { showToast("Choose a shop", "error"); return; }
+      toType = "shop"; toId = form.to_location;
+    } else if (action === "adjust") {
+      if (!form.from_location) { showToast("Choose a location", "error"); return; }
+      // Could be a shop or a truck — convention: if it's a BRANCH_OPTIONS value, it's a shop
+      const isShop = BRANCH_OPTIONS.some(b => b.value === form.from_location);
+      fromType = isShop ? "shop" : "truck"; fromId = form.from_location;
+    } else if (action === "usage") {
+      if (!form.from_location) { showToast("Choose where the product came from", "error"); return; }
+      const isShop = BRANCH_OPTIONS.some(b => b.value === form.from_location);
+      fromType = isShop ? "shop" : "truck"; fromId = form.from_location;
+    } else if (action === "distributor_purchase") {
+      if (!form.to_location) { showToast("Choose which truck received the product", "error"); return; }
+      toType = "truck"; toId = form.to_location;
+    }
+
+    setSaving(true);
+    try {
+      // Helper: get/upsert inventory row
+      async function adjustQuantity(locType, locId, delta) {
+        const existing = inventory.find(r =>
+          r.location_type === locType && r.location_id === locId && r.product_id === form.product_id
+        );
+        if (existing) {
+          const newQty = (existing.quantity || 0) + delta;
+          if (newQty < 0) throw new Error(`Not enough stock at ${locId} (have ${existing.quantity}, need ${-delta})`);
+          await sbPatch("inventory", existing.id, { quantity: newQty, updated_at: new Date().toISOString() });
+        } else {
+          if (delta < 0) throw new Error(`No inventory exists at ${locId} to subtract from`);
+          await sbPost("inventory", {
+            product_id: form.product_id,
+            location_type: locType,
+            location_id: locId,
+            quantity: delta
+          });
+        }
+      }
+
+      // Apply the move
+      if (fromType && fromId) await adjustQuantity(fromType, fromId, -qty);
+      if (toType   && toId)   await adjustQuantity(toType,   toId,   +qty);
+
+      // Log the transaction
+      const txPayload = {
+        product_id: form.product_id,
+        employee_id: user.id,
+        action: action,
+        quantity: qty,
+        from_location: fromId || null,
+        to_location: toId || null,
+        notes: form.notes || null
+      };
+      // Distributor-purchase metadata: vendor, invoice, cost
+      if (action === "distributor_purchase") {
+        txPayload.vendor = form.vendor.trim() || null;
+        txPayload.invoice_number = form.invoice_number.trim() || null;
+        const tc = parseFloat(form.total_cost);
+        txPayload.total_cost = isNaN(tc) ? null : tc;
+      }
+      await sbPost("inventory_transactions", txPayload);
+
+      showToast("Move logged successfully");
+      onSaved();
+    } catch (err) {
+      showToast("Error: " + (err.message || err), "error");
+    }
+    setSaving(false);
+  }
+
+  const filteredProducts = products.filter(p => p.active && (catFilter === "All" || p.category === catFilter));
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:520, maxHeight:"90vh", overflowY:"auto"}}>
+        <div className="modal-top">
           <div>
-            <div style={{background:"#FEF3C7",border:"1px solid rgba(245,158,11,.3)",borderRadius:10,padding:"11px 14px",marginBottom:14,fontSize:13,color:"#92400E"}}>
-              ⚠ Set reorder thresholds in Settings → Products. Items below threshold will appear here automatically.
+            <div className="modal-title">{titles[action]}</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>{titleHint[action]}</div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          {/* From / To pickers */}
+          {(action === "load_truck") && (
+            <>
+              <div className="form-group">
+                <label className="form-label">From shop *</label>
+                <select className="form-input" value={form.from_location} onChange={e => update("from_location", e.target.value)}>
+                  <option value="">— Select shop —</option>
+                  {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+                </select>
+              </div>
+              <div className="form-group">
+                <label className="form-label">To truck *</label>
+                <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
+                  <option value="">— Select truck —</option>
+                  {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </div>
+            </>
+          )}
+          {action === "return" && (
+            <>
+              <div className="form-group">
+                <label className="form-label">From truck *</label>
+                <select className="form-input" value={form.from_location} onChange={e => update("from_location", e.target.value)}>
+                  <option value="">— Select truck —</option>
+                  {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </div>
+              <div className="form-group">
+                <label className="form-label">To shop *</label>
+                <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
+                  <option value="">— Select shop —</option>
+                  {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+                </select>
+              </div>
+            </>
+          )}
+          {action === "add_stock" && (
+            <div className="form-group">
+              <label className="form-label">To shop *</label>
+              <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
+                <option value="">— Select shop —</option>
+                {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+              </select>
             </div>
-            <div className="table-wrap" style={{marginTop:0}}>
-              <div className="table-head"><span className="table-title">All products with thresholds</span><Btn variant="primary" onClick={()=>{}}>Send Veseris order</Btn></div>
+          )}
+          {(action === "adjust" || action === "usage") && (
+            <div className="form-group">
+              <label className="form-label">{action === "usage" ? "Used from *" : "Adjust at *"}</label>
+              <select className="form-input" value={form.from_location} onChange={e => update("from_location", e.target.value)}>
+                <option value="">— Select location —</option>
+                <optgroup label="Shops">
+                  {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+                </optgroup>
+                <optgroup label="Trucks">
+                  {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </optgroup>
+              </select>
+            </div>
+          )}
+          {action === "distributor_purchase" && (
+            <>
+              <div className="form-group">
+                <label className="form-label">Goes to truck *</label>
+                <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
+                  <option value="">— Select truck —</option>
+                  {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1.4fr 1fr",gap:10,marginBottom:10}}>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Vendor / distributor</label>
+                  <input className="form-input" value={form.vendor}
+                    onChange={e => update("vendor", e.target.value)}
+                    placeholder="e.g. Veseris, Target Specialty, ProSource" />
+                </div>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Invoice / receipt #</label>
+                  <input className="form-input" value={form.invoice_number}
+                    onChange={e => update("invoice_number", e.target.value)}
+                    style={{fontFamily:"monospace"}}
+                    placeholder="optional" />
+                </div>
+              </div>
+              <div className="form-group">
+                <label className="form-label">Total cost paid ($)</label>
+                <input className="form-input" type="number" step="0.01" min="0" value={form.total_cost}
+                  onChange={e => update("total_cost", e.target.value)}
+                  style={{fontFamily:"monospace"}}
+                  placeholder="What the tech actually paid (incl. tax)" />
+              </div>
+            </>
+          )}
+
+          {/* Product picker with category filter */}
+          <div className="form-group">
+            <label className="form-label">Category</label>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {["All","Pest","Wildlife","Rodent","Mosquito","Termite","Insulation"].map(c => (
+                <button key={c}
+                  onClick={() => setCatFilter(c)}
+                  style={{
+                    padding:"4px 10px",borderRadius:4,fontSize:11,fontWeight:600,cursor:"pointer",
+                    border:"1px solid " + (catFilter===c ? "#22C55E" : "#2A3348"),
+                    background: catFilter===c ? "rgba(34,197,94,0.15)" : "transparent",
+                    color: catFilter===c ? "#22C55E" : "#8A95A8"
+                  }}>{c}</button>
+              ))}
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Product *</label>
+            <select className="form-input" value={form.product_id} onChange={e => update("product_id", e.target.value)}>
+              <option value="">— Select product —</option>
+              {filteredProducts
+                .sort((a,b) => a.name.localeCompare(b.name))
+                .map(p => <option key={p.id} value={p.id}>{p.name} ({p.category})</option>)}
+            </select>
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"1fr 2fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Quantity *</label>
+              <input className="form-input" type="number" min="1" value={form.quantity}
+                onChange={e => update("quantity", e.target.value)} />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Notes</label>
+              <input className="form-input" value={form.notes}
+                onChange={e => update("notes", e.target.value)}
+                placeholder="PO number, vendor, job site..." />
+            </div>
+          </div>
+
+          <div style={{display:"flex",gap:8,marginTop:8}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+              {saving ? "Saving..." : "Submit"}
+            </Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Equipment Checkout ───────────────────────────────────────────────────────
+function EquipmentPage({ user, employees, showToast }) {
+  const [tab, setTab] = useState("checkout");
+  const [equipment, setEquipment] = useState([]);
+  const [checkouts, setCheckouts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [editingEquip, setEditingEquip] = useState(null);
+  const [coForm, setCoForm] = useState({ equipment_id: "", expected_return: "", notes: "" });
+
+  const isManager = ["super_admin","manager","lead"].includes(user.access_level);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const [eq, co] = await Promise.all([
+        sb("equipment", "?select=*&order=name"),
+        sb("equipment_checkouts",
+          "?select=*,equipment:equipment(name,category),employee:employees(name)&order=checked_out_at.desc")
+      ]);
+      setEquipment(eq);
+      setCheckouts(co);
+    } catch (err) { showToast("Error loading equipment: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+
+  useEffect(() => { load(); }, []); // eslint-disable-line
+
+  // Available equipment (active + not currently checked out)
+  const checkedOutIds = new Set(checkouts.filter(c => !c.checked_in_at).map(c => c.equipment_id));
+  const available = equipment.filter(e => e.active && !checkedOutIds.has(e.id));
+  const currentlyOut = checkouts.filter(c => !c.checked_in_at);
+  const closedCheckouts = checkouts.filter(c => !!c.checked_in_at);
+
+  async function checkOut() {
+    if (!coForm.equipment_id) { showToast("Select equipment", "error"); return; }
+    try {
+      await sbPost("equipment_checkouts", {
+        equipment_id: coForm.equipment_id,
+        employee_id: user.id,
+        employee_name: user.name,
+        expected_return: coForm.expected_return || null,
+        notes: coForm.notes || null
+      });
+      showToast("Equipment checked out");
+      setCoForm({ equipment_id: "", expected_return: "", notes: "" });
+      load();
+    } catch (err) { showToast("Check out failed: " + (err.message || err), "error"); }
+  }
+
+  async function checkIn(co, returnNotes) {
+    try {
+      await sbPatch("equipment_checkouts", co.id, {
+        checked_in_at: new Date().toISOString(),
+        return_notes: returnNotes || null
+      });
+      showToast("Equipment checked back in");
+      load();
+    } catch (err) { showToast("Check in failed: " + (err.message || err), "error"); }
+  }
+
+  async function removeEquip(eq) {
+    if (!window.confirm(`Remove "${eq.name}" from equipment list? This cannot be undone.`)) return;
+    try {
+      await sbDelete("equipment", eq.id);
+      showToast("Equipment removed");
+      load();
+    } catch (err) { showToast("Remove failed: " + (err.message || err), "error"); }
+  }
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        🔧 Check out & check in shared tools, traps, ladders, etc. {equipment.filter(e => e.active).length} items registered · {currentlyOut.length} currently out
+      </div>
+
+      <div className="tabs" style={{marginBottom:14}}>
+        {[["checkout","Check Out"],["checkin","Check In"],["log","Log"]].concat(isManager ? [["manage","Manage Equipment"]] : []).map(([t,l]) => (
+          <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
+        ))}
+      </div>
+
+      {/* Check Out tab */}
+      {tab === "checkout" && (
+        <div>
+          <div className="mod-card" style={{marginBottom:14}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Checking out as: {user.name}</div>
+            <div className="form-group">
+              <label className="form-label">Equipment item *</label>
+              <select className="form-input" value={coForm.equipment_id}
+                onChange={e => setCoForm(f => ({...f, equipment_id: e.target.value}))}>
+                <option value="">Select equipment...</option>
+                {available.sort((a,b) => a.name.localeCompare(b.name)).map(e => (
+                  <option key={e.id} value={e.id}>{e.name}{e.category ? ` (${e.category})` : ""}{e.serial_number ? ` · S/N ${e.serial_number}` : ""}</option>
+                ))}
+              </select>
+              {available.length === 0 && !loading && (
+                <div style={{fontSize:11,color:"#F59E0B",marginTop:6}}>No equipment currently available — all items are either checked out or inactive.</div>
+              )}
+            </div>
+            <div className="form-group">
+              <label className="form-label">Expected return</label>
+              <input className="form-input" type="date" value={coForm.expected_return}
+                onChange={e => setCoForm(f => ({...f, expected_return: e.target.value}))} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Notes</label>
+              <textarea className="form-input" rows={2} value={coForm.notes}
+                onChange={e => setCoForm(f => ({...f, notes: e.target.value}))}
+                placeholder="Job site, purpose..." />
+            </div>
+            <Btn variant="primary" style={{width:"100%"}} onClick={checkOut} disabled={!coForm.equipment_id}>Check Out</Btn>
+          </div>
+
+          <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Currently checked out ({currentlyOut.length})</div>
+          {loading ? <div className="loading">Loading...</div> : currentlyOut.length === 0 ? (
+            <div className="empty-state">No equipment currently checked out</div>
+          ) : (
+            <div className="table-wrap">
               <table>
-                <thead><tr><th>Product</th><th>Category</th><th>Unit cost</th><th>Reorder min</th><th>Supplier</th></tr></thead>
+                <thead><tr><th>Equipment</th><th>Checked out by</th><th>Date out</th><th>Expected back</th><th>Notes</th></tr></thead>
                 <tbody>
-                  {products.filter(p=>p.active&&p.reorder_threshold>0).map(p => (
-                    <tr key={p.id}>
-                      <td><strong>{p.name}</strong></td>
-                      <td><Badge color={p.category==="Pest"?"amber":p.category==="Wildlife"?"green":p.category==="Rodent"?"red":"blue"}>{p.category}</Badge></td>
-                      <td style={{fontFamily:"monospace"}}>${p.unit_cost.toFixed(2)}</td>
-                      <td style={{fontFamily:"monospace"}}>{p.reorder_threshold}</td>
-                      <td>{p.supplier}</td>
+                  {currentlyOut.map(co => {
+                    const overdue = co.expected_return && new Date(co.expected_return) < new Date();
+                    return (
+                      <tr key={co.id}>
+                        <td><strong>{co.equipment?.name || "—"}</strong></td>
+                        <td>{co.employee_name || co.employee?.name || "—"}</td>
+                        <td style={{fontSize:12}}>{new Date(co.checked_out_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}</td>
+                        <td>{co.expected_return ? <Badge color={overdue?"red":"blue"}>{new Date(co.expected_return).toLocaleDateString("en-US",{month:"short",day:"numeric"})}</Badge> : <span style={{color:"#8A95A8"}}>—</span>}</td>
+                        <td style={{fontSize:11,color:"#8A95A8"}}>{co.notes || "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Check In tab */}
+      {tab === "checkin" && (
+        <div>
+          {loading ? <div className="loading">Loading...</div> : currentlyOut.length === 0 ? (
+            <div className="empty-state">Nothing to check back in</div>
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Equipment</th><th>Checked out by</th><th>Date out</th><th>Expected back</th><th>Actions</th></tr></thead>
+                <tbody>
+                  {currentlyOut.map(co => {
+                    const overdue = co.expected_return && new Date(co.expected_return) < new Date();
+                    return (
+                      <tr key={co.id}>
+                        <td><strong>{co.equipment?.name || "—"}</strong></td>
+                        <td>{co.employee_name || co.employee?.name || "—"}</td>
+                        <td style={{fontSize:12}}>{new Date(co.checked_out_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}</td>
+                        <td>{co.expected_return ? <Badge color={overdue?"red":"blue"}>{new Date(co.expected_return).toLocaleDateString("en-US",{month:"short",day:"numeric"})}</Badge> : <span style={{color:"#8A95A8"}}>—</span>}</td>
+                        <td>
+                          <Btn variant="primary" onClick={() => {
+                            const notes = window.prompt("Return notes (optional, e.g. 'damaged tip', 'missing battery'):", "");
+                            if (notes !== null) checkIn(co, notes);
+                          }}>Check In</Btn>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Log tab */}
+      {tab === "log" && (
+        <div>
+          <div className="alert blue" style={{marginBottom:14}}>
+            🕓 Last {checkouts.length} checkout events.
+          </div>
+          {loading ? <div className="loading">Loading...</div> : (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Equipment</th><th>Person</th><th>Out</th><th>Back</th><th>Status</th><th>Notes</th></tr></thead>
+                <tbody>
+                  {checkouts.length === 0 ? (
+                    <tr><td colSpan={6}><div className="empty-state">No checkout history yet</div></td></tr>
+                  ) : checkouts.map(co => (
+                    <tr key={co.id}>
+                      <td><strong>{co.equipment?.name || "—"}</strong></td>
+                      <td>{co.employee_name || co.employee?.name || "—"}</td>
+                      <td style={{fontSize:12}}>{new Date(co.checked_out_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}</td>
+                      <td style={{fontSize:12}}>{co.checked_in_at ? new Date(co.checked_in_at).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "—"}</td>
+                      <td>{co.checked_in_at ? <Badge color="green">Returned</Badge> : <Badge color="amber">Out</Badge>}</td>
+                      <td style={{fontSize:11,color:"#8A95A8",maxWidth:220}}>
+                        {co.notes || "—"}
+                        {co.return_notes && <div style={{marginTop:2}}>↩ {co.return_notes}</div>}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
+          )}
+        </div>
+      )}
+
+      {/* Manage Equipment tab — managers only */}
+      {tab === "manage" && isManager && (
+        <div>
+          <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}>
+            <Btn variant="primary" onClick={() => { setEditingEquip(null); setShowAdd(true); }}>+ Add equipment</Btn>
           </div>
-        )}
+          {loading ? <div className="loading">Loading...</div> : (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Name</th><th>Category</th><th>Serial #</th><th>Branch</th><th>Status</th><th>Active</th><th>Actions</th></tr></thead>
+                <tbody>
+                  {equipment.length === 0 ? (
+                    <tr><td colSpan={7}><div className="empty-state">No equipment registered yet — click "+ Add equipment"</div></td></tr>
+                  ) : equipment.map(eq => {
+                    const isOut = checkedOutIds.has(eq.id);
+                    return (
+                      <tr key={eq.id}>
+                        <td><strong>{eq.name}</strong></td>
+                        <td>{eq.category || "—"}</td>
+                        <td style={{fontFamily:"monospace",fontSize:11}}>{eq.serial_number || "—"}</td>
+                        <td>{eq.branch || "—"}</td>
+                        <td>{isOut ? <Badge color="amber">Checked out</Badge> : <Badge color="green">Available</Badge>}</td>
+                        <td>{eq.active ? <Badge color="green">Active</Badge> : <Badge color="gray">Inactive</Badge>}</td>
+                        <td>
+                          <div style={{display:"flex",gap:6}}>
+                            <Btn onClick={() => { setEditingEquip(eq); setShowAdd(true); }}>Edit</Btn>
+                            <Btn variant="red" onClick={() => removeEquip(eq)} disabled={isOut}>Remove</Btn>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {showAdd && (
+        <EquipmentModal
+          equipment={editingEquip}
+          onClose={() => { setShowAdd(false); setEditingEquip(null); }}
+          onSaved={() => { setShowAdd(false); setEditingEquip(null); load(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Equipment Add/Edit Modal ─────────────────────────────────────────────────
+function EquipmentModal({ equipment, onClose, onSaved, showToast }) {
+  const isEdit = !!equipment;
+  const [form, setForm] = useState({
+    name: equipment?.name || "",
+    category: equipment?.category || "",
+    serial_number: equipment?.serial_number || "",
+    branch: equipment?.branch || "DFW",
+    notes: equipment?.notes || "",
+    active: equipment?.active ?? true
+  });
+  const [saving, setSaving] = useState(false);
+
+  function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+
+  async function save() {
+    if (!form.name.trim()) { showToast("Name is required", "error"); return; }
+    setSaving(true);
+    try {
+      const payload = {
+        name: form.name.trim(),
+        category: form.category.trim() || null,
+        serial_number: form.serial_number.trim() || null,
+        branch: form.branch || null,
+        notes: form.notes.trim() || null,
+        active: form.active
+      };
+      if (isEdit) await sbPatch("equipment", equipment.id, payload);
+      else await sbPost("equipment", payload);
+      showToast(isEdit ? "Equipment updated" : "Equipment added");
+      onSaved();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:460}}>
+        <div className="modal-top">
+          <div><div className="modal-title">{isEdit ? "Edit equipment" : "+ Add equipment"}</div></div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Name *</label>
+            <input className="form-input" value={form.name}
+              onChange={e => update("name", e.target.value)} autoFocus
+              placeholder="e.g. 24ft Extension Ladder" />
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Category</label>
+              <input className="form-input" value={form.category}
+                onChange={e => update("category", e.target.value)}
+                placeholder="Ladder, Trap, Tool..." />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Branch</label>
+              <select className="form-input" value={form.branch}
+                onChange={e => update("branch", e.target.value)}>
+                {BASE_BRANCHES.map(b => <option key={b} value={b}>{b}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Serial number</label>
+            <input className="form-input" value={form.serial_number}
+              onChange={e => update("serial_number", e.target.value)}
+              style={{fontFamily:"monospace"}} />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Notes</label>
+            <textarea className="form-input" rows={2} value={form.notes}
+              onChange={e => update("notes", e.target.value)} />
+          </div>
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,cursor:"pointer",marginBottom:14}}>
+            <input type="checkbox" checked={form.active}
+              onChange={e => update("active", e.target.checked)} />
+            Active (available for checkout)
+          </label>
+          <div style={{display:"flex",gap:8}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+              {saving ? "Saving..." : isEdit ? "Save" : "Add equipment"}
+            </Btn>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
+
 
 // ── Fleet ─────────────────────────────────────────────────────────────────────
 function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) {
@@ -1137,18 +2248,39 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
               {["super_admin","manager","lead"].includes(user.access_level) && <Btn variant="primary" onClick={() => setTruckModalOpen(true)}>+ Add truck</Btn>}
             </div>
             <table>
-              <thead><tr><th>Truck</th><th>Branch</th><th>Driver</th><th>Plate</th><th>Mileage</th><th>Next oil</th><th>Reg expires</th><th>GPS</th><th>Actions</th></tr></thead>
+              <thead><tr><th>Truck</th><th>Branch</th><th>Dept</th><th>Driver</th><th>Plate</th><th>Mileage</th><th>Next oil</th><th>Reg expires</th><th>GPS</th><th>Actions</th></tr></thead>
               <tbody>
                 {list.length === 0 ? (
-                  <tr><td colSpan={9}><div className="empty-state">No trucks added yet — click "+ Add truck" to get started</div></td></tr>
+                  <tr><td colSpan={10}><div className="empty-state">No trucks added yet — click "+ Add truck" to get started</div></td></tr>
                 ) : list.map(t => {
                   const oil = oilStatus(t);
                   const regExp = t.reg_expires && new Date(t.reg_expires) < new Date();
                   const dot = maintenance.includes(t) || regExp ? "#EF4444" : t.has_gps ? "#22C55E" : "#8A95A8";
+                  const canEdit = ["super_admin","manager","lead"].includes(user.access_level);
                   return (
                     <tr key={t.id}>
                       <td><div style={{display:"flex",alignItems:"center",gap:7}}><div style={{width:8,height:8,borderRadius:"50%",background:dot,flexShrink:0}} /><strong>{t.truck_number}</strong></div></td>
                       <td>{t.branch}</td>
+                      <td>
+                        {canEdit ? (
+                          <select
+                            value={t.department || ""}
+                            onChange={async (e) => {
+                              const newDept = e.target.value || null;
+                              try {
+                                await sbPatch("trucks", t.id, { department: newDept });
+                                reloadTrucks();
+                                showToast(newDept ? `Dept set to ${newDept}` : "Dept cleared");
+                              } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+                            }}
+                            style={{background:"#1E2535",border:"1px solid #2A3348",borderRadius:4,padding:"3px 6px",color:"#E8EDF5",fontSize:11,fontFamily:"DM Sans,sans-serif",cursor:"pointer"}}>
+                            <option value="">—</option>
+                            {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+                          </select>
+                        ) : (
+                          t.department ? <Badge color={deptColor(t.department)}>{t.department}</Badge> : <span style={{color:"#8A95A8"}}>—</span>
+                        )}
+                      </td>
                       <td>{t.assigned_employee?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
                       <td style={{fontFamily:"monospace",fontSize:11}}>{t.plate || "—"}</td>
                       <td style={{fontFamily:"monospace"}}>{t.mileage ? t.mileage.toLocaleString() : "—"}</td>
@@ -1156,7 +2288,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                       <td><Badge color={regExp?"red":!t.reg_expires?"gray":"green"}>{t.reg_expires ? new Date(t.reg_expires).toLocaleDateString("en-US",{month:"short",year:"numeric"}) : "—"}</Badge></td>
                       <td><Badge color={t.has_gps?"green":"gray"}>{t.has_gps?"Active":"No GPS"}</Badge></td>
                       <td>
-                        {["super_admin","manager","lead"].includes(user.access_level) ? (
+                        {canEdit ? (
                           <div style={{display:"flex",gap:6}}>
                             <Btn onClick={() => { setTruckEditing(t); setTruckModalOpen(true); }}>Edit</Btn>
                             <Btn variant="red" onClick={() => removeTruck(t)}>Remove</Btn>
@@ -1765,7 +2897,9 @@ function AddEmployeeModal({ onClose, onSaved, showToast }) {
   const [form, setForm] = useState({
     name: "",
     email: "",
+    phone: "",
     branch: "DFW",
+    department: "",
     access_level: "employee",
     start_date: new Date().toISOString().slice(0,10),
     status: "onboarding"
@@ -1781,7 +2915,9 @@ function AddEmployeeModal({ onClose, onSaved, showToast }) {
       const payload = {
         name: form.name.trim(),
         email: form.email.trim() || null,
+        phone: form.phone.trim() || null,
         branch: form.branch,
+        department: form.department || null,
         access_level: form.access_level,
         start_date: form.start_date || null,
         status: form.status
@@ -1815,18 +2951,34 @@ function AddEmployeeModal({ onClose, onSaved, showToast }) {
               onChange={e => update("name", e.target.value)}
               placeholder="First Last" autoFocus />
           </div>
-          <div className="form-group">
-            <label className="form-label">Email</label>
-            <input className="form-input" type="email" value={form.email}
-              onChange={e => update("email", e.target.value)}
-              placeholder="name@critterstop.com" />
-          </div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Email</label>
+              <input className="form-input" type="email" value={form.email}
+                onChange={e => update("email", e.target.value)}
+                placeholder="name@critterstop.com" />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Phone</label>
+              <input className="form-input" type="tel" value={form.phone}
+                onChange={e => update("phone", e.target.value)}
+                placeholder="(555) 123-4567" />
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:10}}>
             <div className="form-group" style={{marginBottom:0}}>
               <label className="form-label">Branch *</label>
               <select className="form-input" value={form.branch}
                 onChange={e => update("branch", e.target.value)}>
                 {["DFW","OKC","ATX","CStat","Office"].map(b => <option key={b} value={b}>{b}</option>)}
+              </select>
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Department</label>
+              <select className="form-input" value={form.department}
+                onChange={e => update("department", e.target.value)}>
+                <option value="">— None —</option>
+                {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
               </select>
             </div>
             <div className="form-group" style={{marginBottom:0}}>
@@ -1879,11 +3031,12 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
     vin: editing.vin || "",
     plate: editing.plate || "",
     branch: editing.branch || "DFW",
+    department: editing.department || "",
     driver_id: editing.assigned_employee_id || ""
   } : {
     truck_number: "",
     year: "", make: "", model: "", vin: "", plate: "",
-    branch: "DFW", driver_id: ""
+    branch: "DFW", department: "", driver_id: ""
   });
   const [saving, setSaving] = useState(false);
 
@@ -1909,7 +3062,8 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
         model: form.model.trim(),
         vin: form.vin.trim().toUpperCase(),
         plate: form.plate.trim().toUpperCase(),
-        branch: form.branch
+        branch: form.branch,
+        department: form.department || null
       };
       let savedTruck;
       if (isEdit) {
@@ -1992,6 +3146,14 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
                 {["DFW","OKC","ATX","CStat","Office"].map(b => <option key={b} value={b}>{b}</option>)}
               </select>
             </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Department</label>
+            <select className="form-input" value={form.department}
+              onChange={e => update("department", e.target.value)}>
+              <option value="">— None —</option>
+              {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+            </select>
           </div>
           <div className="form-group">
             <label className="form-label">Assigned driver</label>
@@ -3165,6 +4327,7 @@ function ProfileModal({ person, trucks, creditCards, currentUser, onClose, onSav
     email: person?.email || "",
     phone: person?.phone || "",
     branch: person?.branch || "",
+    department: person?.department || "",
     start_date: person?.start_date || "",
     access_level: person?.access_level || "employee",
     status: person?.status || "active"
@@ -3193,6 +4356,7 @@ function ProfileModal({ person, trucks, creditCards, currentUser, onClose, onSav
         email: form.email.trim() || null,
         phone: form.phone.trim() || null,
         branch: form.branch,
+        department: form.department || null,
         start_date: form.start_date || null,
         access_level: form.access_level,
         status: form.status
@@ -3228,7 +4392,7 @@ function ProfileModal({ person, trucks, creditCards, currentUser, onClose, onSav
         <div className="modal-body">
           {editing ? (
             <div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+              <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr",gap:10,marginBottom:10}}>
                 <div className="form-group" style={{marginBottom:0}}>
                   <label className="form-label">Full name *</label>
                   <input className="form-input" value={form.name} onChange={e => update("name", e.target.value)} />
@@ -3237,6 +4401,13 @@ function ProfileModal({ person, trucks, creditCards, currentUser, onClose, onSav
                   <label className="form-label">Branch</label>
                   <select className="form-input" value={form.branch} onChange={e => update("branch", e.target.value)}>
                     {["DFW","OKC","ATX","CStat","Office"].map(b => <option key={b} value={b}>{b}</option>)}
+                  </select>
+                </div>
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Department</label>
+                  <select className="form-input" value={form.department} onChange={e => update("department", e.target.value)}>
+                    <option value="">— None —</option>
+                    {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
                   </select>
                 </div>
               </div>
@@ -3283,7 +4454,8 @@ function ProfileModal({ person, trucks, creditCards, currentUser, onClose, onSav
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
                 <div className="mod-card">
                   <div className="mod-card-title"><span style={{width:7,height:7,borderRadius:2,background:"#22C55E",display:"inline-block"}} />HR Info</div>
-                  <div className="kv"><span className="kv-key">Branch</span><span className="kv-val">{person.branch}</span></div>
+                  <div className="kv"><span className="kv-key">Branch</span><span className="kv-val">{branchLabel(person)}</span></div>
+                  <div className="kv"><span className="kv-key">Department</span><span className="kv-val">{person.department ? <Badge color={deptColor(person.department)}>{person.department}</Badge> : <span style={{color:"#8A95A8"}}>—</span>}</span></div>
                   <div className="kv"><span className="kv-key">Start date</span><span className="kv-val">{person.start_date ? new Date(person.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</span></div>
                   <div className="kv"><span className="kv-key">Access level</span><span className="kv-val">{accessLabel(person.access_level)}</span></div>
                   <div className="kv"><span className="kv-key">Email</span><span className="kv-val" style={{fontSize:10}}>{person.email || "—"}</span></div>
@@ -3407,7 +4579,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",equipment:"Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -3428,6 +4600,7 @@ export default function App() {
               {navItem("hr","HR & Onboarding","✦")}
               {navItem("timeoff","Time Off & Callouts","◈")}
               {navItem("inventory","Inventory","◧")}
+              {navItem("equipment","Equipment","🔧")}
               {navItem("fleet","Fleet","◉")}
               {navItem("inspections","Inspections","✓")}
               {navItem("cards","Credit Cards","◆")}
@@ -3456,7 +4629,8 @@ export default function App() {
             {dataLoaded && page === "people" && <People user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {dataLoaded && page === "hr" && <HR user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {page === "timeoff" && <TimeOff user={currentUser} employees={employees} showToast={showToast} />}
-            {page === "inventory" && <Inventory user={currentUser} products={products} showToast={showToast} />}
+            {page === "inventory" && <Inventory user={currentUser} products={products} trucks={trucks} employees={employees} showToast={showToast} />}
+            {page === "equipment" && <EquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
             {dataLoaded && page === "inspections" && <InspectionsPage user={currentUser} trucks={trucks} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "cards" && <CardsPage user={currentUser} employees={employees} showToast={showToast} />}
