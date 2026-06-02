@@ -213,7 +213,7 @@ tr:hover td{background:#1E2535;cursor:pointer}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const BASE_BRANCHES = ["DFW","OKC","ATX","CStat","Office"];
-const DEPARTMENTS = ["Pest","Wildlife","Insulation"];
+const DEPARTMENTS = ["Pest","Wildlife","Insulation","Project Manager","Office"];
 
 // The 6-way branch filter: DFW splits into three by department, others stay as-is
 const BRANCH_OPTIONS = [
@@ -273,7 +273,58 @@ function accessLabel(a) {
   return a === "super_admin" ? "Super Admin" : a === "manager" ? "Manager" : a === "lead" ? "Lead" : "Employee";
 }
 function deptColor(d) {
-  return d === "Pest" ? "amber" : d === "Wildlife" ? "green" : d === "Insulation" ? "blue" : "gray";
+  return d === "Pest" ? "amber" : d === "Wildlife" ? "green" : d === "Insulation" ? "blue"
+       : d === "Project Manager" ? "purple" : d === "Office" ? "gray" : "gray";
+}
+
+// ── Sorting ──────────────────────────────────────────────────────────────────
+// useSortableData: pass rows + a default sort. Returns { rows, sortKey, sortDir, requestSort }.
+// `accessor` can be a string key or a function row -> value.
+function useSortableData(rows, defaultKey, defaultDir = "asc") {
+  const [sortKey, setSortKey] = useState(defaultKey);
+  const [sortDir, setSortDir] = useState(defaultDir);
+  const [accessors, setAccessors] = useState({}); // optional override map
+
+  function requestSort(key, accessor) {
+    if (accessor) setAccessors(prev => ({ ...prev, [key]: accessor }));
+    if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortKey(key); setSortDir("asc"); }
+  }
+
+  const sortedRows = (() => {
+    if (!sortKey) return rows;
+    const acc = accessors[sortKey] || ((r) => r?.[sortKey]);
+    const out = [...rows].sort((a, b) => {
+      const av = acc(a);
+      const bv = acc(b);
+      // null/undefined go to the bottom regardless of direction
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      if (typeof av === "number" && typeof bv === "number") return av - bv;
+      return String(av).toLowerCase().localeCompare(String(bv).toLowerCase());
+    });
+    return sortDir === "desc" ? out.reverse() : out;
+  })();
+
+  return { rows: sortedRows, sortKey, sortDir, requestSort };
+}
+
+function SortableTh({ sortState, sortKey, accessor, children, style }) {
+  const active = sortState.sortKey === sortKey;
+  const arrow = !active ? "↕" : sortState.sortDir === "asc" ? "↑" : "↓";
+  return (
+    <th
+      onClick={() => sortState.requestSort(sortKey, accessor)}
+      style={{cursor:"pointer",userSelect:"none",...(style||{})}}
+      title="Click to sort"
+    >
+      <span style={{display:"inline-flex",alignItems:"center",gap:5}}>
+        {children}
+        <span style={{fontSize:9,color:active?"#22C55E":"#4A5568",fontWeight:active?700:400}}>{arrow}</span>
+      </span>
+    </th>
+  );
 }
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
@@ -391,6 +442,33 @@ function Dashboard({ user, employees, trucks, inventory }) {
     return new Date(t.reg_expires) < new Date();
   }).length;
 
+  // Items needing reorder: inventory rows where quantity <= reorder_threshold (and threshold is set)
+  const reorderRows = (inventory || []).filter(r => r.reorder_threshold != null && r.quantity <= r.reorder_threshold);
+  const reorderByLocation = {}; // location_id → count
+  for (const r of reorderRows) {
+    reorderByLocation[r.location_id] = (reorderByLocation[r.location_id] || 0) + 1;
+  }
+
+  function reorderCountForBranch(branchValue) {
+    // branchValue is a BRANCH_OPTIONS key like "DFW|Pest" or "OKC"
+    let total = reorderByLocation[branchValue] || 0;
+    // Plus trucks belonging to that branch+dept
+    const matchingTrucks = trucks.filter(t => branchKey(t) === branchValue);
+    for (const t of matchingTrucks) total += (reorderByLocation[t.id] || 0);
+    return total;
+  }
+
+  function reorderCountForDept(dept) {
+    // Sum reorders for any branch+dept combo, plus trucks where department matches
+    let total = 0;
+    for (const opt of BRANCH_OPTIONS) {
+      if (opt.value.endsWith("|" + dept)) total += (reorderByLocation[opt.value] || 0);
+    }
+    const matchingTrucks = trucks.filter(t => t.department === dept);
+    for (const t of matchingTrucks) total += (reorderByLocation[t.id] || 0);
+    return total;
+  }
+
   return (
     <div>
       <div className="stat-row">
@@ -400,6 +478,7 @@ function Dashboard({ user, employees, trucks, inventory }) {
           { label:"Total trucks", value: trucks.length, color:"#E8EDF5" },
           { label:"Oil service due", value: oilIssues, color: oilIssues > 0 ? "#EF4444" : "#22C55E" },
           { label:"Reg expired", value: regIssues, color: regIssues > 0 ? "#F59E0B" : "#22C55E" },
+          { label:"Items to reorder", value: reorderRows.length, color: reorderRows.length > 0 ? "#F59E0B" : "#22C55E" },
         ].map(s => (
           <div key={s.label} className="stat-card">
             <div className="stat-label">{s.label}</div>
@@ -407,26 +486,58 @@ function Dashboard({ user, employees, trucks, inventory }) {
           </div>
         ))}
       </div>
-      <div className="table-wrap">
-        <div className="table-head"><span className="table-title">Branch overview</span></div>
-        <table>
-          <thead><tr><th>Branch</th><th>Employees</th><th>Trucks</th><th>Onboarding</th></tr></thead>
-          <tbody>
-            {["DFW","OKC","ATX","CStat"].map(b => {
-              const bEmp = employees.filter(e => e.branch === b);
-              const bTruck = trucks.filter(t => t.branch === b);
-              const bOnboard = bEmp.filter(e => e.status === "onboarding");
-              return (
-                <tr key={b}>
-                  <td><strong>{b}</strong></td>
-                  <td>{bEmp.length}</td>
-                  <td>{bTruck.length}</td>
-                  <td>{bOnboard.length > 0 ? <Badge color="blue">{bOnboard.length} active</Badge> : <Badge color="green">Clear</Badge>}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
+        <div className="table-wrap" style={{marginBottom:0}}>
+          <div className="table-head"><span className="table-title">Branch overview</span></div>
+          <table>
+            <thead><tr><th>Branch</th><th>Employees</th><th>Trucks</th><th>To reorder</th></tr></thead>
+            <tbody>
+              {BRANCH_OPTIONS.map(opt => {
+                // Match employees + trucks by branchKey (handles DFW|Pest etc.)
+                const bEmp = employees.filter(e => branchKey(e) === opt.value);
+                const bTruck = trucks.filter(t => branchKey(t) === opt.value);
+                const reorderCount = reorderCountForBranch(opt.value);
+                return (
+                  <tr key={opt.value}>
+                    <td><strong>{opt.label}</strong></td>
+                    <td>{bEmp.length}</td>
+                    <td>{bTruck.length}</td>
+                    <td>{reorderCount > 0 ? <Badge color="amber">{reorderCount}</Badge> : <Badge color="green">Clear</Badge>}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="table-wrap" style={{marginBottom:0}}>
+          <div className="table-head"><span className="table-title">Department overview</span></div>
+          <table>
+            <thead><tr><th>Department</th><th>Employees</th><th>Trucks</th><th>To reorder</th></tr></thead>
+            <tbody>
+              {DEPARTMENTS.map(d => {
+                const dEmp = employees.filter(e => e.department === d);
+                const dTruck = trucks.filter(t => t.department === d);
+                const reorderCount = reorderCountForDept(d);
+                return (
+                  <tr key={d}>
+                    <td><Badge color={deptColor(d)}>{d}</Badge></td>
+                    <td>{dEmp.length}</td>
+                    <td>{dTruck.length}</td>
+                    <td>{reorderCount > 0 ? <Badge color="amber">{reorderCount}</Badge> : <Badge color="green">Clear</Badge>}</td>
+                  </tr>
+                );
+              })}
+              <tr>
+                <td style={{color:"#8A95A8"}}>No department</td>
+                <td>{employees.filter(e => !e.department).length}</td>
+                <td>{trucks.filter(t => !t.department).length}</td>
+                <td>—</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
@@ -451,6 +562,7 @@ function People({ user, employees, setEmployees, onProfile, showToast }) {
     (statusFilter === "All" || e.status === statusFilter) &&
     (!q || e.name.toLowerCase().includes(q.toLowerCase()))
   );
+  const sort = useSortableData(list, "name");
 
   return (
     <div>
@@ -476,11 +588,17 @@ function People({ user, employees, setEmployees, onProfile, showToast }) {
           <span className="table-title">Employees ({list.length})</span>
         </div>
         <table>
-          <thead><tr><th>Name</th><th>Branch</th><th>Start date</th><th>Access</th><th>Status</th></tr></thead>
+          <thead><tr>
+            <SortableTh sortState={sort} sortKey="name">Name</SortableTh>
+            <SortableTh sortState={sort} sortKey="branch">Branch</SortableTh>
+            <SortableTh sortState={sort} sortKey="start_date">Start date</SortableTh>
+            <SortableTh sortState={sort} sortKey="access_level">Access</SortableTh>
+            <SortableTh sortState={sort} sortKey="status">Status</SortableTh>
+          </tr></thead>
           <tbody>
-            {list.length === 0 ? (
+            {sort.rows.length === 0 ? (
               <tr><td colSpan={5}><div className="empty-state">No employees found</div></td></tr>
-            ) : list.map(e => (
+            ) : sort.rows.map(e => (
               <tr key={e.id} onClick={() => onProfile(e)}>
                 <td><strong>{e.name}</strong></td>
                 <td>{e.branch}</td>
@@ -493,6 +611,64 @@ function People({ user, employees, setEmployees, onProfile, showToast }) {
         </table>
       </div>
       {addOpen && <AddEmployeeModal onClose={() => setAddOpen(false)} onSaved={reload} showToast={showToast} />}
+    </div>
+  );
+}
+
+// ── HR Tables (sortable) ─────────────────────────────────────────────────────
+function HROnboardingTable({ list, onProfile, onAdd }) {
+  const sort = useSortableData(list, "name");
+  return (
+    <div className="table-wrap">
+      <div className="table-head"><span className="table-title">Active onboarding ({list.length})</span><Btn variant="primary" onClick={onAdd}>+ Add employee</Btn></div>
+      <table>
+        <thead><tr>
+          <SortableTh sortState={sort} sortKey="name">Employee</SortableTh>
+          <SortableTh sortState={sort} sortKey="branch">Branch</SortableTh>
+          <SortableTh sortState={sort} sortKey="start_date">Start date</SortableTh>
+          <SortableTh sortState={sort} sortKey="access_level">Access level</SortableTh>
+          <SortableTh sortState={sort} sortKey="status">Status</SortableTh>
+        </tr></thead>
+        <tbody>
+          {sort.rows.length === 0 ? (
+            <tr><td colSpan={5}><div className="empty-state">✓ No active onboarding for this branch</div></td></tr>
+          ) : sort.rows.map(e => (
+            <tr key={e.id} onClick={() => onProfile(e)}>
+              <td><strong>{e.name}</strong></td><td>{e.branch}</td>
+              <td>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
+              <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
+              <td><Badge color="blue">Onboarding</Badge></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function HRAllEmployeesTable({ list, onProfile }) {
+  const sort = useSortableData(list, "name");
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr>
+          <SortableTh sortState={sort} sortKey="name">Employee</SortableTh>
+          <SortableTh sortState={sort} sortKey="branch">Branch</SortableTh>
+          <SortableTh sortState={sort} sortKey="start_date">Start date</SortableTh>
+          <SortableTh sortState={sort} sortKey="access_level">Access</SortableTh>
+          <SortableTh sortState={sort} sortKey="status">Status</SortableTh>
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(e => (
+            <tr key={e.id} onClick={() => onProfile(e)}>
+              <td><strong>{e.name}</strong></td><td>{e.branch}</td>
+              <td style={{color:"#8A95A8",fontSize:12}}>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
+              <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
+              <td><Badge color={statusColor(e.status)}>{e.status}</Badge></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -534,41 +710,10 @@ function HR({ user, employees, setEmployees, onProfile, showToast }) {
         ))}
       </div>
       {tab === "onboarding" && (
-        <div className="table-wrap">
-          <div className="table-head"><span className="table-title">Active onboarding ({onboarding.length})</span><Btn variant="primary" onClick={() => setAddOpen(true)}>+ Add employee</Btn></div>
-          <table>
-            <thead><tr><th>Employee</th><th>Branch</th><th>Start date</th><th>Access level</th><th>Status</th></tr></thead>
-            <tbody>
-              {onboarding.length === 0 ? (
-                <tr><td colSpan={5}><div className="empty-state">✓ No active onboarding for this branch</div></td></tr>
-              ) : onboarding.map(e => (
-                <tr key={e.id} onClick={() => onProfile(e)}>
-                  <td><strong>{e.name}</strong></td><td>{e.branch}</td>
-                  <td>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
-                  <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
-                  <td><Badge color="blue">Onboarding</Badge></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <HROnboardingTable list={onboarding} onProfile={onProfile} onAdd={() => setAddOpen(true)} />
       )}
       {tab === "all" && (
-        <div className="table-wrap">
-          <table>
-            <thead><tr><th>Employee</th><th>Branch</th><th>Start date</th><th>Access</th><th>Status</th></tr></thead>
-            <tbody>
-              {list.map(e => (
-                <tr key={e.id} onClick={() => onProfile(e)}>
-                  <td><strong>{e.name}</strong></td><td>{e.branch}</td>
-                  <td style={{color:"#8A95A8",fontSize:12}}>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
-                  <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
-                  <td><Badge color={statusColor(e.status)}>{e.status}</Badge></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <HRAllEmployeesTable list={list} onProfile={onProfile} />
       )}
       {tab === "documents" && (
         <div className="alert blue">📄 Document storage is configured in Supabase Storage. Click any employee profile to upload documents for that person.</div>
@@ -713,13 +858,17 @@ function TimeOff({ user, employees, showToast }) {
   }
 
   const filtered = requests.filter(r => {
-    if (branch !== "All" && r.employee?.branch !== branch) return false;
+    if (!matchBranchFilter(r.employee, branch)) return false;
     if (!isManager && r.employee_id !== user.id) return false;
     return true;
   });
 
   const pending = filtered.filter(r => r.status === "pending");
   const callouts = filtered.filter(r => r.type === "callout");
+  // Sort hooks — run on every render to keep order consistent
+  const sortPending = useSortableData(pending, "start_date", "desc");
+  const sortAllReq  = useSortableData(filtered, "start_date", "desc");
+  const sortCallout = useSortableData(callouts, "start_date", "desc");
 
   return (
     <div>
@@ -744,9 +893,16 @@ function TimeOff({ user, employees, showToast }) {
                 <div className="table-wrap" style={{marginBottom:16}}>
                   <div className="table-head"><span className="table-title">Pending approval</span></div>
                   <table>
-                    <thead><tr><th>Employee</th><th>Branch</th><th>Dates</th><th>Reason</th><th>Type</th>{isManager && <th>Action</th>}</tr></thead>
+                    <thead><tr>
+                      <SortableTh sortState={sortPending} sortKey="employee_name" accessor={r => r.employee?.name || ""}>Employee</SortableTh>
+                      <SortableTh sortState={sortPending} sortKey="branch" accessor={r => r.employee?.branch || ""}>Branch</SortableTh>
+                      <SortableTh sortState={sortPending} sortKey="start_date">Dates</SortableTh>
+                      <SortableTh sortState={sortPending} sortKey="reason">Reason</SortableTh>
+                      <SortableTh sortState={sortPending} sortKey="type">Type</SortableTh>
+                      {isManager && <th>Action</th>}
+                    </tr></thead>
                     <tbody>
-                      {pending.map(r => (
+                      {sortPending.rows.map(r => (
                         <tr key={r.id}>
                           <td><strong>{r.employee?.name || "Unknown"}</strong></td>
                           <td>{r.employee?.branch}</td>
@@ -770,11 +926,18 @@ function TimeOff({ user, employees, showToast }) {
               <div className="table-wrap">
                 <div className="table-head"><span className="table-title">All requests</span></div>
                 <table>
-                  <thead><tr><th>Employee</th><th>Branch</th><th>Dates</th><th>Reason</th><th>Status</th><th>Type</th></tr></thead>
+                  <thead><tr>
+                    <SortableTh sortState={sortAllReq} sortKey="employee_name" accessor={r => r.employee?.name || ""}>Employee</SortableTh>
+                    <SortableTh sortState={sortAllReq} sortKey="branch" accessor={r => r.employee?.branch || ""}>Branch</SortableTh>
+                    <SortableTh sortState={sortAllReq} sortKey="start_date">Dates</SortableTh>
+                    <SortableTh sortState={sortAllReq} sortKey="reason">Reason</SortableTh>
+                    <SortableTh sortState={sortAllReq} sortKey="status">Status</SortableTh>
+                    <SortableTh sortState={sortAllReq} sortKey="type">Type</SortableTh>
+                  </tr></thead>
                   <tbody>
-                    {filtered.length === 0 ? (
+                    {sortAllReq.rows.length === 0 ? (
                       <tr><td colSpan={6}><div className="empty-state">No requests yet</div></td></tr>
-                    ) : filtered.map(r => (
+                    ) : sortAllReq.rows.map(r => (
                       <tr key={r.id}>
                         <td><strong>{r.employee?.name || "Unknown"}</strong></td>
                         <td>{r.employee?.branch}</td>
@@ -851,11 +1014,18 @@ function TimeOff({ user, employees, showToast }) {
             <Btn variant="primary" onClick={() => { setForm(f => ({...f, type:"callout"})); setShowForm(true); }}>+ Log callout</Btn>
           </div>
           <table>
-            <thead><tr><th>Employee</th><th>Branch</th><th>Date</th><th>Reason</th><th>Notice</th><th>Status</th></tr></thead>
+            <thead><tr>
+              <SortableTh sortState={sortCallout} sortKey="employee_name" accessor={r => r.employee?.name || ""}>Employee</SortableTh>
+              <SortableTh sortState={sortCallout} sortKey="branch" accessor={r => r.employee?.branch || ""}>Branch</SortableTh>
+              <SortableTh sortState={sortCallout} sortKey="start_date">Date</SortableTh>
+              <SortableTh sortState={sortCallout} sortKey="reason">Reason</SortableTh>
+              <SortableTh sortState={sortCallout} sortKey="notice_given">Notice</SortableTh>
+              <SortableTh sortState={sortCallout} sortKey="status">Status</SortableTh>
+            </tr></thead>
             <tbody>
-              {callouts.length === 0 ? (
+              {sortCallout.rows.length === 0 ? (
                 <tr><td colSpan={6}><div className="empty-state">No callouts logged yet</div></td></tr>
-              ) : callouts.map(r => (
+              ) : sortCallout.rows.map(r => (
                 <tr key={r.id}>
                   <td><strong>{r.employee?.name}</strong></td>
                   <td>{r.employee?.branch}</td>
@@ -975,10 +1145,16 @@ function OvertimeTab({ user, employees, branch, showToast }) {
       emp.ot      += Math.max(wkHours - 40, 0);
     }
   }
-  const employeeRows = Object.entries(perEmployee).sort((a,b) => b[1].total - a[1].total);
+  const employeeRows = Object.entries(perEmployee)
+    .map(([eid, e]) => ({ eid, ...e }))
+    .sort((a,b) => b.total - a.total);
 
-  const totalAllHours = employeeRows.reduce((sum, [_, e]) => sum + e.total, 0);
-  const totalAllOT    = employeeRows.reduce((sum, [_, e]) => sum + e.ot, 0);
+  const totalAllHours = employeeRows.reduce((sum, e) => sum + e.total, 0);
+  const totalAllOT    = employeeRows.reduce((sum, e) => sum + e.ot, 0);
+
+  // Sort hooks
+  const sortEmpSummary = useSortableData(employeeRows, "total", "desc");
+  const sortShifts     = useSortableData(filtered, "shift_date", "desc");
 
   return (
     <div>
@@ -1022,12 +1198,18 @@ function OvertimeTab({ user, employees, branch, showToast }) {
       <div className="table-wrap" style={{marginBottom:16}}>
         <div className="table-head"><span className="table-title">Summary by employee</span></div>
         <table>
-          <thead><tr><th>Employee</th><th>Branch</th><th>Total hours</th><th>Regular</th><th>Overtime</th></tr></thead>
+          <thead><tr>
+            <SortableTh sortState={sortEmpSummary} sortKey="name">Employee</SortableTh>
+            <SortableTh sortState={sortEmpSummary} sortKey="branch">Branch</SortableTh>
+            <SortableTh sortState={sortEmpSummary} sortKey="total">Total hours</SortableTh>
+            <SortableTh sortState={sortEmpSummary} sortKey="regular">Regular</SortableTh>
+            <SortableTh sortState={sortEmpSummary} sortKey="ot">Overtime</SortableTh>
+          </tr></thead>
           <tbody>
-            {employeeRows.length === 0 ? (
+            {sortEmpSummary.rows.length === 0 ? (
               <tr><td colSpan={5}><div className="empty-state">No shifts logged for this period</div></td></tr>
-            ) : employeeRows.map(([eid, e]) => (
-              <tr key={eid}>
+            ) : sortEmpSummary.rows.map(e => (
+              <tr key={e.eid}>
                 <td><strong>{e.name}</strong></td>
                 <td style={{fontSize:12}}>{branchLabel({branch:e.branch, department:e.dept})}</td>
                 <td style={{fontFamily:"monospace"}}>{e.total.toFixed(1)}</td>
@@ -1044,11 +1226,20 @@ function OvertimeTab({ user, employees, branch, showToast }) {
         <div className="table-head"><span className="table-title">Shift entries ({filtered.length})</span></div>
         {loading ? <div className="loading">Loading...</div> : (
           <table>
-            <thead><tr><th>Date</th><th>Employee</th><th>Start</th><th>End</th><th>Hours</th><th>Notes</th><th>Logged by</th><th>Actions</th></tr></thead>
+            <thead><tr>
+              <SortableTh sortState={sortShifts} sortKey="shift_date">Date</SortableTh>
+              <SortableTh sortState={sortShifts} sortKey="employee_name" accessor={s => s.employee?.name || ""}>Employee</SortableTh>
+              <SortableTh sortState={sortShifts} sortKey="start_time">Start</SortableTh>
+              <SortableTh sortState={sortShifts} sortKey="end_time">End</SortableTh>
+              <SortableTh sortState={sortShifts} sortKey="hours" accessor={s => parseFloat(s.hours)}>Hours</SortableTh>
+              <th>Notes</th>
+              <SortableTh sortState={sortShifts} sortKey="logger_name">Logged by</SortableTh>
+              <th>Actions</th>
+            </tr></thead>
             <tbody>
-              {filtered.length === 0 ? (
+              {sortShifts.rows.length === 0 ? (
                 <tr><td colSpan={8}><div className="empty-state">No shifts in this period — click "+ Log shift" to add one</div></td></tr>
-              ) : filtered.map(s => (
+              ) : sortShifts.rows.map(s => (
                 <tr key={s.id}>
                   <td style={{fontSize:12}}>{new Date(s.shift_date + "T12:00:00").toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}</td>
                   <td><strong>{s.employee?.name || "—"}</strong></td>
@@ -1310,7 +1501,7 @@ function Inventory({ user, products, trucks, employees, showToast }) {
       </div>
 
       <div className="tabs" style={{marginBottom:14}}>
-        {[["shops","Shops"],["trucks","Trucks"],["log","Log Move"],["history","History"]].map(([t,l]) => (
+        {[["shops","Shops"],["trucks","Trucks"],["log","Log Move"],["history","History"],["order","Order"]].map(([t,l]) => (
           <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
         ))}
       </div>
@@ -1436,32 +1627,12 @@ function Inventory({ user, products, trucks, employees, showToast }) {
           <div className="alert blue" style={{marginBottom:14}}>
             🕓 Last 200 inventory transactions across all branches and trucks.
           </div>
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>Date</th><th>Action</th><th>Product</th><th>Qty</th><th>From → To</th><th>By</th><th>Notes</th></tr></thead>
-              <tbody>
-                {history.length === 0 ? (
-                  <tr><td colSpan={7}><div className="empty-state">No transactions yet</div></td></tr>
-                ) : history.map(tx => (
-                  <tr key={tx.id}>
-                    <td style={{fontSize:11,color:"#8A95A8"}}>{new Date(tx.created_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</td>
-                    <td><Badge color={tx.action === "load_truck" ? "blue" : tx.action === "return" ? "amber" : tx.action === "usage" ? "green" : tx.action === "adjust" ? "red" : tx.action === "distributor_purchase" ? "purple" : "gray"}>{tx.action}</Badge></td>
-                    <td><strong>{tx.product?.name || "—"}</strong></td>
-                    <td style={{fontFamily:"monospace"}}>{tx.quantity}</td>
-                    <td style={{fontSize:11,color:"#8A95A8"}}>{tx.from_location || "—"} → {tx.to_location || "—"}</td>
-                    <td style={{fontSize:12}}>{tx.employee?.name || "—"}</td>
-                    <td style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>
-                      {tx.action === "distributor_purchase" && tx.vendor && (
-                        <div style={{color:"#A855F7",fontSize:11,fontWeight:600}}>🏬 {tx.vendor}{tx.invoice_number ? ` · #${tx.invoice_number}` : ""}{tx.total_cost ? ` · $${parseFloat(tx.total_cost).toFixed(2)}` : ""}</div>
-                      )}
-                      {tx.notes || (tx.action === "distributor_purchase" ? "" : "—")}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <InventoryHistoryTable history={history} />
         </div>
+      )}
+
+      {tab === "order" && (
+        <OrderTab user={user} products={products} employees={employees} showToast={showToast} />
       )}
 
       {moveModal && (
@@ -1479,6 +1650,484 @@ function Inventory({ user, products, trucks, employees, showToast }) {
           catFilter={catFilter}
           setCatFilter={setCatFilter}
         />
+      )}
+    </div>
+  );
+}
+
+// ── Inventory History Table (sortable) ───────────────────────────────────────
+function InventoryHistoryTable({ history }) {
+  const sort = useSortableData(history, "created_at", "desc");
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr>
+          <SortableTh sortState={sort} sortKey="created_at">Date</SortableTh>
+          <SortableTh sortState={sort} sortKey="action">Action</SortableTh>
+          <SortableTh sortState={sort} sortKey="product_name" accessor={t => t.product?.name || ""}>Product</SortableTh>
+          <SortableTh sortState={sort} sortKey="quantity">Qty</SortableTh>
+          <SortableTh sortState={sort} sortKey="from_location">From → To</SortableTh>
+          <SortableTh sortState={sort} sortKey="employee_name" accessor={t => t.employee?.name || ""}>By</SortableTh>
+          <th>Notes</th>
+        </tr></thead>
+        <tbody>
+          {sort.rows.length === 0 ? (
+            <tr><td colSpan={7}><div className="empty-state">No transactions yet</div></td></tr>
+          ) : sort.rows.map(tx => (
+            <tr key={tx.id}>
+              <td style={{fontSize:11,color:"#8A95A8"}}>{new Date(tx.created_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</td>
+              <td><Badge color={tx.action === "load_truck" ? "blue" : tx.action === "return" ? "amber" : tx.action === "usage" ? "green" : tx.action === "adjust" ? "red" : tx.action === "distributor_purchase" ? "purple" : "gray"}>{tx.action}</Badge></td>
+              <td><strong>{tx.product?.name || "—"}</strong></td>
+              <td style={{fontFamily:"monospace"}}>{tx.quantity}</td>
+              <td style={{fontSize:11,color:"#8A95A8"}}>{tx.from_location || "—"} → {tx.to_location || "—"}</td>
+              <td style={{fontSize:12}}>{tx.employee?.name || "—"}</td>
+              <td style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>
+                {tx.action === "distributor_purchase" && tx.vendor && (
+                  <div style={{color:"#A855F7",fontSize:11,fontWeight:600}}>🏬 {tx.vendor}{tx.invoice_number ? ` · #${tx.invoice_number}` : ""}{tx.total_cost ? ` · $${parseFloat(tx.total_cost).toFixed(2)}` : ""}</div>
+                )}
+                {tx.notes || (tx.action === "distributor_purchase" ? "" : "—")}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Order tab (inside Inventory) — tech submits a need; manager consolidates ─
+function OrderTab({ user, products, employees, showToast }) {
+  const [subtab, setSubtab] = useState("submit");
+  const isManager = ["super_admin","manager","lead"].includes(user.access_level);
+
+  return (
+    <div>
+      <div className="tabs" style={{marginBottom:14}}>
+        <button className={"tab-btn"+(subtab==="submit"?" active":"")} onClick={()=>setSubtab("submit")}>📋 Submit Request</button>
+        {isManager && (
+          <button className={"tab-btn"+(subtab==="manager"?" active":"")} onClick={()=>setSubtab("manager")}>📦 Manager View</button>
+        )}
+      </div>
+      {subtab === "submit"  && <OrderSubmit  user={user} products={products} employees={employees} showToast={showToast} />}
+      {subtab === "manager" && isManager && <OrderManager user={user} products={products} showToast={showToast} />}
+    </div>
+  );
+}
+
+// ── Order: technician submits a request ──────────────────────────────────────
+function OrderSubmit({ user, products, employees, showToast }) {
+  const [name, setName] = useState(user?.id || "");
+  const [weekNeeded, setWeekNeeded] = useState(() => {
+    // Default to next Monday
+    const d = new Date();
+    const dow = d.getDay() || 7;
+    d.setDate(d.getDate() + (8 - dow));
+    return d.toISOString().slice(0,10);
+  });
+  const [notes, setNotes] = useState("");
+  const [items, setItems] = useState([]); // [{ product_id, quantity, notes }]
+  const [pickProduct, setPickProduct] = useState("");
+  const [pickQty, setPickQty] = useState(1);
+  const [recent, setRecent] = useState([]);
+  const [saving, setSaving] = useState(false);
+
+  async function loadRecent() {
+    if (!user?.id) return;
+    try {
+      const data = await sb("orders",
+        `?requester_id=eq.${user.id}&select=*,items:order_items(*,product:products(name))&order=created_at.desc&limit=10`);
+      setRecent(data);
+    } catch (err) { /* silent */ }
+  }
+  useEffect(() => { loadRecent(); }, []); // eslint-disable-line
+
+  function addItem() {
+    if (!pickProduct) { showToast("Select a product first", "error"); return; }
+    const qty = parseInt(pickQty, 10);
+    if (!qty || qty < 1) { showToast("Quantity must be at least 1", "error"); return; }
+    // Merge into existing line if same product
+    const existing = items.findIndex(i => i.product_id === pickProduct);
+    if (existing >= 0) {
+      const next = [...items];
+      next[existing] = { ...next[existing], quantity: next[existing].quantity + qty };
+      setItems(next);
+    } else {
+      setItems(prev => [...prev, { product_id: pickProduct, quantity: qty, notes: "" }]);
+    }
+    setPickProduct("");
+    setPickQty(1);
+  }
+
+  function removeItem(idx) {
+    setItems(prev => prev.filter((_, i) => i !== idx));
+  }
+
+  function updateItemQty(idx, q) {
+    const qty = parseInt(q, 10);
+    if (isNaN(qty) || qty < 1) return;
+    setItems(prev => prev.map((it, i) => i === idx ? { ...it, quantity: qty } : it));
+  }
+
+  async function submitOrder() {
+    if (!name) { showToast("Pick your name", "error"); return; }
+    if (items.length === 0) { showToast("Add at least one product", "error"); return; }
+    const emp = employees.find(e => e.id === name) || user;
+    setSaving(true);
+    try {
+      const created = await sbPost("orders", {
+        requester_id: name,
+        requester_name: emp?.name || "Unknown",
+        week_needed: weekNeeded,
+        notes: notes.trim() || null
+      });
+      const order = Array.isArray(created) ? created[0] : created;
+      // Insert items
+      for (const it of items) {
+        await sbPost("order_items", {
+          order_id: order.id,
+          product_id: it.product_id,
+          quantity: it.quantity,
+          notes: it.notes || null
+        });
+      }
+      showToast("Order request submitted");
+      setItems([]); setNotes("");
+      loadRecent();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    setSaving(false);
+  }
+
+  // Estimated total based on unit_cost
+  const estTotal = items.reduce((sum, it) => {
+    const p = products.find(p => p.id === it.product_id);
+    return sum + ((p?.unit_cost || 0) * it.quantity);
+  }, 0);
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        📋 Tell us what you need for the week. Submissions go to your manager for ordering.
+      </div>
+
+      <div className="mod-card" style={{marginBottom:14}}>
+        <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>My Info</div>
+        <div className="form-group">
+          <label className="form-label">Your name</label>
+          <select className="form-input" value={name} onChange={e => setName(e.target.value)}>
+            <option value="">Select your name...</option>
+            {employees.filter(e => e.status !== "inactive").sort((a,b)=>a.name.localeCompare(b.name)).map(e => (
+              <option key={e.id} value={e.id}>{e.name} ({branchLabel(e)})</option>
+            ))}
+          </select>
+        </div>
+        <div className="form-group">
+          <label className="form-label">Week needed <span style={{color:"#8A95A8"}}>(select the week start)</span></label>
+          <input className="form-input" type="date" value={weekNeeded}
+            onChange={e => setWeekNeeded(e.target.value)} />
+        </div>
+        <div className="form-group">
+          <label className="form-label">Notes <span style={{color:"#8A95A8"}}>(optional)</span></label>
+          <textarea className="form-input" rows={2} value={notes}
+            onChange={e => setNotes(e.target.value)}
+            placeholder="e.g. running low on these, need before Thursday..." />
+        </div>
+      </div>
+
+      <div className="mod-card" style={{marginBottom:14}}>
+        <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Products Needed</div>
+        <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"flex-end"}}>
+          <div style={{flex:1}}>
+            <select className="form-input" value={pickProduct} onChange={e => setPickProduct(e.target.value)}>
+              <option value="">Select product...</option>
+              {products.filter(p => p.active).sort((a,b)=>a.name.localeCompare(b.name)).map(p => (
+                <option key={p.id} value={p.id}>{p.name} ({p.category})</option>
+              ))}
+            </select>
+          </div>
+          <input className="form-input" type="number" min="1" value={pickQty}
+            style={{width:70,fontFamily:"monospace",textAlign:"center"}}
+            onChange={e => setPickQty(e.target.value)} />
+          <Btn variant="primary" onClick={addItem}>+</Btn>
+        </div>
+        {items.length === 0 ? (
+          <div style={{padding:"12px 0",fontSize:13,color:"#8A95A8",textAlign:"center"}}>No products added yet</div>
+        ) : (
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {items.map((it, idx) => {
+              const p = products.find(p => p.id === it.product_id);
+              return (
+                <div key={idx} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:13,fontWeight:500}}>{p?.name || "—"}</div>
+                    <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>{p?.category} · ${(p?.unit_cost || 0).toFixed(2)} {p?.unit_of_measure ? "/ " + p.unit_of_measure : ""}</div>
+                  </div>
+                  <input type="number" min="1" value={it.quantity}
+                    onChange={e => updateItemQty(idx, e.target.value)}
+                    style={{width:60,padding:"4px 6px",background:"#0F1623",border:"1px solid #2A3348",borderRadius:4,color:"#E8EDF5",fontFamily:"monospace",textAlign:"center",fontSize:13}} />
+                  <span style={{fontSize:11,color:"#8A95A8",width:60,textAlign:"right",fontFamily:"monospace"}}>${((p?.unit_cost || 0) * it.quantity).toFixed(2)}</span>
+                  <Btn variant="red" onClick={() => removeItem(idx)}>×</Btn>
+                </div>
+              );
+            })}
+            <div style={{display:"flex",justifyContent:"space-between",padding:"8px 12px",marginTop:4,fontSize:13}}>
+              <span style={{color:"#8A95A8"}}>Estimated total ({items.length} item{items.length===1?"":"s"})</span>
+              <strong style={{fontFamily:"monospace"}}>${estTotal.toFixed(2)}</strong>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <Btn variant="primary" style={{width:"100%",padding:"12px"}} onClick={submitOrder} disabled={saving || items.length === 0}>
+        {saving ? "Submitting..." : "Submit Order Request"}
+      </Btn>
+
+      {recent.length > 0 && (
+        <div style={{marginTop:24}}>
+          <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>My Recent Requests</div>
+          {recent.map(o => (
+            <div key={o.id} className="mod-card" style={{marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                <div>
+                  <strong>{o.requester_name}</strong>
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
+                    Week of {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · Submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                  </div>
+                </div>
+                <Badge color={o.status === "pending" ? "amber" : o.status === "ordered" ? "blue" : o.status === "received" ? "green" : "gray"}>{o.status}</Badge>
+              </div>
+              {o.items && o.items.length > 0 && (
+                <div style={{borderTop:"1px solid #2A3348",paddingTop:8,marginTop:8}}>
+                  {o.items.map(it => (
+                    <div key={it.id} style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"3px 0"}}>
+                      <span>{it.product?.name || "—"}</span>
+                      <span style={{fontFamily:"monospace",color:"#8A95A8"}}>{it.adj_quantity ?? it.quantity} ea</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Order: manager view — consolidate all techs' requests for a week ──────────
+function OrderManager({ user, products, showToast }) {
+  const [orders, setOrders] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [weekFilter, setWeekFilter] = useState("");
+  const [allWeeks, setAllWeeks] = useState([]);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await sb("orders",
+        "?select=*,items:order_items(*,product:products(id,name,category,unit_cost,unit_of_measure))&order=week_needed.desc,created_at.desc&status=in.(pending,ordered)");
+      setOrders(data);
+      // Build week list
+      const weeks = Array.from(new Set(data.map(o => o.week_needed))).sort().reverse();
+      setAllWeeks(weeks);
+      if (!weekFilter && weeks.length > 0) setWeekFilter(weeks[0]);
+    } catch (err) { showToast("Error loading orders: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, []); // eslint-disable-line
+
+  const weekOrders = orders.filter(o => !weekFilter || o.week_needed === weekFilter);
+
+  // Build consolidated product totals across all orders for this week
+  const consolidated = {}; // product_id → { product, qty, adjQty, requesters }
+  for (const o of weekOrders) {
+    for (const it of (o.items || [])) {
+      const pid = it.product_id;
+      if (!consolidated[pid]) {
+        consolidated[pid] = { product: it.product, qty: 0, adjQty: 0, requesters: new Set(), customAdj: false };
+      }
+      consolidated[pid].qty    += it.quantity;
+      consolidated[pid].adjQty += (it.adj_quantity ?? it.quantity);
+      consolidated[pid].requesters.add(o.requester_name);
+    }
+  }
+  const consolidatedRows = Object.entries(consolidated).map(([pid, v]) => ({
+    product_id: pid,
+    product: v.product,
+    qty: v.qty,
+    adjQty: v.adjQty,
+    requesters: [...v.requesters]
+  }));
+  consolidatedRows.sort((a,b) => (a.product?.name || "").localeCompare(b.product?.name || ""));
+
+  const [adjustments, setAdjustments] = useState({}); // product_id → adjusted qty for this session
+  function setAdj(pid, qty) {
+    setAdjustments(prev => ({ ...prev, [pid]: qty }));
+  }
+
+  // For displaying the adjusted total
+  const totalEst = consolidatedRows.reduce((sum, r) => {
+    const adj = adjustments[r.product_id] !== undefined ? parseInt(adjustments[r.product_id], 10) || 0 : r.adjQty;
+    return sum + (adj * (r.product?.unit_cost || 0));
+  }, 0);
+
+  async function markAllOrdered() {
+    if (!window.confirm(`Mark all ${weekOrders.length} requests for this week as 'ordered'?`)) return;
+    try {
+      for (const o of weekOrders) {
+        if (o.status === "pending") {
+          await sbPatch("orders", o.id, {
+            status: "ordered",
+            ordered_at: new Date().toISOString(),
+            ordered_by: user.id
+          });
+        }
+      }
+      showToast("Marked as ordered");
+      load();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+  }
+
+  function clearWeek() {
+    if (!weekFilter) return;
+    if (!window.confirm("Clear (cancel) all pending requests for this week?")) return;
+    (async () => {
+      try {
+        for (const o of weekOrders) {
+          if (o.status === "pending") {
+            await sbPatch("orders", o.id, { status: "cancelled" });
+          }
+        }
+        showToast("Week cleared");
+        load();
+      } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    })();
+  }
+
+  // Print/Share: open a new window with a print-friendly view
+  function printOrder() {
+    if (consolidatedRows.length === 0) { showToast("Nothing to print", "error"); return; }
+    const date = weekFilter ? new Date(weekFilter + "T12:00:00").toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"}) : "All weeks";
+    const requesters = [...new Set(weekOrders.map(o => o.requester_name))].join(", ");
+    let rows = "";
+    let total = 0;
+    for (const r of consolidatedRows) {
+      const adj = adjustments[r.product_id] !== undefined ? parseInt(adjustments[r.product_id], 10) || 0 : r.adjQty;
+      const cost = adj * (r.product?.unit_cost || 0);
+      total += cost;
+      rows += `<tr><td>${r.product?.name || "—"}</td><td>${adj} ${r.product?.unit_of_measure || "ea"}</td><td style="text-align:right">$${cost.toFixed(2)}</td></tr>`;
+    }
+    const html = `<!doctype html><html><head><title>Critter Stop — Order Request</title>
+<style>
+  body{font-family:Arial,sans-serif;padding:30px;color:#1a1a18;font-size:13px;}
+  h1{color:#1a6b3c;margin-bottom:4px;font-size:18px;}
+  .meta{font-size:11px;color:#666;margin-bottom:18px;}
+  table{width:100%;border-collapse:collapse;}
+  th{text-align:left;background:#f4f4f0;padding:8px;border-bottom:2px solid #1a6b3c;font-size:11px;text-transform:uppercase;letterspacing:.05em;color:#1a6b3c;}
+  td{padding:8px;border-bottom:1px solid #e5e5e0;}
+  .total{text-align:right;color:#1a6b3c;font-weight:bold;font-size:14px;margin-top:14px;}
+  .footer{margin-top:30px;font-size:10px;color:#888;border-top:1px solid #e5e5e0;padding-top:10px;}
+</style></head><body>
+<h1>Critter Stop — Order Request</h1>
+<div class="meta">Week of <strong>${date}</strong><br/>Requested by: ${requesters}<br/>Generated: ${new Date().toLocaleString()}</div>
+<table>
+  <thead><tr><th>Product</th><th>Quantity</th><th style="text-align:right">Est. Cost</th></tr></thead>
+  <tbody>${rows}</tbody>
+</table>
+<div class="total">Estimated Total: $${total.toFixed(2)}</div>
+<div class="footer">Prices are estimates based on last known costs. Confirm pricing with vendor at time of order. This order covers ${consolidatedRows.length} products from ${weekOrders.length} request${weekOrders.length===1?"":"s"}.</div>
+<script>window.onload=()=>window.print();</script>
+</body></html>`;
+    const win = window.open("", "_blank");
+    if (!win) { showToast("Pop-up blocked — allow pop-ups for this site", "error"); return; }
+    win.document.write(html);
+    win.document.close();
+  }
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        📦 Consolidated order across all techs for the selected week. Adjust quantities before exporting.
+      </div>
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+        <div className="form-group" style={{marginBottom:0}}>
+          <label className="form-label" style={{fontSize:10}}>Filter by week</label>
+          <select className="form-input" value={weekFilter} onChange={e => setWeekFilter(e.target.value)} style={{padding:"6px 9px"}}>
+            <option value="">All weeks</option>
+            {allWeeks.map(w => (
+              <option key={w} value={w}>Week of {new Date(w + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}</option>
+            ))}
+          </select>
+        </div>
+        <div style={{flex:1}} />
+        <Btn variant="red" onClick={clearWeek}>Clear Week</Btn>
+        <Btn variant="primary" onClick={printOrder}>🖨 Print / Share</Btn>
+        <Btn onClick={markAllOrdered}>Mark Ordered</Btn>
+      </div>
+
+      {loading ? <div className="loading">Loading...</div> : weekOrders.length === 0 ? (
+        <div className="empty-state">No pending order requests for this week</div>
+      ) : (
+        <>
+          <div className="mod-card" style={{marginBottom:14}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>
+              Consolidated Order — {weekFilter ? "Week of " + new Date(weekFilter + "T12:00:00").toLocaleDateString("en-US",{month:"long",day:"numeric"}) : "All weeks"}
+              <span style={{color:"#8A95A8",marginLeft:8,fontWeight:400}}>· {weekOrders.length} request{weekOrders.length===1?"":"s"} from {[...new Set(weekOrders.map(o=>o.requester_name))].length} techs</span>
+            </div>
+            <div className="table-wrap" style={{marginBottom:0}}>
+              <table>
+                <thead><tr><th>Product</th><th>Requesters</th><th>Requested</th><th>Adj. quantity</th><th style={{textAlign:"right"}}>Est. cost</th></tr></thead>
+                <tbody>
+                  {consolidatedRows.map(r => {
+                    const adj = adjustments[r.product_id] !== undefined ? adjustments[r.product_id] : r.adjQty;
+                    const cost = (parseInt(adj,10) || 0) * (r.product?.unit_cost || 0);
+                    return (
+                      <tr key={r.product_id}>
+                        <td><strong>{r.product?.name || "—"}</strong><div style={{fontSize:10,color:"#8A95A8",marginTop:2}}>{r.product?.category}</div></td>
+                        <td style={{fontSize:11,color:"#8A95A8"}}>{r.requesters.join(", ")}</td>
+                        <td style={{fontFamily:"monospace"}}>{r.qty} {r.product?.unit_of_measure || ""}</td>
+                        <td>
+                          <input type="number" min="0" value={adj}
+                            onChange={e => setAdj(r.product_id, e.target.value)}
+                            style={{width:80,padding:"4px 8px",background:"#0F1623",border:"1px solid #2A3348",borderRadius:4,color:"#E8EDF5",fontFamily:"monospace",textAlign:"center",fontSize:13}} />
+                        </td>
+                        <td style={{textAlign:"right",fontFamily:"monospace"}}>${cost.toFixed(2)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+                <tfoot>
+                  <tr><td colSpan={4} style={{textAlign:"right",fontWeight:600,fontSize:13,paddingTop:10}}>Estimated Total</td><td style={{textAlign:"right",fontFamily:"monospace",fontWeight:700,fontSize:14,paddingTop:10}}>${totalEst.toFixed(2)}</td></tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
+
+          <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Individual Requests</div>
+          {weekOrders.map(o => (
+            <div key={o.id} className="mod-card" style={{marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                <div>
+                  <strong>{o.requester_name}</strong>
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
+                    Submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                    {o.notes && <span> · {o.notes}</span>}
+                  </div>
+                </div>
+                <Badge color={o.status === "pending" ? "amber" : o.status === "ordered" ? "blue" : "gray"}>{o.status}</Badge>
+              </div>
+              {o.items && o.items.length > 0 && (
+                <div style={{borderTop:"1px solid #2A3348",paddingTop:8,marginTop:8}}>
+                  {o.items.map(it => (
+                    <div key={it.id} style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"3px 0"}}>
+                      <span>{it.product?.name || "—"}</span>
+                      <span style={{fontFamily:"monospace",color:"#8A95A8"}}>{it.quantity} {it.product?.unit_of_measure || "ea"}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </>
       )}
     </div>
   );
@@ -1508,14 +2157,25 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations,
     const loc = action === "view_shop" ? shopLocations[modal.location] : truckLocations[modal.location];
     const productRows = loc ? Object.values(loc.products) : [];
     productRows.sort((a, b) => (a.product?.name || "").localeCompare(b.product?.name || ""));
+    const canEdit = ["super_admin","manager","lead"].includes(user.access_level);
+    const belowThresh = productRows.filter(r => r.reorder_threshold != null && r.quantity <= r.reorder_threshold);
+    async function updateThreshold(rowId, newValue) {
+      try {
+        const v = newValue === "" ? null : parseInt(newValue, 10);
+        if (newValue !== "" && (isNaN(v) || v < 0)) { showToast("Threshold must be a positive number", "error"); return; }
+        await sbPatch("inventory", rowId, { reorder_threshold: v });
+        onSaved();
+      } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    }
     return (
       <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
-        <div className="modal" style={{maxWidth:560, maxHeight:"90vh", overflowY:"auto"}}>
+        <div className="modal" style={{maxWidth:640, maxHeight:"90vh", overflowY:"auto"}}>
           <div className="modal-top">
             <div>
               <div className="modal-title">{action === "view_shop" ? "🏪" : "🚛"} {modal.label}</div>
               <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
                 {productRows.length} SKUs · {loc?.items || 0} items · ${(loc?.value || 0).toFixed(2)} value
+                {belowThresh.length > 0 && <span style={{color:"#F59E0B",marginLeft:8}}>· ⚠ {belowThresh.length} below reorder threshold</span>}
               </div>
             </div>
             <div className="modal-close" onClick={onClose}>✕</div>
@@ -1526,18 +2186,40 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations,
             ) : (
               <div className="table-wrap">
                 <table>
-                  <thead><tr><th>Product</th><th>Category</th><th>Qty</th><th>Value</th></tr></thead>
+                  <thead><tr><th>Product</th><th>Category</th><th>Qty</th><th>Reorder at</th><th>Value</th></tr></thead>
                   <tbody>
-                    {productRows.map(r => (
-                      <tr key={r.id}>
-                        <td><strong>{r.product?.name || "—"}</strong></td>
-                        <td><Badge color="gray">{r.product?.category || "—"}</Badge></td>
-                        <td style={{fontFamily:"monospace"}}>{r.quantity} {r.product?.unit_of_measure || ""}</td>
-                        <td style={{fontFamily:"monospace",fontSize:11,color:"#8A95A8"}}>${(r.quantity * (r.product?.unit_cost || 0)).toFixed(2)}</td>
-                      </tr>
-                    ))}
+                    {productRows.map(r => {
+                      const below = r.reorder_threshold != null && r.quantity <= r.reorder_threshold;
+                      return (
+                        <tr key={r.id} style={below ? {background:"rgba(245,158,11,0.05)"} : {}}>
+                          <td><strong>{r.product?.name || "—"}</strong>{below && <span style={{color:"#F59E0B",fontSize:10,marginLeft:6}}>⚠ reorder</span>}</td>
+                          <td><Badge color="gray">{r.product?.category || "—"}</Badge></td>
+                          <td style={{fontFamily:"monospace"}}>{r.quantity} {r.product?.unit_of_measure || ""}</td>
+                          <td>
+                            {canEdit ? (
+                              <input type="number" min="0" defaultValue={r.reorder_threshold ?? ""}
+                                onBlur={(e) => {
+                                  const newVal = e.target.value;
+                                  const oldVal = r.reorder_threshold == null ? "" : String(r.reorder_threshold);
+                                  if (newVal !== oldVal) updateThreshold(r.id, newVal);
+                                }}
+                                placeholder="—"
+                                style={{width:60,padding:"3px 6px",background:"#0F1623",border:"1px solid #2A3348",borderRadius:4,color:"#E8EDF5",fontFamily:"monospace",textAlign:"center",fontSize:12}} />
+                            ) : (
+                              <span style={{fontFamily:"monospace",color:"#8A95A8"}}>{r.reorder_threshold ?? "—"}</span>
+                            )}
+                          </td>
+                          <td style={{fontFamily:"monospace",fontSize:11,color:"#8A95A8"}}>${(r.quantity * (r.product?.unit_cost || 0)).toFixed(2)}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
+              </div>
+            )}
+            {canEdit && (
+              <div style={{fontSize:11,color:"#8A95A8",marginTop:8,fontStyle:"italic"}}>
+                Tip: set a reorder threshold to trigger Dashboard alerts when stock falls to or below that number. Leave blank to disable.
               </div>
             )}
           </div>
@@ -1847,6 +2529,12 @@ function EquipmentPage({ user, employees, showToast }) {
   const currentlyOut = checkouts.filter(c => !c.checked_in_at);
   const closedCheckouts = checkouts.filter(c => !!c.checked_in_at);
 
+  // Sortable data hooks — must run on every render in same order
+  const sortCheckedOut = useSortableData(currentlyOut, "checked_out_at", "desc");
+  const sortCheckIn    = useSortableData(currentlyOut, "checked_out_at", "desc");
+  const sortLog        = useSortableData(checkouts, "checked_out_at", "desc");
+  const sortEquipMgr   = useSortableData(equipment, "name");
+
   async function checkOut() {
     if (!coForm.equipment_id) { showToast("Select equipment", "error"); return; }
     try {
@@ -1933,9 +2621,15 @@ function EquipmentPage({ user, employees, showToast }) {
           ) : (
             <div className="table-wrap">
               <table>
-                <thead><tr><th>Equipment</th><th>Checked out by</th><th>Date out</th><th>Expected back</th><th>Notes</th></tr></thead>
+                <thead><tr>
+                  <SortableTh sortState={sortCheckedOut} sortKey="equipment_name" accessor={c => c.equipment?.name || ""}>Equipment</SortableTh>
+                  <SortableTh sortState={sortCheckedOut} sortKey="employee_name" accessor={c => c.employee_name || c.employee?.name || ""}>Checked out by</SortableTh>
+                  <SortableTh sortState={sortCheckedOut} sortKey="checked_out_at">Date out</SortableTh>
+                  <SortableTh sortState={sortCheckedOut} sortKey="expected_return">Expected back</SortableTh>
+                  <th>Notes</th>
+                </tr></thead>
                 <tbody>
-                  {currentlyOut.map(co => {
+                  {sortCheckedOut.rows.map(co => {
                     const overdue = co.expected_return && new Date(co.expected_return) < new Date();
                     return (
                       <tr key={co.id}>
@@ -1962,9 +2656,15 @@ function EquipmentPage({ user, employees, showToast }) {
           ) : (
             <div className="table-wrap">
               <table>
-                <thead><tr><th>Equipment</th><th>Checked out by</th><th>Date out</th><th>Expected back</th><th>Actions</th></tr></thead>
+                <thead><tr>
+                  <SortableTh sortState={sortCheckIn} sortKey="equipment_name" accessor={c => c.equipment?.name || ""}>Equipment</SortableTh>
+                  <SortableTh sortState={sortCheckIn} sortKey="employee_name" accessor={c => c.employee_name || c.employee?.name || ""}>Checked out by</SortableTh>
+                  <SortableTh sortState={sortCheckIn} sortKey="checked_out_at">Date out</SortableTh>
+                  <SortableTh sortState={sortCheckIn} sortKey="expected_return">Expected back</SortableTh>
+                  <th>Actions</th>
+                </tr></thead>
                 <tbody>
-                  {currentlyOut.map(co => {
+                  {sortCheckIn.rows.map(co => {
                     const overdue = co.expected_return && new Date(co.expected_return) < new Date();
                     return (
                       <tr key={co.id}>
@@ -1997,11 +2697,18 @@ function EquipmentPage({ user, employees, showToast }) {
           {loading ? <div className="loading">Loading...</div> : (
             <div className="table-wrap">
               <table>
-                <thead><tr><th>Equipment</th><th>Person</th><th>Out</th><th>Back</th><th>Status</th><th>Notes</th></tr></thead>
+                <thead><tr>
+                  <SortableTh sortState={sortLog} sortKey="equipment_name" accessor={c => c.equipment?.name || ""}>Equipment</SortableTh>
+                  <SortableTh sortState={sortLog} sortKey="employee_name" accessor={c => c.employee_name || c.employee?.name || ""}>Person</SortableTh>
+                  <SortableTh sortState={sortLog} sortKey="checked_out_at">Out</SortableTh>
+                  <SortableTh sortState={sortLog} sortKey="checked_in_at">Back</SortableTh>
+                  <SortableTh sortState={sortLog} sortKey="status" accessor={c => c.checked_in_at ? "Returned" : "Out"}>Status</SortableTh>
+                  <th>Notes</th>
+                </tr></thead>
                 <tbody>
-                  {checkouts.length === 0 ? (
+                  {sortLog.rows.length === 0 ? (
                     <tr><td colSpan={6}><div className="empty-state">No checkout history yet</div></td></tr>
-                  ) : checkouts.map(co => (
+                  ) : sortLog.rows.map(co => (
                     <tr key={co.id}>
                       <td><strong>{co.equipment?.name || "—"}</strong></td>
                       <td>{co.employee_name || co.employee?.name || "—"}</td>
@@ -2030,11 +2737,19 @@ function EquipmentPage({ user, employees, showToast }) {
           {loading ? <div className="loading">Loading...</div> : (
             <div className="table-wrap">
               <table>
-                <thead><tr><th>Name</th><th>Category</th><th>Serial #</th><th>Branch</th><th>Status</th><th>Active</th><th>Actions</th></tr></thead>
+                <thead><tr>
+                  <SortableTh sortState={sortEquipMgr} sortKey="name">Name</SortableTh>
+                  <SortableTh sortState={sortEquipMgr} sortKey="category">Category</SortableTh>
+                  <SortableTh sortState={sortEquipMgr} sortKey="serial_number">Serial #</SortableTh>
+                  <SortableTh sortState={sortEquipMgr} sortKey="branch">Branch</SortableTh>
+                  <SortableTh sortState={sortEquipMgr} sortKey="status" accessor={eq => checkedOutIds.has(eq.id) ? "Out" : "Available"}>Status</SortableTh>
+                  <SortableTh sortState={sortEquipMgr} sortKey="active">Active</SortableTh>
+                  <th>Actions</th>
+                </tr></thead>
                 <tbody>
-                  {equipment.length === 0 ? (
+                  {sortEquipMgr.rows.length === 0 ? (
                     <tr><td colSpan={7}><div className="empty-state">No equipment registered yet — click "+ Add equipment"</div></td></tr>
-                  ) : equipment.map(eq => {
+                  ) : sortEquipMgr.rows.map(eq => {
                     const isOut = checkedOutIds.has(eq.id);
                     return (
                       <tr key={eq.id}>
@@ -2194,14 +2909,17 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
   }
 
   const list = trucks.filter(t =>
-    (branch === "All" || t.branch === branch) &&
+    matchBranchFilter(t, branch) &&
     (!q || t.truck_number?.toLowerCase().includes(q.toLowerCase()) ||
       t.plate?.toLowerCase().includes(q.toLowerCase()) ||
       t.assigned_employee?.name?.toLowerCase().includes(q.toLowerCase()))
   );
+  const sortAll = useSortableData(list, "truck_number");
 
   const maintenance = list.filter(t => t.next_oil_miles && t.mileage >= t.next_oil_miles - 500);
   const regExpired = list.filter(t => t.reg_expires && new Date(t.reg_expires) < new Date());
+  const sortMaint = useSortableData(maintenance, "truck_number");
+  const sortReg = useSortableData(list, "reg_expires", "asc");
 
   function oilStatus(t) {
     if (!t.next_oil_miles) return { color:"#8A95A8", label:"—" };
@@ -2248,11 +2966,22 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
               {["super_admin","manager","lead"].includes(user.access_level) && <Btn variant="primary" onClick={() => setTruckModalOpen(true)}>+ Add truck</Btn>}
             </div>
             <table>
-              <thead><tr><th>Truck</th><th>Branch</th><th>Dept</th><th>Driver</th><th>Plate</th><th>Mileage</th><th>Next oil</th><th>Reg expires</th><th>GPS</th><th>Actions</th></tr></thead>
+              <thead><tr>
+                <SortableTh sortState={sortAll} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="branch">Branch</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="department">Dept</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="driver_name" accessor={t => t.assigned_employee?.name || ""}>Driver</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="plate">Plate</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="mileage">Mileage</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="next_oil_miles">Next oil</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="reg_expires">Reg expires</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="has_gps">GPS</SortableTh>
+                <th>Actions</th>
+              </tr></thead>
               <tbody>
-                {list.length === 0 ? (
+                {sortAll.rows.length === 0 ? (
                   <tr><td colSpan={10}><div className="empty-state">No trucks added yet — click "+ Add truck" to get started</div></td></tr>
-                ) : list.map(t => {
+                ) : sortAll.rows.map(t => {
                   const oil = oilStatus(t);
                   const regExp = t.reg_expires && new Date(t.reg_expires) < new Date();
                   const dot = maintenance.includes(t) || regExp ? "#EF4444" : t.has_gps ? "#22C55E" : "#8A95A8";
@@ -2308,11 +3037,18 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
         <div className="table-wrap">
           <div className="table-head"><span className="table-title">Needs service ({maintenance.length})</span></div>
           <table>
-            <thead><tr><th>Truck</th><th>Driver</th><th>Branch</th><th>Current mileage</th><th>Next oil due</th><th>Overdue by</th></tr></thead>
+            <thead><tr>
+              <SortableTh sortState={sortMaint} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
+              <SortableTh sortState={sortMaint} sortKey="driver" accessor={t => t.assigned_employee?.name || ""}>Driver</SortableTh>
+              <SortableTh sortState={sortMaint} sortKey="branch">Branch</SortableTh>
+              <SortableTh sortState={sortMaint} sortKey="mileage">Current mileage</SortableTh>
+              <SortableTh sortState={sortMaint} sortKey="next_oil_miles">Next oil due</SortableTh>
+              <SortableTh sortState={sortMaint} sortKey="overdue" accessor={t => (t.mileage || 0) - (t.next_oil_miles || 0)}>Overdue by</SortableTh>
+            </tr></thead>
             <tbody>
-              {maintenance.length === 0 ? (
+              {sortMaint.rows.length === 0 ? (
                 <tr><td colSpan={6}><div className="empty-state">✓ All trucks are up to date on oil changes</div></td></tr>
-              ) : maintenance.map(t => {
+              ) : sortMaint.rows.map(t => {
                 const overdue = t.mileage - t.next_oil_miles;
                 return (
                   <tr key={t.id}>
@@ -2333,9 +3069,22 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
       {tab === "registration" && (
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Truck</th><th>Driver</th><th>Branch</th><th>Plate</th><th>Reg expires</th><th>Status</th></tr></thead>
+            <thead><tr>
+              <SortableTh sortState={sortReg} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
+              <SortableTh sortState={sortReg} sortKey="driver" accessor={t => t.assigned_employee?.name || ""}>Driver</SortableTh>
+              <SortableTh sortState={sortReg} sortKey="branch">Branch</SortableTh>
+              <SortableTh sortState={sortReg} sortKey="plate">Plate</SortableTh>
+              <SortableTh sortState={sortReg} sortKey="reg_expires">Reg expires</SortableTh>
+              <SortableTh sortState={sortReg} sortKey="reg_status" accessor={t => {
+                if (!t.reg_expires) return "zUnknown";
+                const exp = new Date(t.reg_expires);
+                if (exp < new Date()) return "aEXPIRED";
+                if ((exp - new Date()) < 60 * 24 * 60 * 60 * 1000) return "bSoon";
+                return "cCurrent";
+              }}>Status</SortableTh>
+            </tr></thead>
             <tbody>
-              {list.map(t => {
+              {sortReg.rows.map(t => {
                 const exp = t.reg_expires ? new Date(t.reg_expires) : null;
                 const expired = exp && exp < new Date();
                 const soon = exp && !expired && (exp - new Date()) < 60 * 24 * 60 * 60 * 1000;
@@ -2399,7 +3148,7 @@ function InspectionsPage({ user, trucks, employees, showToast }) {
     }
   }
 
-  const branchTrucks = trucks.filter(t => branch === "All" || t.branch === branch);
+  const branchTrucks = trucks.filter(t => matchBranchFilter(t, branch));
 
   const filteredTrucks = branchTrucks.filter(t => {
     const latest = latestByTruck[t.id];
@@ -2412,6 +3161,7 @@ function InspectionsPage({ user, trucks, employees, showToast }) {
     }
     return true;
   });
+  const sortInsp = useSortableData(filteredTrucks, "truck_number");
 
   const stats = {
     total: branchTrucks.length,
@@ -2455,11 +3205,20 @@ function InspectionsPage({ user, trucks, employees, showToast }) {
       ) : (
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Truck</th><th>Driver</th><th>Branch</th><th>Last inspected</th><th>Inspector</th><th>Status</th><th>Issues</th><th>Actions</th></tr></thead>
+            <thead><tr>
+              <SortableTh sortState={sortInsp} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="driver" accessor={t => t.assigned_employee?.name || ""}>Driver</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="branch">Branch</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="last_inspected" accessor={t => latestByTruck[t.id]?.inspected_at}>Last inspected</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="inspector" accessor={t => latestByTruck[t.id]?.inspector_name || ""}>Inspector</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="status" accessor={t => latestByTruck[t.id]?.overall_status || "zNo"}>Status</SortableTh>
+              <th>Issues</th>
+              <th>Actions</th>
+            </tr></thead>
             <tbody>
-              {filteredTrucks.length === 0 ? (
+              {sortInsp.rows.length === 0 ? (
                 <tr><td colSpan={8}><div className="empty-state">No trucks match the filters</div></td></tr>
-              ) : filteredTrucks.map(t => {
+              ) : sortInsp.rows.map(t => {
                 const latest = latestByTruck[t.id];
                 const dot = !latest ? "#F59E0B" : latest.fail_count > 0 ? "#EF4444" : "#22C55E";
                 return (
@@ -3402,6 +4161,81 @@ function TrucksPage({ user, employees, setEmployees, trucks, setTrucks, showToas
   );
 }
 
+// ── Cards Tables (sortable) ──────────────────────────────────────────────────
+function CardsAssignedTable({ cards, onEdit, onMoveToInventory, onRemove }) {
+  const sort = useSortableData(cards, "assigned_to");
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr>
+          <SortableTh sortState={sort} sortKey="assigned_to">Assigned to</SortableTh>
+          <SortableTh sortState={sort} sortKey="name_on_card">Name on card</SortableTh>
+          <SortableTh sortState={sort} sortKey="last4">Last 4</SortableTh>
+          <SortableTh sortState={sort} sortKey="program">Program</SortableTh>
+          <th>Notes</th>
+          <th>Actions</th>
+        </tr></thead>
+        <tbody>
+          {sort.rows.length === 0 ? (
+            <tr><td colSpan={6}><div className="empty-state">No cards match the current filters</div></td></tr>
+          ) : sort.rows.map(c => (
+            <tr key={c.id}>
+              <td><strong>{c.assigned_to}</strong></td>
+              <td>{c.name_on_card}</td>
+              <td style={{fontFamily:"monospace"}}>{c.last4 ? "•••• " + c.last4 : <span style={{color:"#EF4444"}}>missing</span>}</td>
+              <td><Badge color={c.program === "Capital One" ? "blue" : "purple"}>{c.program}</Badge></td>
+              <td style={{fontSize:11,color:"#8A95A8"}}>{c.notes || "—"}</td>
+              <td>
+                <div style={{display:"flex",gap:6}}>
+                  <Btn onClick={() => onEdit(c)}>Edit</Btn>
+                  <Btn onClick={() => onMoveToInventory(c)}>→ Inventory</Btn>
+                  <Btn variant="red" onClick={() => onRemove(c)}>Remove</Btn>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function CardsInventoryTable({ cards, onAssign, onEdit, onRemove }) {
+  const sort = useSortableData(cards, "name_on_card");
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr>
+          <SortableTh sortState={sort} sortKey="name_on_card">Name on card</SortableTh>
+          <SortableTh sortState={sort} sortKey="last4">Last 4</SortableTh>
+          <SortableTh sortState={sort} sortKey="program">Program</SortableTh>
+          <th>Notes</th>
+          <th>Actions</th>
+        </tr></thead>
+        <tbody>
+          {sort.rows.length === 0 ? (
+            <tr><td colSpan={5}><div className="empty-state">Inventory is empty</div></td></tr>
+          ) : sort.rows.map(c => (
+            <tr key={c.id}>
+              <td><strong>{c.name_on_card}</strong></td>
+              <td style={{fontFamily:"monospace"}}>{c.last4 ? "•••• " + c.last4 : <span style={{color:"#EF4444"}}>missing</span>}</td>
+              <td><Badge color={c.program === "Capital One" ? "blue" : "purple"}>{c.program}</Badge></td>
+              <td style={{fontSize:11,color:"#8A95A8"}}>{c.notes || "—"}</td>
+              <td>
+                <div style={{display:"flex",gap:6}}>
+                  <Btn variant="primary" onClick={() => onAssign(c)}>Assign to person</Btn>
+                  <Btn onClick={() => onEdit(c)}>Edit</Btn>
+                  <Btn variant="red" onClick={() => onRemove(c)}>Remove</Btn>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // ── Credit Cards (standalone module) ──────────────────────────────────────────
 function CardsPage({ user, employees, showToast }) {
   const [cardsTab, setCardsTab] = useState("assigned");
@@ -3475,41 +4309,18 @@ function CardsPage({ user, employees, showToast }) {
             </select>
             <Btn variant="primary" onClick={() => setCardModal({ mode: "add-assigned", card: null })}>+ Add card</Btn>
           </div>
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>Assigned to</th><th>Name on card</th><th>Last 4</th><th>Program</th><th>Notes</th><th>Actions</th></tr></thead>
-              <tbody>
-                {(() => {
-                  const filtered = creditCards.filter(c =>
-                    (cardProgFilter === "All" || c.program === cardProgFilter) &&
-                    (!cardSearch ||
-                      c.assigned_to?.toLowerCase().includes(cardSearch.toLowerCase()) ||
-                      c.name_on_card?.toLowerCase().includes(cardSearch.toLowerCase()) ||
-                      c.last4?.includes(cardSearch))
-                  );
-                  if (filtered.length === 0) return (
-                    <tr><td colSpan={6}><div className="empty-state">No cards match the current filters</div></td></tr>
-                  );
-                  return filtered.map(c => (
-                    <tr key={c.id}>
-                      <td><strong>{c.assigned_to}</strong></td>
-                      <td>{c.name_on_card}</td>
-                      <td style={{fontFamily:"monospace"}}>{c.last4 ? "•••• " + c.last4 : <span style={{color:"#EF4444"}}>missing</span>}</td>
-                      <td><Badge color={c.program === "Capital One" ? "blue" : "purple"}>{c.program}</Badge></td>
-                      <td style={{fontSize:11,color:"#8A95A8"}}>{c.notes || "—"}</td>
-                      <td>
-                        <div style={{display:"flex",gap:6}}>
-                          <Btn onClick={() => setCardModal({ mode: "edit-assigned", card: c })}>Edit</Btn>
-                          <Btn onClick={() => moveCardToInventory(c)}>→ Inventory</Btn>
-                          <Btn variant="red" onClick={() => removeCard(c, "credit_cards")}>Remove</Btn>
-                        </div>
-                      </td>
-                    </tr>
-                  ));
-                })()}
-              </tbody>
-            </table>
-          </div>
+          <CardsAssignedTable
+            cards={creditCards.filter(c =>
+              (cardProgFilter === "All" || c.program === cardProgFilter) &&
+              (!cardSearch ||
+                c.assigned_to?.toLowerCase().includes(cardSearch.toLowerCase()) ||
+                c.name_on_card?.toLowerCase().includes(cardSearch.toLowerCase()) ||
+                c.last4?.includes(cardSearch))
+            )}
+            onEdit={c => setCardModal({ mode: "edit-assigned", card: c })}
+            onMoveToInventory={moveCardToInventory}
+            onRemove={c => removeCard(c, "credit_cards")}
+          />
         </div>
       ) : (
         <div>
@@ -3520,38 +4331,16 @@ function CardsPage({ user, employees, showToast }) {
             </div>
             <Btn variant="primary" onClick={() => setCardModal({ mode: "add-inventory", card: null })}>+ Add to inventory</Btn>
           </div>
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>Name on card</th><th>Last 4</th><th>Program</th><th>Notes</th><th>Actions</th></tr></thead>
-              <tbody>
-                {(() => {
-                  const filtered = cardInventory.filter(c =>
-                    !cardSearch ||
-                    c.name_on_card?.toLowerCase().includes(cardSearch.toLowerCase()) ||
-                    c.last4?.includes(cardSearch)
-                  );
-                  if (filtered.length === 0) return (
-                    <tr><td colSpan={5}><div className="empty-state">Inventory is empty</div></td></tr>
-                  );
-                  return filtered.map(c => (
-                    <tr key={c.id}>
-                      <td><strong>{c.name_on_card}</strong></td>
-                      <td style={{fontFamily:"monospace"}}>{c.last4 ? "•••• " + c.last4 : <span style={{color:"#EF4444"}}>missing</span>}</td>
-                      <td><Badge color={c.program === "Capital One" ? "blue" : "purple"}>{c.program}</Badge></td>
-                      <td style={{fontSize:11,color:"#8A95A8"}}>{c.notes || "—"}</td>
-                      <td>
-                        <div style={{display:"flex",gap:6}}>
-                          <Btn variant="primary" onClick={() => setCardModal({ mode: "assign-from-inventory", card: c })}>Assign to person</Btn>
-                          <Btn onClick={() => setCardModal({ mode: "edit-inventory", card: c })}>Edit</Btn>
-                          <Btn variant="red" onClick={() => removeCard(c, "card_inventory")}>Remove</Btn>
-                        </div>
-                      </td>
-                    </tr>
-                  ));
-                })()}
-              </tbody>
-            </table>
-          </div>
+          <CardsInventoryTable
+            cards={cardInventory.filter(c =>
+              !cardSearch ||
+              c.name_on_card?.toLowerCase().includes(cardSearch.toLowerCase()) ||
+              c.last4?.includes(cardSearch)
+            )}
+            onAssign={c => setCardModal({ mode: "assign-from-inventory", card: c })}
+            onEdit={c => setCardModal({ mode: "edit-inventory", card: c })}
+            onRemove={c => removeCard(c, "card_inventory")}
+          />
         </div>
       )}
 
@@ -3565,6 +4354,108 @@ function CardsPage({ user, employees, showToast }) {
           showToast={showToast}
         />
       )}
+    </div>
+  );
+}
+
+// ── Settings Tables (sortable) ───────────────────────────────────────────────
+function SettingsUsersTable({ users, currentUserId, onResetPin, onToggleAccess }) {
+  const sort = useSortableData(users, "name");
+  return (
+    <div className="table-wrap">
+      <div className="table-head"><span className="table-title">All users ({users.length})</span></div>
+      <table>
+        <thead><tr>
+          <SortableTh sortState={sort} sortKey="name">Name</SortableTh>
+          <SortableTh sortState={sort} sortKey="branch">Branch</SortableTh>
+          <SortableTh sortState={sort} sortKey="access_level">Access level</SortableTh>
+          <SortableTh sortState={sort} sortKey="status">Status</SortableTh>
+          <th>PIN</th>
+          <th>Actions</th>
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(e => (
+            <tr key={e.id}>
+              <td><strong>{e.name}</strong></td>
+              <td>{e.branch}</td>
+              <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
+              <td><Badge color={statusColor(e.status)}>{e.status}</Badge></td>
+              <td><span style={{fontFamily:"monospace",fontSize:13,letterSpacing:4,color:"#8A95A8"}}>••••</span></td>
+              <td>
+                <div style={{display:"flex",gap:6}}>
+                  <Btn onClick={() => onResetPin(e)}>Reset PIN</Btn>
+                  {e.id !== currentUserId && <Btn onClick={() => onToggleAccess(e)}>{e.access_level==="employee"?"Make lead":"Make employee"}</Btn>}
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SettingsProductsTable({ products }) {
+  const sort = useSortableData(products, "name");
+  return (
+    <div className="table-wrap">
+      <div className="table-head"><span className="table-title">Product catalog ({products.filter(p=>p.active).length} active)</span><Btn variant="primary" onClick={()=>{}}>+ Add product</Btn></div>
+      <table>
+        <thead><tr>
+          <SortableTh sortState={sort} sortKey="name">Product</SortableTh>
+          <SortableTh sortState={sort} sortKey="category">Category</SortableTh>
+          <SortableTh sortState={sort} sortKey="unit_cost">Unit cost</SortableTh>
+          <SortableTh sortState={sort} sortKey="unit_of_measure">Per</SortableTh>
+          <SortableTh sortState={sort} sortKey="reorder_threshold">Reorder min</SortableTh>
+          <SortableTh sortState={sort} sortKey="supplier">Supplier</SortableTh>
+          <SortableTh sortState={sort} sortKey="active">Active</SortableTh>
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(p => (
+            <tr key={p.id}>
+              <td><strong>{p.name}</strong>{p.notes ? <span style={{fontSize:11,color:"#8A95A8",marginLeft:6}}>{p.notes}</span> : null}</td>
+              <td><Badge color={p.category==="Pest"?"amber":p.category==="Wildlife"?"green":p.category==="Rodent"?"red":p.category==="Mosquito"?"teal":p.category==="Termite"?"purple":"blue"}>{p.category}</Badge></td>
+              <td style={{fontFamily:"monospace"}}>${p.unit_cost > 0 ? p.unit_cost.toFixed(2) : "—"}</td>
+              <td style={{color:"#8A95A8",fontSize:12}}>{p.unit_of_measure}</td>
+              <td style={{fontFamily:"monospace"}}>{p.reorder_threshold > 0 ? p.reorder_threshold : "—"}</td>
+              <td>{p.supplier}</td>
+              <td><Badge color={p.active?"green":"gray"}>{p.active?"Active":"Inactive"}</Badge></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SettingsEmployeesTable({ employees }) {
+  const sort = useSortableData(employees, "name");
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr>
+          <SortableTh sortState={sort} sortKey="name">Name</SortableTh>
+          <SortableTh sortState={sort} sortKey="email">Email</SortableTh>
+          <SortableTh sortState={sort} sortKey="branch">Branch</SortableTh>
+          <SortableTh sortState={sort} sortKey="start_date">Start date</SortableTh>
+          <SortableTh sortState={sort} sortKey="access_level">Access</SortableTh>
+          <SortableTh sortState={sort} sortKey="status">Status</SortableTh>
+          <th>Actions</th>
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(e => (
+            <tr key={e.id}>
+              <td><strong>{e.name}</strong></td>
+              <td style={{fontSize:11,color:"#8A95A8"}}>{e.email || "—"}</td>
+              <td>{e.branch}</td>
+              <td style={{fontSize:12,color:"#8A95A8"}}>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
+              <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
+              <td><Badge color={statusColor(e.status)}>{e.status}</Badge></td>
+              <td><div style={{display:"flex",gap:6}}><Btn>Edit</Btn><Btn variant="red">Deactivate</Btn></div></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -3749,29 +4640,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
               <option value="employees">Employees only</option>
             </select>
           </div>
-          <div className="table-wrap">
-            <div className="table-head"><span className="table-title">All users ({filteredUsers.length})</span></div>
-            <table>
-              <thead><tr><th>Name</th><th>Branch</th><th>Access level</th><th>Status</th><th>PIN</th><th>Actions</th></tr></thead>
-              <tbody>
-                {filteredUsers.map(e => (
-                  <tr key={e.id}>
-                    <td><strong>{e.name}</strong></td>
-                    <td>{e.branch}</td>
-                    <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
-                    <td><Badge color={statusColor(e.status)}>{e.status}</Badge></td>
-                    <td><span style={{fontFamily:"monospace",fontSize:13,letterSpacing:4,color:"#8A95A8"}}>••••</span></td>
-                    <td>
-                      <div style={{display:"flex",gap:6}}>
-                        <Btn onClick={() => { setPinTarget(e); setNewPin(""); }}>Reset PIN</Btn>
-                        {e.id !== user.id && <Btn onClick={() => toggleAccess(e)}>{e.access_level==="employee"?"Make lead":"Make employee"}</Btn>}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <SettingsUsersTable users={filteredUsers} currentUserId={user.id} onResetPin={(e) => { setPinTarget(e); setNewPin(""); }} onToggleAccess={toggleAccess} />
           {pinTarget && (
             <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setPinTarget(null)}>
               <div className="modal modal-sm">
@@ -3798,25 +4667,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
       )}
 
       {tab === "products" && (
-        <div className="table-wrap">
-          <div className="table-head"><span className="table-title">Product catalog ({products.filter(p=>p.active).length} active)</span><Btn variant="primary" onClick={()=>{}}>+ Add product</Btn></div>
-          <table>
-            <thead><tr><th>Product</th><th>Category</th><th>Unit cost</th><th>Per</th><th>Reorder min</th><th>Supplier</th><th>Active</th></tr></thead>
-            <tbody>
-              {products.map(p => (
-                <tr key={p.id}>
-                  <td><strong>{p.name}</strong>{p.notes ? <span style={{fontSize:11,color:"#8A95A8",marginLeft:6}}>{p.notes}</span> : null}</td>
-                  <td><Badge color={p.category==="Pest"?"amber":p.category==="Wildlife"?"green":p.category==="Rodent"?"red":p.category==="Mosquito"?"teal":p.category==="Termite"?"purple":"blue"}>{p.category}</Badge></td>
-                  <td style={{fontFamily:"monospace"}}>${p.unit_cost > 0 ? p.unit_cost.toFixed(2) : "—"}</td>
-                  <td style={{color:"#8A95A8",fontSize:12}}>{p.unit_of_measure}</td>
-                  <td style={{fontFamily:"monospace"}}>{p.reorder_threshold > 0 ? p.reorder_threshold : "—"}</td>
-                  <td>{p.supplier}</td>
-                  <td><Badge color={p.active?"green":"gray"}>{p.active?"Active":"Inactive"}</Badge></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <SettingsProductsTable products={products} />
       )}
 
       {tab === "employees" && (
@@ -3828,24 +4679,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
             </select>
             <Btn variant="primary" onClick={() => setSettingsAddEmpOpen(true)}>+ Add employee</Btn>
           </div>
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>Name</th><th>Email</th><th>Branch</th><th>Start date</th><th>Access</th><th>Status</th><th>Actions</th></tr></thead>
-              <tbody>
-                {employees.filter(e => empBranch === "All" || e.branch === empBranch).map(e => (
-                  <tr key={e.id}>
-                    <td><strong>{e.name}</strong></td>
-                    <td style={{fontSize:11,color:"#8A95A8"}}>{e.email || "—"}</td>
-                    <td>{e.branch}</td>
-                    <td style={{fontSize:12,color:"#8A95A8"}}>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
-                    <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
-                    <td><Badge color={statusColor(e.status)}>{e.status}</Badge></td>
-                    <td><div style={{display:"flex",gap:6}}><Btn>Edit</Btn><Btn variant="red">Deactivate</Btn></div></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <SettingsEmployeesTable employees={employees.filter(e => empBranch === "All" || e.branch === empBranch)} />
         </div>
       )}
 
@@ -4219,6 +5053,7 @@ function CompanyDocsPage({ user, showToast }) {
     (d.description || "").toLowerCase().includes(q.toLowerCase()) ||
     (d.file_name || "").toLowerCase().includes(q.toLowerCase())
   );
+  const sortDocs = useSortableData(filtered, "uploaded_at", "desc");
 
   return (
     <div>
@@ -4252,11 +5087,19 @@ function CompanyDocsPage({ user, showToast }) {
         <div className="table-wrap">
           <div className="table-head"><span className="table-title">Documents ({filtered.length})</span></div>
           <table>
-            <thead><tr><th></th><th>Title</th><th>Description</th><th>Size</th><th>Uploaded by</th><th>Date</th><th>Actions</th></tr></thead>
+            <thead><tr>
+              <th></th>
+              <SortableTh sortState={sortDocs} sortKey="title" accessor={d => (d.title || d.file_name || "")}>Title</SortableTh>
+              <SortableTh sortState={sortDocs} sortKey="description">Description</SortableTh>
+              <SortableTh sortState={sortDocs} sortKey="file_size">Size</SortableTh>
+              <SortableTh sortState={sortDocs} sortKey="uploader_name">Uploaded by</SortableTh>
+              <SortableTh sortState={sortDocs} sortKey="uploaded_at">Date</SortableTh>
+              <th>Actions</th>
+            </tr></thead>
             <tbody>
-              {filtered.length === 0 ? (
+              {sortDocs.rows.length === 0 ? (
                 <tr><td colSpan={7}><div className="empty-state">{docs.length === 0 ? "No company documents uploaded yet" : "No documents match your search"}</div></td></tr>
-              ) : filtered.map(doc => (
+              ) : sortDocs.rows.map(doc => (
                 <tr key={doc.id}>
                   <td style={{fontSize:22,width:36}}>{fileIcon(doc.mime_type)}</td>
                   <td>
@@ -4525,6 +5368,7 @@ export default function App() {
   const [trucks, setTrucks] = useState([]);
   const [products, setProducts] = useState([]);
   const [creditCards, setCreditCards] = useState([]);
+  const [inventory, setInventory] = useState([]);
   const [toast, setToast] = useState(null);
   const [dataLoaded, setDataLoaded] = useState(false);
 
@@ -4539,11 +5383,13 @@ export default function App() {
       sb("trucks", "?select=*,assigned_employee:employees(name)&order=truck_number").catch(() => []),
       sb("products", "?select=*&order=category,name").catch(() => []),
       sb("credit_cards", "?select=*&order=assigned_to").catch(() => []),
-    ]).then(([e, t, p, cc]) => {
+      sb("inventory", "?select=*").catch(() => []),
+    ]).then(([e, t, p, cc, inv]) => {
       setEmployees(e);
       setTrucks(t);
       setProducts(p);
       setCreditCards(cc);
+      setInventory(inv);
       setDataLoaded(true);
     });
   }, [currentUser]);
@@ -4561,6 +5407,7 @@ export default function App() {
     setTrucks([]);
     setProducts([]);
     setCreditCards([]);
+    setInventory([]);
   }
 
   const isManager = currentUser && ["super_admin","manager","lead"].includes(currentUser.access_level);
@@ -4625,7 +5472,7 @@ export default function App() {
               </div>
             )}
             {!dataLoaded && page !== "inventory" && <div className="loading">Loading data from database...</div>}
-            {dataLoaded && page === "home" && <Dashboard user={currentUser} employees={employees} trucks={trucks} inventory={[]} />}
+            {dataLoaded && page === "home" && <Dashboard user={currentUser} employees={employees} trucks={trucks} inventory={inventory} />}
             {dataLoaded && page === "people" && <People user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {dataLoaded && page === "hr" && <HR user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {page === "timeoff" && <TimeOff user={currentUser} employees={employees} showToast={showToast} />}
