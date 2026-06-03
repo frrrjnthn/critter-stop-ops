@@ -433,7 +433,7 @@ function Login({ onLogin }) {
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
-function Dashboard({ user, employees, trucks, inventory }) {
+function Dashboard({ user, employees, trucks, inventory, shops }) {
   const totalEmp = employees.length;
   const onboarding = employees.filter(e => e.status === "onboarding").length;
   const oilIssues = trucks.filter(t => t.next_oil_miles && t.mileage >= t.next_oil_miles - 500).length;
@@ -449,9 +449,19 @@ function Dashboard({ user, employees, trucks, inventory }) {
     reorderByLocation[r.location_id] = (reorderByLocation[r.location_id] || 0) + 1;
   }
 
+  // Build map of shop_id → branchKey for grouping
+  const shopBranchKey = {};
+  for (const s of (shops || [])) {
+    shopBranchKey[s.id] = s.department ? `${s.branch}|${s.department}` : s.branch;
+  }
+
   function reorderCountForBranch(branchValue) {
     // branchValue is a BRANCH_OPTIONS key like "DFW|Pest" or "OKC"
-    let total = reorderByLocation[branchValue] || 0;
+    let total = 0;
+    // Sum reorders for all shops belonging to this branch+dept combo
+    for (const [shopId, key] of Object.entries(shopBranchKey)) {
+      if (key === branchValue) total += (reorderByLocation[shopId] || 0);
+    }
     // Plus trucks belonging to that branch+dept
     const matchingTrucks = trucks.filter(t => branchKey(t) === branchValue);
     for (const t of matchingTrucks) total += (reorderByLocation[t.id] || 0);
@@ -459,10 +469,10 @@ function Dashboard({ user, employees, trucks, inventory }) {
   }
 
   function reorderCountForDept(dept) {
-    // Sum reorders for any branch+dept combo, plus trucks where department matches
+    // Sum reorders for shops + trucks where department matches
     let total = 0;
-    for (const opt of BRANCH_OPTIONS) {
-      if (opt.value.endsWith("|" + dept)) total += (reorderByLocation[opt.value] || 0);
+    for (const s of (shops || [])) {
+      if (s.department === dept) total += (reorderByLocation[s.id] || 0);
     }
     const matchingTrucks = trucks.filter(t => t.department === dept);
     for (const t of matchingTrucks) total += (reorderByLocation[t.id] || 0);
@@ -1414,7 +1424,7 @@ function ShiftModal({ shift, user, employees, branch, onClose, onSaved, showToas
 // Shop & truck inventory with Load Truck / Return / Add Stock / Adjust flows.
 // Uses existing `inventory` (product_id, location_type, location_id, quantity)
 // and `inventory_transactions` tables created by the standalone dashboard.
-function Inventory({ user, products, trucks, employees, showToast }) {
+function Inventory({ user, products, trucks, employees, shops, showToast }) {
   const [tab, setTab] = useState("shops");
   const [inventory, setInventory] = useState([]);
   const [loadingInv, setLoadingInv] = useState(true);
@@ -1446,17 +1456,25 @@ function Inventory({ user, products, trucks, employees, showToast }) {
   useEffect(() => { loadInventory(); }, []); // eslint-disable-line
   useEffect(() => { if (tab === "history") loadHistory(); }, [tab]); // eslint-disable-line
 
-  // Build location maps for fast lookup
-  // shopLocations: branchKey → totals { itemCount, totalValue }
+  // Build location maps for fast lookup, keyed by shop UUID
+  const activeShops = (shops || []).filter(s => s.active);
   const shopLocations = {};
-  for (const opt of BRANCH_OPTIONS) {
-    shopLocations[opt.value] = { label: opt.label, items: 0, value: 0, products: {} };
+  for (const s of activeShops) {
+    shopLocations[s.id] = {
+      shop: s,
+      label: s.name,
+      branchKey: s.department ? `${s.branch}|${s.department}` : s.branch,
+      items: 0,
+      value: 0,
+      products: {}
+    };
   }
   for (const row of inventory) {
     if (row.location_type === "shop" && row.quantity > 0) {
       const key = row.location_id;
       if (!shopLocations[key]) {
-        shopLocations[key] = { label: key, items: 0, value: 0, products: {} };
+        // Stale row pointing to a deactivated/deleted shop — still display under a placeholder
+        shopLocations[key] = { shop: null, label: "(Unknown shop)", branchKey: "", items: 0, value: 0, products: {} };
       }
       shopLocations[key].items += row.quantity;
       shopLocations[key].value += (row.quantity * (row.product?.unit_cost || 0));
@@ -1477,8 +1495,8 @@ function Inventory({ user, products, trucks, employees, showToast }) {
     }
   }
 
-  const filteredShops = Object.entries(shopLocations).filter(([k]) =>
-    branchFilter === "All" || k === branchFilter
+  const filteredShops = Object.entries(shopLocations).filter(([_, s]) =>
+    branchFilter === "All" || s.branchKey === branchFilter
   );
   const filteredTrucks = Object.entries(truckLocations).filter(([_, t]) =>
     matchBranchFilter(t.truck, branchFilter) &&
@@ -1641,6 +1659,7 @@ function Inventory({ user, products, trucks, employees, showToast }) {
           inventory={inventory}
           products={products}
           trucks={trucks}
+          shops={shops}
           shopLocations={shopLocations}
           truckLocations={truckLocations}
           user={user}
@@ -2134,7 +2153,7 @@ function OrderManager({ user, products, showToast }) {
 }
 
 // ── Inventory Move Modal ─────────────────────────────────────────────────────
-function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations, truckLocations, user, onClose, onSaved, showToast, catFilter, setCatFilter }) {
+function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLocations, truckLocations, user, onClose, onSaved, showToast, catFilter, setCatFilter }) {
   const action = modal.action;
   const isView = action === "view_shop" || action === "view_truck";
 
@@ -2228,8 +2247,11 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations,
     );
   }
 
-  // Choices for from/to depending on action
-  const shopOptions = BRANCH_OPTIONS.map(b => b.value);
+  // Choices for from/to depending on action — shops come from the shops table now
+  const shopOptions = (shops || []).filter(s => s.active).map(s => ({
+    value: s.id,
+    label: s.name + (s.branch ? " — " + (s.department ? s.branch + " · " + s.department : s.branch) : "")
+  }));
   const truckOptions = trucks.map(t => ({
     value: t.id,
     label: `Truck #${t.truck_number} · ${t.assigned_employee?.name || "Unassigned"}`
@@ -2271,12 +2293,12 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations,
       toType = "shop"; toId = form.to_location;
     } else if (action === "adjust") {
       if (!form.from_location) { showToast("Choose a location", "error"); return; }
-      // Could be a shop or a truck — convention: if it's a BRANCH_OPTIONS value, it's a shop
-      const isShop = BRANCH_OPTIONS.some(b => b.value === form.from_location);
+      // If it's a shop ID, it'll be in our shops list; otherwise treat as truck
+      const isShop = (shops || []).some(s => s.id === form.from_location);
       fromType = isShop ? "shop" : "truck"; fromId = form.from_location;
     } else if (action === "usage") {
       if (!form.from_location) { showToast("Choose where the product came from", "error"); return; }
-      const isShop = BRANCH_OPTIONS.some(b => b.value === form.from_location);
+      const isShop = (shops || []).some(s => s.id === form.from_location);
       fromType = isShop ? "shop" : "truck"; fromId = form.from_location;
     } else if (action === "distributor_purchase") {
       if (!form.to_location) { showToast("Choose which truck received the product", "error"); return; }
@@ -2356,7 +2378,7 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations,
                 <label className="form-label">From shop *</label>
                 <select className="form-input" value={form.from_location} onChange={e => update("from_location", e.target.value)}>
                   <option value="">— Select shop —</option>
-                  {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+                  {shopOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                 </select>
               </div>
               <div className="form-group">
@@ -2381,7 +2403,7 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations,
                 <label className="form-label">To shop *</label>
                 <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
                   <option value="">— Select shop —</option>
-                  {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+                  {shopOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                 </select>
               </div>
             </>
@@ -2391,7 +2413,7 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations,
               <label className="form-label">To shop *</label>
               <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
                 <option value="">— Select shop —</option>
-                {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+                {shopOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>
             </div>
           )}
@@ -2401,7 +2423,7 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shopLocations,
               <select className="form-input" value={form.from_location} onChange={e => update("from_location", e.target.value)}>
                 <option value="">— Select location —</option>
                 <optgroup label="Shops">
-                  {BRANCH_OPTIONS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+                  {shopOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                 </optgroup>
                 <optgroup label="Trucks">
                   {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
@@ -4460,8 +4482,175 @@ function SettingsEmployeesTable({ employees }) {
   );
 }
 
+// ── Settings Shops Tab ───────────────────────────────────────────────────────
+function SettingsShopsTab({ shops, reloadShops, showToast }) {
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const sort = useSortableData(shops || [], "name");
+
+  async function toggleActive(shop) {
+    try {
+      await sbPatch("shops", shop.id, { active: !shop.active });
+      showToast(shop.active ? "Shop deactivated" : "Shop activated");
+      reloadShops();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+  }
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        🏪 Shops are the physical locations where you store inventory. Each shop has a branch (the city/region) and an optional department (Pest, Wildlife, etc.). Deactivating a shop hides it from inventory dropdowns but keeps historical data intact.
+      </div>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}>
+        <Btn variant="primary" onClick={() => { setEditing(null); setModalOpen(true); }}>+ Add shop</Btn>
+      </div>
+      <div className="table-wrap">
+        <div className="table-head"><span className="table-title">All shops ({(shops || []).length})</span></div>
+        <table>
+          <thead><tr>
+            <SortableTh sortState={sort} sortKey="name">Shop name</SortableTh>
+            <SortableTh sortState={sort} sortKey="branch">Branch</SortableTh>
+            <SortableTh sortState={sort} sortKey="department">Department</SortableTh>
+            <SortableTh sortState={sort} sortKey="active">Status</SortableTh>
+            <th>Notes</th>
+            <th>Actions</th>
+          </tr></thead>
+          <tbody>
+            {sort.rows.length === 0 ? (
+              <tr><td colSpan={6}><div className="empty-state">No shops yet — click "+ Add shop" to create your first one</div></td></tr>
+            ) : sort.rows.map(s => (
+              <tr key={s.id}>
+                <td><strong>{s.name}</strong></td>
+                <td>{s.branch}</td>
+                <td>{s.department ? <Badge color={deptColor(s.department)}>{s.department}</Badge> : <span style={{color:"#8A95A8"}}>—</span>}</td>
+                <td>{s.active ? <Badge color="green">Active</Badge> : <Badge color="gray">Inactive</Badge>}</td>
+                <td style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>{s.notes || "—"}</td>
+                <td>
+                  <div style={{display:"flex",gap:6}}>
+                    <Btn onClick={() => { setEditing(s); setModalOpen(true); }}>Edit</Btn>
+                    <Btn variant={s.active ? "red" : "primary"} onClick={() => toggleActive(s)}>{s.active ? "Deactivate" : "Reactivate"}</Btn>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {modalOpen && (
+        <ShopModal
+          shop={editing}
+          onClose={() => { setModalOpen(false); setEditing(null); }}
+          onSaved={() => { setModalOpen(false); setEditing(null); reloadShops(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function ShopModal({ shop, onClose, onSaved, showToast }) {
+  const isEdit = !!shop;
+  const [form, setForm] = useState({
+    name: shop?.name || "",
+    branch: shop?.branch || "DFW",
+    department: shop?.department || "",
+    notes: shop?.notes || "",
+    active: shop?.active ?? true
+  });
+  const [saving, setSaving] = useState(false);
+
+  function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+
+  async function save() {
+    if (!form.name.trim()) { showToast("Shop name is required", "error"); return; }
+    if (!form.branch) { showToast("Branch is required", "error"); return; }
+    setSaving(true);
+    try {
+      const payload = {
+        name: form.name.trim(),
+        branch: form.branch,
+        department: form.department || null,
+        notes: form.notes.trim() || null,
+        active: form.active
+      };
+      if (isEdit) await sbPatch("shops", shop.id, payload);
+      else await sbPost("shops", payload);
+      showToast(isEdit ? "Shop updated" : "Shop created");
+      onSaved();
+    } catch (err) {
+      // Detect unique-name conflict
+      const msg = (err.message || "").toLowerCase();
+      if (msg.includes("unique") || msg.includes("duplicate")) {
+        showToast("A shop with that name already exists", "error");
+      } else {
+        showToast("Error: " + (err.message || err), "error");
+      }
+    }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:460}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">{isEdit ? "Edit shop" : "+ Add shop"}</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+              {isEdit ? "Update shop details" : "Create a new physical inventory location"}
+            </div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Shop name *</label>
+            <input className="form-input" value={form.name}
+              onChange={e => update("name", e.target.value)} autoFocus
+              placeholder="e.g. McKinney Warehouse, Frisco Pest Shop" />
+            <div style={{fontSize:11,color:"#8A95A8",marginTop:4}}>Must be unique. This is the display name shown in inventory dropdowns.</div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Branch *</label>
+              <select className="form-input" value={form.branch}
+                onChange={e => update("branch", e.target.value)}>
+                {BASE_BRANCHES.map(b => <option key={b} value={b}>{b}</option>)}
+              </select>
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Department</label>
+              <select className="form-input" value={form.department}
+                onChange={e => update("department", e.target.value)}>
+                <option value="">— None —</option>
+                {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Notes</label>
+            <textarea className="form-input" rows={2} value={form.notes}
+              onChange={e => update("notes", e.target.value)}
+              placeholder="Address, contact info, anything else..." />
+          </div>
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,cursor:"pointer",marginBottom:14}}>
+            <input type="checkbox" checked={form.active}
+              onChange={e => update("active", e.target.checked)} />
+            Active (shows in inventory dropdowns)
+          </label>
+          <div style={{display:"flex",gap:8}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+              {saving ? "Saving..." : isEdit ? "Save changes" : "Create shop"}
+            </Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
-function Settings({ user, employees, setEmployees, products, setProducts, trucks, setTrucks, showToast }) {
+function Settings({ user, employees, setEmployees, products, setProducts, trucks, setTrucks, shops, reloadShops, showToast }) {
   const [tab, setTab] = useState("users");
   const [q, setQ] = useState("");
   const [roleFilter, setRoleFilter] = useState("All");
@@ -4602,7 +4791,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
   return (
     <div>
       <div className="tabs">
-        {[["users","Users & PINs"],["products","Products"],["employees","Employees"],["inspection","Inspection Form"]].map(([t,l]) => (
+        {[["users","Users & PINs"],["products","Products"],["employees","Employees"],["shops","Shops"],["inspection","Inspection Form"]].map(([t,l]) => (
           <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
         ))}
       </div>
@@ -4682,6 +4871,8 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
           <SettingsEmployeesTable employees={employees.filter(e => empBranch === "All" || e.branch === empBranch)} />
         </div>
       )}
+
+      {tab === "shops" && <SettingsShopsTab shops={shops} reloadShops={reloadShops} showToast={showToast} />}
 
       {tab === "inspection" && <InspectionTemplateEditor showToast={showToast} />}
 
@@ -5369,12 +5560,20 @@ export default function App() {
   const [products, setProducts] = useState([]);
   const [creditCards, setCreditCards] = useState([]);
   const [inventory, setInventory] = useState([]);
+  const [shops, setShops] = useState([]);
   const [toast, setToast] = useState(null);
   const [dataLoaded, setDataLoaded] = useState(false);
 
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type, key: Date.now() });
   }, []);
+
+  async function reloadShops() {
+    try {
+      const s = await sb("shops", "?select=*&order=name");
+      setShops(s);
+    } catch (err) { /* silent */ }
+  }
 
   useEffect(() => {
     if (!currentUser) return;
@@ -5384,12 +5583,14 @@ export default function App() {
       sb("products", "?select=*&order=category,name").catch(() => []),
       sb("credit_cards", "?select=*&order=assigned_to").catch(() => []),
       sb("inventory", "?select=*").catch(() => []),
-    ]).then(([e, t, p, cc, inv]) => {
+      sb("shops", "?select=*&order=name").catch(() => []),
+    ]).then(([e, t, p, cc, inv, s]) => {
       setEmployees(e);
       setTrucks(t);
       setProducts(p);
       setCreditCards(cc);
       setInventory(inv);
+      setShops(s);
       setDataLoaded(true);
     });
   }, [currentUser]);
@@ -5408,6 +5609,7 @@ export default function App() {
     setProducts([]);
     setCreditCards([]);
     setInventory([]);
+    setShops([]);
   }
 
   const isManager = currentUser && ["super_admin","manager","lead"].includes(currentUser.access_level);
@@ -5472,11 +5674,11 @@ export default function App() {
               </div>
             )}
             {!dataLoaded && page !== "inventory" && <div className="loading">Loading data from database...</div>}
-            {dataLoaded && page === "home" && <Dashboard user={currentUser} employees={employees} trucks={trucks} inventory={inventory} />}
+            {dataLoaded && page === "home" && <Dashboard user={currentUser} employees={employees} trucks={trucks} inventory={inventory} shops={shops} />}
             {dataLoaded && page === "people" && <People user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {dataLoaded && page === "hr" && <HR user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {page === "timeoff" && <TimeOff user={currentUser} employees={employees} showToast={showToast} />}
-            {page === "inventory" && <Inventory user={currentUser} products={products} trucks={trucks} employees={employees} showToast={showToast} />}
+            {page === "inventory" && <Inventory user={currentUser} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />}
             {page === "equipment" && <EquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
             {dataLoaded && page === "inspections" && <InspectionsPage user={currentUser} trucks={trucks} employees={employees} showToast={showToast} />}
@@ -5492,7 +5694,7 @@ export default function App() {
                 </div>
               </div>
             )}
-            {isManager && page === "settings" && dataLoaded && <Settings user={currentUser} employees={employees} setEmployees={setEmployees} products={products} setProducts={setProducts} trucks={trucks} setTrucks={setTrucks} showToast={showToast} />}
+            {isManager && page === "settings" && dataLoaded && <Settings user={currentUser} employees={employees} setEmployees={setEmployees} products={products} setProducts={setProducts} trucks={trucks} setTrucks={setTrucks} shops={shops} reloadShops={reloadShops} showToast={showToast} />}
           </div>
           {profile && (
             <ProfileModal
