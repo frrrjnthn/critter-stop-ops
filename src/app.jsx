@@ -1025,7 +1025,6 @@ function TimeOff({ user, employees, showToast }) {
                       </tr>
                       );
                     })}
-                    ))}
                   </tbody>
                 </table>
               </div>
@@ -1753,7 +1752,7 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
             </div>
             <Btn variant="primary" onClick={() => downloadHistoryCSV(history, shops, trucks)}>↓ Download CSV</Btn>
           </div>
-          <InventoryHistoryTable history={history} />
+          <InventoryHistoryTable history={history} shops={shops} trucks={trucks} />
         </div>
       )}
 
@@ -1787,39 +1786,118 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
 }
 
 // ── Inventory History Table (sortable) ───────────────────────────────────────
-function InventoryHistoryTable({ history }) {
-  const sort = useSortableData(history, "created_at", "desc");
+function InventoryHistoryTable({ history, shops, trucks }) {
+  // Group by batch_id; rows without a batch_id are treated as their own "batch of 1"
+  const groups = (function() {
+    const map = new Map();
+    for (const tx of history) {
+      const key = tx.batch_id || ("__single_" + tx.id);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(tx);
+    }
+    // Build summary rows
+    return Array.from(map.values()).map(rows => {
+      const first = rows[0];
+      const totalQty = rows.reduce((s, r) => s + (r.quantity || 0), 0);
+      // Find total cost (only first row has it for distributor purchases)
+      const totalCost = rows.reduce((s, r) => s + (parseFloat(r.total_cost) || 0), 0);
+      return {
+        batch_id: first.batch_id || first.id,
+        is_batch: !!first.batch_id && rows.length > 1,
+        created_at: first.created_at,
+        action: first.action,
+        from_location: first.from_location,
+        to_location: first.to_location,
+        employee: first.employee,
+        employee_name: first.employee?.name || "",
+        vendor: first.vendor,
+        invoice_number: first.invoice_number,
+        total_cost: totalCost > 0 ? totalCost : null,
+        notes: first.notes,
+        row_count: rows.length,
+        rows: rows,
+        product_name: rows.length === 1 ? (first.product?.name || "") : `${rows.length} products`,
+        quantity_display: rows.length === 1 ? (first.quantity || 0) : totalQty
+      };
+    });
+  })();
+
+  const sort = useSortableData(groups, "created_at", "desc");
+  const [expanded, setExpanded] = useState({});
+
+  function toggleExpand(id) {
+    setExpanded(prev => ({ ...prev, [id]: !prev[id] }));
+  }
+
+  function locName(locId) {
+    if (!locId) return "—";
+    const shop = (shops || []).find(s => s.id === locId);
+    if (shop) return shop.name;
+    const truck = (trucks || []).find(t => t.id === locId);
+    if (truck) return `Truck #${truck.truck_number}`;
+    return locId; // fallback to raw ID if not resolved
+  }
+
   return (
     <div className="table-wrap">
       <table>
         <thead><tr>
           <SortableTh sortState={sort} sortKey="created_at">Date</SortableTh>
           <SortableTh sortState={sort} sortKey="action">Action</SortableTh>
-          <SortableTh sortState={sort} sortKey="product_name" accessor={t => t.product?.name || ""}>Product</SortableTh>
-          <SortableTh sortState={sort} sortKey="quantity">Qty</SortableTh>
+          <SortableTh sortState={sort} sortKey="product_name">Items</SortableTh>
+          <SortableTh sortState={sort} sortKey="quantity_display">Qty</SortableTh>
           <SortableTh sortState={sort} sortKey="from_location">From → To</SortableTh>
-          <SortableTh sortState={sort} sortKey="employee_name" accessor={t => t.employee?.name || ""}>By</SortableTh>
+          <SortableTh sortState={sort} sortKey="employee_name">By</SortableTh>
           <th>Notes</th>
         </tr></thead>
         <tbody>
           {sort.rows.length === 0 ? (
             <tr><td colSpan={7}><div className="empty-state">No transactions yet</div></td></tr>
-          ) : sort.rows.map(tx => (
-            <tr key={tx.id}>
-              <td style={{fontSize:11,color:"#8A95A8"}}>{new Date(tx.created_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</td>
-              <td><Badge color={tx.action === "load_truck" ? "blue" : tx.action === "return" ? "amber" : tx.action === "usage" ? "green" : tx.action === "adjust" ? "red" : tx.action === "distributor_purchase" ? "purple" : "gray"}>{tx.action}</Badge></td>
-              <td><strong>{tx.product?.name || "—"}</strong></td>
-              <td style={{fontFamily:"monospace"}}>{tx.quantity}</td>
-              <td style={{fontSize:11,color:"#8A95A8"}}>{tx.from_location || "—"} → {tx.to_location || "—"}</td>
-              <td style={{fontSize:12}}>{tx.employee?.name || "—"}</td>
-              <td style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>
-                {tx.action === "distributor_purchase" && tx.vendor && (
-                  <div style={{color:"#A855F7",fontSize:11,fontWeight:600}}>🏬 {tx.vendor}{tx.invoice_number ? ` · #${tx.invoice_number}` : ""}{tx.total_cost ? ` · $${parseFloat(tx.total_cost).toFixed(2)}` : ""}</div>
-                )}
-                {tx.notes || (tx.action === "distributor_purchase" ? "" : "—")}
-              </td>
-            </tr>
-          ))}
+          ) : sort.rows.flatMap(g => {
+            const main = (
+              <tr key={g.batch_id} style={g.is_batch ? {cursor:"pointer"} : {}}
+                onClick={g.is_batch ? () => toggleExpand(g.batch_id) : undefined}>
+                <td style={{fontSize:11,color:"#8A95A8"}}>{new Date(g.created_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</td>
+                <td>
+                  <Badge color={g.action === "load_truck" ? "blue" : g.action === "return" ? "amber" : g.action === "usage" ? "green" : g.action === "adjust" ? "red" : g.action === "distributor_purchase" ? "purple" : "gray"}>{g.action}</Badge>
+                </td>
+                <td>
+                  {g.is_batch ? (
+                    <span>
+                      <span style={{fontSize:10,marginRight:4,color:"#22C55E"}}>{expanded[g.batch_id] ? "▼" : "▶"}</span>
+                      <strong>📦 Batch · {g.row_count} products</strong>
+                    </span>
+                  ) : (
+                    <strong>{g.product_name || "—"}</strong>
+                  )}
+                </td>
+                <td style={{fontFamily:"monospace"}}>{g.quantity_display}</td>
+                <td style={{fontSize:11,color:"#8A95A8"}}>{locName(g.from_location)} → {locName(g.to_location)}</td>
+                <td style={{fontSize:12}}>{g.employee?.name || "—"}</td>
+                <td style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>
+                  {g.action === "distributor_purchase" && g.vendor && (
+                    <div style={{color:"#A855F7",fontSize:11,fontWeight:600}}>🏬 {g.vendor}{g.invoice_number ? ` · #${g.invoice_number}` : ""}{g.total_cost ? ` · $${g.total_cost.toFixed(2)}` : ""}</div>
+                  )}
+                  {g.notes || (g.action === "distributor_purchase" ? "" : "—")}
+                </td>
+              </tr>
+            );
+            if (g.is_batch && expanded[g.batch_id]) {
+              const childRows = g.rows.map((tx, i) => (
+                <tr key={g.batch_id + "-" + i} style={{background:"rgba(34,197,94,0.04)"}}>
+                  <td style={{paddingLeft:24,fontSize:10,color:"#4A5568"}}>↳</td>
+                  <td></td>
+                  <td style={{fontSize:12}}>{tx.product?.name || "—"}</td>
+                  <td style={{fontFamily:"monospace",fontSize:12}}>{tx.quantity}</td>
+                  <td></td>
+                  <td></td>
+                  <td></td>
+                </tr>
+              ));
+              return [main, ...childRows];
+            }
+            return [main];
+          })}
         </tbody>
       </table>
     </div>
@@ -2639,7 +2717,38 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLoc
     );
   }
 
-  // Choices for from/to depending on action — shops come from the shops table now
+  // ── Cart mode: collect multiple products before submit ──────────────────────
+  return (
+    <InventoryCartModal
+      action={action}
+      products={products}
+      trucks={trucks}
+      shops={shops}
+      inventory={inventory}
+      user={user}
+      onClose={onClose}
+      onSaved={onSaved}
+      showToast={showToast}
+    />
+  );
+}
+
+// ── Inventory Cart Modal (multi-product entry) ───────────────────────────────
+function InventoryCartModal({ action, products, trucks, shops, inventory, user, onClose, onSaved, showToast }) {
+  const [destination, setDestination] = useState({ from: "", to: "" });
+  // Cart: [{ key, product_id, quantity }]
+  const [cart, setCart] = useState([]);
+  const [pickProduct, setPickProduct] = useState("");
+  const [pickQty, setPickQty] = useState(1);
+  const [catFilter, setCatFilter] = useState("All");
+  const [search, setSearch] = useState("");
+  // Distributor-purchase only
+  const [vendor, setVendor] = useState("");
+  const [invoiceNumber, setInvoiceNumber] = useState("");
+  const [totalCost, setTotalCost] = useState("");
+  const [notes, setNotes] = useState("");
+  const [saving, setSaving] = useState(false);
+
   const shopOptions = (shops || []).filter(s => s.active).map(s => ({
     value: s.id,
     label: s.name + (s.branch ? " — " + (s.department ? s.branch + " · " + s.department : s.branch) : "")
@@ -2658,60 +2767,148 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLoc
     distributor_purchase: "🏬 Distributor purchase"
   };
   const titleHint = {
-    load_truck:           "Move stock from a shop to a truck",
-    return:               "Pull stock off a truck back to a shop",
-    add_stock:            "Add new stock to a shop (e.g. delivery received)",
-    adjust:               "Correct quantities or write off damaged/lost stock",
-    usage:                "Record product used on a job (subtracts from a truck or shop)",
-    distributor_purchase: "Tech bought direct from a distributor — adds to the chosen truck. Captures vendor + invoice + actual cost."
+    load_truck:           "Move multiple items from a shop to a truck in one batch",
+    return:               "Pull multiple items off a truck back to a shop",
+    add_stock:            "Receive multiple items into a shop (e.g. a Veseris delivery)",
+    adjust:               "Correct quantities or write off damaged/lost stock at a single location",
+    usage:                "Record multiple products used on a job",
+    distributor_purchase: "Tech bought multiple items direct from a distributor — captures vendor + invoice + total cost"
   };
 
-  async function save() {
-    if (!form.product_id) { showToast("Select a product", "error"); return; }
-    const qty = parseInt(form.quantity, 10);
-    if (!qty || qty < 1) { showToast("Quantity must be at least 1", "error"); return; }
+  // Determine field labels based on action
+  const fromLabel = action === "load_truck" ? "From shop" :
+                    action === "return"     ? "From truck" :
+                    null;
+  const toLabel   = action === "load_truck" ? "To truck" :
+                    action === "return"     ? "To shop" :
+                    action === "add_stock"  ? "To shop" :
+                    action === "distributor_purchase" ? "Goes to truck" :
+                    null;
+  const singleLabel = action === "adjust" ? "Adjust at" :
+                      action === "usage" ? "Used from" :
+                      null;
 
+  // What options does each picker show?
+  function optionsFor(slot) {
+    // slot: "from" or "to" or "single"
+    if (action === "load_truck")  return slot === "from" ? shopOptions  : truckOptions;
+    if (action === "return")      return slot === "from" ? truckOptions : shopOptions;
+    if (action === "add_stock")   return slot === "to"   ? shopOptions  : [];
+    if (action === "distributor_purchase") return slot === "to" ? truckOptions : [];
+    if (action === "adjust" || action === "usage") {
+      // Combined shop+truck picker for single-slot actions
+      return [...shopOptions, ...truckOptions];
+    }
+    return [];
+  }
+
+  // Build the filtered product list for the picker
+  const cats = ["All","Pest","Wildlife","Rodent","Mosquito","Termite","Insulation"];
+  const filteredProducts = products
+    .filter(p => p.active)
+    .filter(p => catFilter === "All" || p.category === catFilter)
+    .filter(p => !search || p.name.toLowerCase().includes(search.toLowerCase()))
+    .sort((a,b) => a.name.localeCompare(b.name));
+
+  // Helper: what does the source location look like? (For destination breakdown messages)
+  function isShopId(id) { return (shops || []).some(s => s.id === id); }
+
+  function addToCart() {
+    if (!pickProduct) { showToast("Select a product", "error"); return; }
+    const qty = parseInt(pickQty, 10);
+    if (!qty || qty < 1) { showToast("Quantity must be at least 1", "error"); return; }
+    // Merge with existing line if same product
+    const existing = cart.findIndex(c => c.product_id === pickProduct);
+    if (existing >= 0) {
+      const next = [...cart];
+      next[existing] = { ...next[existing], quantity: next[existing].quantity + qty };
+      setCart(next);
+    } else {
+      setCart(prev => [...prev, { key: Date.now() + Math.random(), product_id: pickProduct, quantity: qty }]);
+    }
+    setPickProduct("");
+    setPickQty(1);
+  }
+
+  function removeCartItem(key) {
+    setCart(prev => prev.filter(c => c.key !== key));
+  }
+
+  function updateCartQty(key, q) {
+    const qty = parseInt(q, 10);
+    if (isNaN(qty) || qty < 1) return;
+    setCart(prev => prev.map(c => c.key === key ? { ...c, quantity: qty } : c));
+  }
+
+  function quickAddProduct(p) {
+    const existing = cart.findIndex(c => c.product_id === p.id);
+    if (existing >= 0) {
+      const next = [...cart];
+      next[existing] = { ...next[existing], quantity: next[existing].quantity + 1 };
+      setCart(next);
+    } else {
+      setCart(prev => [...prev, { key: Date.now() + Math.random(), product_id: p.id, quantity: 1 }]);
+    }
+  }
+
+  // Compute totals
+  const totalQty = cart.reduce((s, c) => s + c.quantity, 0);
+  const estCost  = cart.reduce((s, c) => {
+    const p = products.find(p => p.id === c.product_id);
+    return s + (p?.unit_cost || 0) * c.quantity;
+  }, 0);
+
+  async function submitBatch() {
+    if (cart.length === 0) { showToast("Add at least one product", "error"); return; }
+
+    // Validate destination
     let fromType = null, fromId = null, toType = null, toId = null;
     if (action === "load_truck") {
-      if (!form.from_location || !form.to_location) { showToast("Choose both shop and truck", "error"); return; }
-      fromType = "shop";  fromId = form.from_location;
-      toType   = "truck"; toId   = form.to_location;
+      if (!destination.from || !destination.to) { showToast("Select both shop and truck", "error"); return; }
+      fromType = "shop"; fromId = destination.from;
+      toType   = "truck"; toId   = destination.to;
     } else if (action === "return") {
-      if (!form.from_location || !form.to_location) { showToast("Choose both truck and shop", "error"); return; }
-      fromType = "truck"; fromId = form.from_location;
-      toType   = "shop";  toId   = form.to_location;
+      if (!destination.from || !destination.to) { showToast("Select both truck and shop", "error"); return; }
+      fromType = "truck"; fromId = destination.from;
+      toType   = "shop";  toId   = destination.to;
     } else if (action === "add_stock") {
-      if (!form.to_location) { showToast("Choose a shop", "error"); return; }
-      toType = "shop"; toId = form.to_location;
-    } else if (action === "adjust") {
-      if (!form.from_location) { showToast("Choose a location", "error"); return; }
-      // If it's a shop ID, it'll be in our shops list; otherwise treat as truck
-      const isShop = (shops || []).some(s => s.id === form.from_location);
-      fromType = isShop ? "shop" : "truck"; fromId = form.from_location;
-    } else if (action === "usage") {
-      if (!form.from_location) { showToast("Choose where the product came from", "error"); return; }
-      const isShop = (shops || []).some(s => s.id === form.from_location);
-      fromType = isShop ? "shop" : "truck"; fromId = form.from_location;
+      if (!destination.to) { showToast("Select a shop", "error"); return; }
+      toType = "shop"; toId = destination.to;
     } else if (action === "distributor_purchase") {
-      if (!form.to_location) { showToast("Choose which truck received the product", "error"); return; }
-      toType = "truck"; toId = form.to_location;
+      if (!destination.to) { showToast("Select a truck", "error"); return; }
+      toType = "truck"; toId = destination.to;
+    } else if (action === "adjust" || action === "usage") {
+      if (!destination.from) { showToast("Select a location", "error"); return; }
+      const isShop = isShopId(destination.from);
+      fromType = isShop ? "shop" : "truck"; fromId = destination.from;
     }
 
     setSaving(true);
     try {
+      // One batch_id ties all rows together for the History grouping
+      const batchId = (typeof crypto !== "undefined" && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : (Date.now() + "-" + Math.random()).toString();
+
       // Helper: get/upsert inventory row
-      async function adjustQuantity(locType, locId, delta) {
+      async function adjustQuantity(locType, locId, productId, delta) {
         const existing = inventory.find(r =>
-          r.location_type === locType && r.location_id === locId && r.product_id === form.product_id
+          r.location_type === locType && r.location_id === locId && r.product_id === productId
         );
         if (existing) {
           const newQty = (existing.quantity || 0) + delta;
-          if (newQty < 0) throw new Error(`Not enough stock at ${locId} (have ${existing.quantity}, need ${-delta})`);
+          if (newQty < 0) {
+            const p = products.find(p => p.id === productId);
+            throw new Error(`Not enough ${p?.name || "stock"} at this location (have ${existing.quantity}, need ${-delta})`);
+          }
           await sbPatch("inventory", existing.id, { quantity: newQty, updated_at: new Date().toISOString() });
         } else {
-          if (delta < 0) throw new Error(`No inventory exists at ${locId} to subtract from`);
+          if (delta < 0) {
+            const p = products.find(p => p.id === productId);
+            throw new Error(`No ${p?.name || "stock"} exists at this location to subtract from`);
+          }
           await sbPost("inventory", {
-            product_id: form.product_id,
+            product_id: productId,
             location_type: locType,
             location_id: locId,
             quantity: delta
@@ -2719,30 +2916,40 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLoc
         }
       }
 
-      // Apply the move
-      if (fromType && fromId) await adjustQuantity(fromType, fromId, -qty);
-      if (toType   && toId)   await adjustQuantity(toType,   toId,   +qty);
+      // For distributor_purchase, the total cost gets attributed to the FIRST tx row
+      // (so it shows on the consolidated batch line); subsequent rows in the batch have 0.
+      const totalCostNum = parseFloat(totalCost);
+      const hasDistMeta = action === "distributor_purchase";
 
-      // Log the transaction
-      const txPayload = {
-        product_id: form.product_id,
-        employee_id: user.id,
-        action: action,
-        quantity: qty,
-        from_location: fromId || null,
-        to_location: toId || null,
-        notes: form.notes || null
-      };
-      // Distributor-purchase metadata: vendor, invoice, cost
-      if (action === "distributor_purchase") {
-        txPayload.vendor = form.vendor.trim() || null;
-        txPayload.invoice_number = form.invoice_number.trim() || null;
-        const tc = parseFloat(form.total_cost);
-        txPayload.total_cost = isNaN(tc) ? null : tc;
+      for (let i = 0; i < cart.length; i++) {
+        const item = cart[i];
+        const qty = item.quantity;
+        // Move stock
+        if (fromType && fromId) await adjustQuantity(fromType, fromId, item.product_id, -qty);
+        if (toType   && toId)   await adjustQuantity(toType,   toId,   item.product_id, +qty);
+
+        // Build transaction row
+        const txPayload = {
+          product_id: item.product_id,
+          employee_id: user.id,
+          action: action,
+          quantity: qty,
+          from_location: fromId || null,
+          to_location: toId || null,
+          notes: notes || null,
+          batch_id: batchId
+        };
+        if (hasDistMeta) {
+          // Vendor + invoice are batch-level — attached to every row for easy filtering,
+          // but the dollar cost lands only on the first row to avoid double-counting.
+          txPayload.vendor = vendor.trim() || null;
+          txPayload.invoice_number = invoiceNumber.trim() || null;
+          if (i === 0 && !isNaN(totalCostNum)) txPayload.total_cost = totalCostNum;
+        }
+        await sbPost("inventory_transactions", txPayload);
       }
-      await sbPost("inventory_transactions", txPayload);
 
-      showToast("Move logged successfully");
+      showToast(`Batch logged — ${cart.length} item${cart.length === 1 ? "" : "s"}`);
       onSaved();
     } catch (err) {
       showToast("Error: " + (err.message || err), "error");
@@ -2750,11 +2957,9 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLoc
     setSaving(false);
   }
 
-  const filteredProducts = products.filter(p => p.active && (catFilter === "All" || p.category === catFilter));
-
   return (
     <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="modal" style={{maxWidth:520, maxHeight:"90vh", overflowY:"auto"}}>
+      <div className="modal" style={{maxWidth:680, maxHeight:"92vh", display:"flex", flexDirection:"column"}}>
         <div className="modal-top">
           <div>
             <div className="modal-title">{titles[action]}</div>
@@ -2762,106 +2967,98 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLoc
           </div>
           <div className="modal-close" onClick={onClose}>✕</div>
         </div>
-        <div className="modal-body">
-          {/* From / To pickers */}
-          {(action === "load_truck") && (
-            <>
-              <div className="form-group">
-                <label className="form-label">From shop *</label>
-                <select className="form-input" value={form.from_location} onChange={e => update("from_location", e.target.value)}>
-                  <option value="">— Select shop —</option>
-                  {shopOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              </div>
-              <div className="form-group">
-                <label className="form-label">To truck *</label>
-                <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
-                  <option value="">— Select truck —</option>
-                  {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              </div>
-            </>
-          )}
-          {action === "return" && (
-            <>
-              <div className="form-group">
-                <label className="form-label">From truck *</label>
-                <select className="form-input" value={form.from_location} onChange={e => update("from_location", e.target.value)}>
-                  <option value="">— Select truck —</option>
-                  {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              </div>
-              <div className="form-group">
-                <label className="form-label">To shop *</label>
-                <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
-                  <option value="">— Select shop —</option>
-                  {shopOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              </div>
-            </>
-          )}
-          {action === "add_stock" && (
-            <div className="form-group">
-              <label className="form-label">To shop *</label>
-              <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
-                <option value="">— Select shop —</option>
-                {shopOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
-            </div>
-          )}
-          {(action === "adjust" || action === "usage") && (
-            <div className="form-group">
-              <label className="form-label">{action === "usage" ? "Used from *" : "Adjust at *"}</label>
-              <select className="form-input" value={form.from_location} onChange={e => update("from_location", e.target.value)}>
-                <option value="">— Select location —</option>
-                <optgroup label="Shops">
-                  {shopOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </optgroup>
-                <optgroup label="Trucks">
-                  {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </optgroup>
-              </select>
-            </div>
-          )}
-          {action === "distributor_purchase" && (
-            <>
-              <div className="form-group">
-                <label className="form-label">Goes to truck *</label>
-                <select className="form-input" value={form.to_location} onChange={e => update("to_location", e.target.value)}>
-                  <option value="">— Select truck —</option>
-                  {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              </div>
-              <div style={{display:"grid",gridTemplateColumns:"1.4fr 1fr",gap:10,marginBottom:10}}>
-                <div className="form-group" style={{marginBottom:0}}>
-                  <label className="form-label">Vendor / distributor</label>
-                  <input className="form-input" value={form.vendor}
-                    onChange={e => update("vendor", e.target.value)}
-                    placeholder="e.g. Veseris, Target Specialty, ProSource" />
-                </div>
-                <div className="form-group" style={{marginBottom:0}}>
-                  <label className="form-label">Invoice / receipt #</label>
-                  <input className="form-input" value={form.invoice_number}
-                    onChange={e => update("invoice_number", e.target.value)}
-                    style={{fontFamily:"monospace"}}
-                    placeholder="optional" />
-                </div>
-              </div>
-              <div className="form-group">
-                <label className="form-label">Total cost paid ($)</label>
-                <input className="form-input" type="number" step="0.01" min="0" value={form.total_cost}
-                  onChange={e => update("total_cost", e.target.value)}
-                  style={{fontFamily:"monospace"}}
-                  placeholder="What the tech actually paid (incl. tax)" />
-              </div>
-            </>
-          )}
 
-          {/* Product picker with category filter */}
-          <div className="form-group">
-            <label className="form-label">Category</label>
-            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              {["All","Pest","Wildlife","Rodent","Mosquito","Termite","Insulation"].map(c => (
+        <div className="modal-body" style={{overflowY:"auto", flex:1}}>
+          {/* Destination / source picker */}
+          <div className="mod-card" style={{marginBottom:14}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>1 · Where</div>
+
+            {fromLabel && (
+              <div className="form-group">
+                <label className="form-label">{fromLabel} *</label>
+                <select className="form-input" value={destination.from}
+                  onChange={e => setDestination(d => ({ ...d, from: e.target.value }))}>
+                  <option value="">— Select —</option>
+                  {optionsFor("from").map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </div>
+            )}
+            {toLabel && (
+              <div className="form-group">
+                <label className="form-label">{toLabel} *</label>
+                <select className="form-input" value={destination.to}
+                  onChange={e => setDestination(d => ({ ...d, to: e.target.value }))}>
+                  <option value="">— Select —</option>
+                  {optionsFor("to").map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </div>
+            )}
+            {singleLabel && (
+              <div className="form-group">
+                <label className="form-label">{singleLabel} *</label>
+                <select className="form-input" value={destination.from}
+                  onChange={e => setDestination(d => ({ ...d, from: e.target.value }))}>
+                  <option value="">— Select location —</option>
+                  <optgroup label="Shops">
+                    {shopOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </optgroup>
+                  <optgroup label="Trucks">
+                    {truckOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </optgroup>
+                </select>
+              </div>
+            )}
+
+            {/* Distributor purchase extra fields */}
+            {action === "distributor_purchase" && (
+              <>
+                <div style={{display:"grid",gridTemplateColumns:"1.4fr 1fr",gap:10,marginBottom:10}}>
+                  <div className="form-group" style={{marginBottom:0}}>
+                    <label className="form-label">Vendor / distributor</label>
+                    <input className="form-input" value={vendor}
+                      onChange={e => setVendor(e.target.value)}
+                      placeholder="e.g. Veseris, Target Specialty" />
+                  </div>
+                  <div className="form-group" style={{marginBottom:0}}>
+                    <label className="form-label">Invoice / receipt #</label>
+                    <input className="form-input" value={invoiceNumber}
+                      onChange={e => setInvoiceNumber(e.target.value)}
+                      style={{fontFamily:"monospace"}}
+                      placeholder="optional" />
+                  </div>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Total cost paid ($) <span style={{color:"#8A95A8"}}>— for the whole batch</span></label>
+                  <input className="form-input" type="number" step="0.01" min="0" value={totalCost}
+                    onChange={e => setTotalCost(e.target.value)}
+                    style={{fontFamily:"monospace"}}
+                    placeholder="What the tech actually paid (incl. tax)" />
+                </div>
+              </>
+            )}
+
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Batch notes <span style={{color:"#8A95A8"}}>(applies to all items)</span></label>
+              <input className="form-input" value={notes}
+                onChange={e => setNotes(e.target.value)}
+                placeholder="PO number, job site, reason..." />
+            </div>
+          </div>
+
+          {/* Product picker */}
+          <div className="mod-card" style={{marginBottom:14}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>2 · Products</div>
+
+            <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap"}}>
+              <div style={{flex:1,minWidth:160,display:"flex",alignItems:"center",gap:8,background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:"6px 11px"}}>
+                <span style={{color:"#4A5568"}}>⌕</span>
+                <input style={{background:"none",border:"none",outline:"none",color:"#E8EDF5",fontSize:13,flex:1,fontFamily:"DM Sans,sans-serif"}}
+                  placeholder="Search products..." value={search} onChange={e=>setSearch(e.target.value)} />
+              </div>
+            </div>
+
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
+              {cats.map(c => (
                 <button key={c}
                   onClick={() => setCatFilter(c)}
                   style={{
@@ -2872,37 +3069,95 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLoc
                   }}>{c}</button>
               ))}
             </div>
-          </div>
-          <div className="form-group">
-            <label className="form-label">Product *</label>
-            <select className="form-input" value={form.product_id} onChange={e => update("product_id", e.target.value)}>
-              <option value="">— Select product —</option>
-              {filteredProducts
-                .sort((a,b) => a.name.localeCompare(b.name))
-                .map(p => <option key={p.id} value={p.id}>{p.name} ({p.category})</option>)}
-            </select>
+
+            {/* Manual add row (select + qty + add) */}
+            <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"center"}}>
+              <select className="form-input" value={pickProduct} onChange={e => setPickProduct(e.target.value)} style={{flex:1}}>
+                <option value="">Select product to add...</option>
+                {filteredProducts.map(p => (
+                  <option key={p.id} value={p.id}>{p.name} ({p.category}) — ${(p.unit_cost || 0).toFixed(2)} / {p.unit_of_measure || "ea"}</option>
+                ))}
+              </select>
+              <input className="form-input" type="number" min="1" value={pickQty}
+                onChange={e => setPickQty(e.target.value)}
+                style={{width:60, fontFamily:"monospace", textAlign:"center"}} />
+              <Btn variant="primary" onClick={addToCart}>+ Add</Btn>
+            </div>
+
+            {/* Quick-add chips for top filtered products */}
+            {(catFilter !== "All" || search) && filteredProducts.length > 0 && filteredProducts.length <= 30 && (
+              <div style={{marginTop:8}}>
+                <div style={{fontSize:10,color:"#8A95A8",marginBottom:5,textTransform:"uppercase",letterSpacing:0.5}}>Quick add</div>
+                <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                  {filteredProducts.slice(0, 20).map(p => (
+                    <button key={p.id} onClick={() => quickAddProduct(p)}
+                      style={{
+                        padding:"4px 9px",fontSize:11,borderRadius:4,cursor:"pointer",
+                        background:"#1E2535",border:"1px solid #2A3348",color:"#E8EDF5"
+                      }}>
+                      + {p.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
-          <div style={{display:"grid",gridTemplateColumns:"1fr 2fr",gap:10,marginBottom:10}}>
-            <div className="form-group" style={{marginBottom:0}}>
-              <label className="form-label">Quantity *</label>
-              <input className="form-input" type="number" min="1" value={form.quantity}
-                onChange={e => update("quantity", e.target.value)} />
+          {/* Cart contents */}
+          <div className="mod-card">
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5}}>
+                3 · Cart ({cart.length} item{cart.length===1?"":"s"})
+              </div>
+              {cart.length > 0 && (
+                <Btn onClick={() => setCart([])} style={{fontSize:11,padding:"3px 8px"}}>Clear all</Btn>
+              )}
             </div>
-            <div className="form-group" style={{marginBottom:0}}>
-              <label className="form-label">Notes</label>
-              <input className="form-input" value={form.notes}
-                onChange={e => update("notes", e.target.value)}
-                placeholder="PO number, vendor, job site..." />
-            </div>
-          </div>
 
-          <div style={{display:"flex",gap:8,marginTop:8}}>
-            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
-            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
-              {saving ? "Saving..." : "Submit"}
-            </Btn>
+            {cart.length === 0 ? (
+              <div style={{padding:"16px 0",fontSize:13,color:"#8A95A8",textAlign:"center",fontStyle:"italic"}}>
+                No items added yet — pick products above and click + Add
+              </div>
+            ) : (
+              <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {cart.map(item => {
+                  const p = products.find(p => p.id === item.product_id);
+                  const lineCost = (p?.unit_cost || 0) * item.quantity;
+                  return (
+                    <div key={item.key} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:13,fontWeight:500}}>{p?.name || "—"}</div>
+                        <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
+                          {p?.category} · ${(p?.unit_cost || 0).toFixed(2)} / {p?.unit_of_measure || "ea"}
+                        </div>
+                      </div>
+                      <button onClick={() => updateCartQty(item.key, item.quantity - 1)} disabled={item.quantity <= 1}
+                        style={{padding:"4px 9px",borderRadius:4,background:"#2A3348",border:"none",color:"#E8EDF5",cursor:"pointer",fontSize:13,fontWeight:600}}>−</button>
+                      <input type="number" min="1" value={item.quantity}
+                        onChange={e => updateCartQty(item.key, e.target.value)}
+                        style={{width:55,padding:"4px 6px",background:"#0F1623",border:"1px solid #2A3348",borderRadius:4,color:"#E8EDF5",fontFamily:"monospace",textAlign:"center",fontSize:13}} />
+                      <button onClick={() => updateCartQty(item.key, item.quantity + 1)}
+                        style={{padding:"4px 9px",borderRadius:4,background:"#2A3348",border:"none",color:"#E8EDF5",cursor:"pointer",fontSize:13,fontWeight:600}}>+</button>
+                      <span style={{fontSize:11,color:"#8A95A8",width:65,textAlign:"right",fontFamily:"monospace"}}>${lineCost.toFixed(2)}</span>
+                      <button onClick={() => removeCartItem(item.key)}
+                        style={{padding:"4px 8px",borderRadius:4,background:"transparent",border:"1px solid #EF4444",color:"#EF4444",cursor:"pointer",fontSize:11}}>×</button>
+                    </div>
+                  );
+                })}
+                <div style={{display:"flex",justifyContent:"space-between",padding:"10px 12px 4px",marginTop:4,fontSize:13,borderTop:"1px solid #2A3348"}}>
+                  <span style={{color:"#8A95A8"}}>{totalQty} item{totalQty===1?"":"s"} total</span>
+                  <strong style={{fontFamily:"monospace"}}>${estCost.toFixed(2)} <span style={{fontSize:10,color:"#8A95A8",fontWeight:400}}>est.</span></strong>
+                </div>
+              </div>
+            )}
           </div>
+        </div>
+
+        <div style={{display:"flex",gap:8,padding:"14px 18px",borderTop:"1px solid #2A3348"}}>
+          <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+          <Btn variant="primary" style={{flex:2}} onClick={submitBatch} disabled={saving || cart.length === 0}>
+            {saving ? "Submitting..." : `Submit batch (${cart.length})`}
+          </Btn>
         </div>
       </div>
     </div>
