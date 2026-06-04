@@ -215,6 +215,53 @@ tr:hover td{background:#1E2535;cursor:pointer}
 const BASE_BRANCHES = ["DFW","OKC","ATX","CStat","Office"];
 const DEPARTMENTS = ["Pest","Wildlife","Insulation","Project Manager","Office"];
 
+// Parse YYYY-MM-DD date-only strings as LOCAL dates (not UTC).
+// Postgres DATE values come over the wire as "YYYY-MM-DD"; if you pass that to
+// new Date() it gets parsed as UTC midnight, which shows as the day before in
+// US timezones. This helper avoids that.
+function parseLocalDate(dateStr) {
+  if (!dateStr) return null;
+  // If it already contains a time component (e.g. ISO timestamp), let Date handle it
+  if (typeof dateStr === "string" && dateStr.length === 10 && dateStr[4] === "-") {
+    const [y, m, d] = dateStr.split("-").map(Number);
+    return new Date(y, m - 1, d);
+  }
+  return new Date(dateStr);
+}
+
+function formatLocalDate(dateStr, opts = { month: "short", day: "numeric", year: "numeric" }) {
+  const d = parseLocalDate(dateStr);
+  return d ? d.toLocaleDateString("en-US", opts) : "—";
+}
+
+// Records a driver change in truck_driver_history. Closes out any open record
+// for that truck (sets unassigned_at = now), then if newEmployeeId provided
+// opens a new one. Failures are logged but don't block the main op since
+// history is secondary to the actual assignment.
+async function recordDriverChange(truckId, newEmployeeId, newEmployeeName, actorId, notes) {
+  try {
+    // Close out the current open assignment for this truck (if any)
+    await fetch(SUPABASE_URL + "/rest/v1/truck_driver_history?truck_id=eq." + truckId + "&unassigned_at=is.null", {
+      method: "PATCH",
+      headers: { ...headers, "Prefer": "return=minimal" },
+      body: JSON.stringify({ unassigned_at: new Date().toISOString() })
+    });
+    // Open a new assignment record if there's a new driver
+    if (newEmployeeId) {
+      await sbPost("truck_driver_history", {
+        truck_id: truckId,
+        employee_id: newEmployeeId,
+        driver_name: newEmployeeName || null,
+        assigned_by: actorId || null,
+        notes: notes || null
+      });
+    }
+  } catch (err) {
+    // History failure shouldn't block the assignment
+    console.warn("Failed to record driver change:", err);
+  }
+}
+
 // The 6-way branch filter: DFW splits into three by department, others stay as-is
 const BRANCH_OPTIONS = [
   { value: "DFW|Pest",       label: "DFW Pest" },
@@ -439,7 +486,7 @@ function Dashboard({ user, employees, trucks, inventory, shops }) {
   const oilIssues = trucks.filter(t => t.next_oil_miles && t.mileage >= t.next_oil_miles - 500).length;
   const regIssues = trucks.filter(t => {
     if (!t.reg_expires) return false;
-    return new Date(t.reg_expires) < new Date();
+    return parseLocalDate(t.reg_expires) < new Date();
   }).length;
 
   // Items needing reorder: inventory rows where quantity <= reorder_threshold (and threshold is set)
@@ -612,7 +659,7 @@ function People({ user, employees, setEmployees, onProfile, showToast }) {
               <tr key={e.id} onClick={() => onProfile(e)}>
                 <td><strong>{e.name}</strong></td>
                 <td>{e.branch}</td>
-                <td style={{color:"#8A95A8",fontSize:12}}>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
+                <td style={{color:"#8A95A8",fontSize:12}}>{formatLocalDate(e.start_date)}</td>
                 <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
                 <td><Badge color={statusColor(e.status)}>{e.status}</Badge></td>
               </tr>
@@ -645,7 +692,7 @@ function HROnboardingTable({ list, onProfile, onAdd }) {
           ) : sort.rows.map(e => (
             <tr key={e.id} onClick={() => onProfile(e)}>
               <td><strong>{e.name}</strong></td><td>{e.branch}</td>
-              <td>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
+              <td>{formatLocalDate(e.start_date)}</td>
               <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
               <td><Badge color="blue">Onboarding</Badge></td>
             </tr>
@@ -672,7 +719,7 @@ function HRAllEmployeesTable({ list, onProfile }) {
           {sort.rows.map(e => (
             <tr key={e.id} onClick={() => onProfile(e)}>
               <td><strong>{e.name}</strong></td><td>{e.branch}</td>
-              <td style={{color:"#8A95A8",fontSize:12}}>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
+              <td style={{color:"#8A95A8",fontSize:12}}>{formatLocalDate(e.start_date)}</td>
               <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
               <td><Badge color={statusColor(e.status)}>{e.status}</Badge></td>
             </tr>
@@ -861,10 +908,18 @@ function TimeOff({ user, employees, showToast }) {
 
   async function updateStatus(id, status) {
     try {
-      await sbPatch("time_off", id, { status, approved_by: user.id });
+      const payload = { status };
+      if (status === "approved" || status === "denied") payload.approved_by = user.id;
+      await sbPatch("time_off", id, payload);
       setRequests(prev => prev.map(r => r.id === id ? { ...r, status } : r));
-      showToast(status === "approved" ? "Request approved" : "Request denied");
-    } catch { showToast("Error updating request", "error"); }
+      const msgs = { approved: "Request approved", denied: "Request denied", cancelled: "Request cancelled", pending: "Request reopened" };
+      showToast(msgs[status] || "Status updated");
+    } catch (err) { showToast("Error updating request: " + (err.message || err), "error"); }
+  }
+
+  async function cancelRequest(r) {
+    if (!window.confirm(`Cancel ${r.employee?.name || "this"}'s ${r.type === "callout" ? "callout" : "time off"} request${r.start_date ? " for " + r.start_date : ""}?`)) return;
+    return updateStatus(r.id, "cancelled");
   }
 
   const filtered = requests.filter(r => {
@@ -912,23 +967,28 @@ function TimeOff({ user, employees, showToast }) {
                       {isManager && <th>Action</th>}
                     </tr></thead>
                     <tbody>
-                      {sortPending.rows.map(r => (
+                      {sortPending.rows.map(r => {
+                        const isMine = r.employee_id === user.id;
+                        const canCancel = isManager || isMine;
+                        return (
                         <tr key={r.id}>
                           <td><strong>{r.employee?.name || "Unknown"}</strong></td>
                           <td>{r.employee?.branch}</td>
-                          <td>{r.start_date}{r.end_date && r.end_date !== r.start_date ? " → " + r.end_date : ""}</td>
+                          <td>{formatLocalDate(r.start_date)}{r.end_date && r.end_date !== r.start_date ? " → " + formatLocalDate(r.end_date) : ""}</td>
                           <td>{r.reason || "—"}</td>
                           <td><Badge color={r.type==="callout"?"red":"blue"}>{r.type==="callout"?"Callout":"Time Off"}</Badge></td>
                           {isManager && (
                             <td>
-                              <div style={{display:"flex",gap:6}}>
+                              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
                                 <Btn variant="primary" style={{padding:"3px 9px",fontSize:11}} onClick={() => updateStatus(r.id,"approved")}>✓ Approve</Btn>
                                 <Btn variant="red" style={{padding:"3px 9px",fontSize:11}} onClick={() => updateStatus(r.id,"denied")}>✕ Deny</Btn>
+                                {canCancel && <Btn style={{padding:"3px 9px",fontSize:11}} onClick={() => cancelRequest(r)}>Cancel</Btn>}
                               </div>
                             </td>
                           )}
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -943,19 +1003,28 @@ function TimeOff({ user, employees, showToast }) {
                     <SortableTh sortState={sortAllReq} sortKey="reason">Reason</SortableTh>
                     <SortableTh sortState={sortAllReq} sortKey="status">Status</SortableTh>
                     <SortableTh sortState={sortAllReq} sortKey="type">Type</SortableTh>
+                    <th>Actions</th>
                   </tr></thead>
                   <tbody>
                     {sortAllReq.rows.length === 0 ? (
-                      <tr><td colSpan={6}><div className="empty-state">No requests yet</div></td></tr>
-                    ) : sortAllReq.rows.map(r => (
+                      <tr><td colSpan={7}><div className="empty-state">No requests yet</div></td></tr>
+                    ) : sortAllReq.rows.map(r => {
+                      const isMine = r.employee_id === user.id;
+                      const canCancel = (isManager || isMine) && r.status !== "cancelled" && r.status !== "denied";
+                      return (
                       <tr key={r.id}>
                         <td><strong>{r.employee?.name || "Unknown"}</strong></td>
                         <td>{r.employee?.branch}</td>
-                        <td style={{fontSize:12,color:"#8A95A8"}}>{r.start_date}{r.end_date && r.end_date !== r.start_date ? " → " + r.end_date : ""}</td>
+                        <td style={{fontSize:12,color:"#8A95A8"}}>{formatLocalDate(r.start_date)}{r.end_date && r.end_date !== r.start_date ? " → " + formatLocalDate(r.end_date) : ""}</td>
                         <td>{r.reason || "—"}</td>
-                        <td><Badge color={r.status==="approved"?"green":r.status==="denied"?"red":"amber"}>{r.status}</Badge></td>
+                        <td><Badge color={r.status==="approved"?"green":r.status==="denied"?"red":r.status==="cancelled"?"gray":"amber"}>{r.status}</Badge></td>
                         <td><Badge color={r.type==="callout"?"red":"blue"}>{r.type==="callout"?"Callout":"Time Off"}</Badge></td>
+                        <td>
+                          {canCancel && <Btn style={{padding:"3px 9px",fontSize:11}} onClick={() => cancelRequest(r)}>Cancel</Btn>}
+                        </td>
                       </tr>
+                      );
+                    })}
                     ))}
                   </tbody>
                 </table>
@@ -1050,29 +1119,65 @@ function TimeOff({ user, employees, showToast }) {
         </div>
       )}
 
-      {tab === "calendar" && (
-        <div>
-          <div className="alert blue">📅 Calendar view — approved time off and callouts for {branch === "All" ? "all branches" : branch}</div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3}}>
-            {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d => (
-              <div key={d} style={{textAlign:"center",fontSize:10,color:"#4A5568",padding:"4px 0",fontWeight:500}}>{d}</div>
-            ))}
-            {[null,null,null,null,null,null,null,...Array.from({length:30},(_,i)=>i+1)].map((d,i) => {
-              const dayReqs = d ? filtered.filter(r => r.start_date && new Date(r.start_date).getDate() === d && r.status === "approved") : [];
-              return (
-                <div key={i} style={{minHeight:60,background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:5,opacity:d?1:.35}}>
-                  <div style={{fontSize:11,fontWeight:500,color:"#8A95A8",marginBottom:3}}>{d}</div>
-                  {dayReqs.map((r,j) => (
-                    <div key={j} style={{fontSize:10,padding:"2px 5px",borderRadius:4,background:r.type==="callout"?"#EF444418":"#3B82F618",color:r.type==="callout"?"#EF4444":"#3B82F6",marginBottom:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                      {r.employee?.name?.split(" ")[0]}
-                    </div>
-                  ))}
-                </div>
-              );
-            })}
+      {tab === "calendar" && (() => {
+        const today = new Date();
+        const cyear = today.getFullYear();
+        const cmonth = today.getMonth(); // 0-indexed
+        const firstDay = new Date(cyear, cmonth, 1);
+        const lastDay = new Date(cyear, cmonth + 1, 0);
+        const startWeekday = firstDay.getDay(); // 0 = Sun
+        const daysInMonth = lastDay.getDate();
+        // Build cells: blank leading + each day
+        const cells = [...Array(startWeekday).fill(null), ...Array.from({length: daysInMonth}, (_,i) => i+1)];
+        // Helper: parse date-only string as local-noon to avoid timezone shifts
+        function parseLocalDate(dateStr) {
+          if (!dateStr) return null;
+          // dateStr is YYYY-MM-DD; parse explicitly as local
+          const [y, m, d] = dateStr.split("-").map(Number);
+          return new Date(y, m - 1, d); // local midnight
+        }
+        // For a given day-of-month, find approved requests whose date range covers it
+        function reqsForDay(day) {
+          const target = new Date(cyear, cmonth, day);
+          return filtered.filter(r => {
+            if (r.status !== "approved" && r.status !== "logged") return false;
+            const start = parseLocalDate(r.start_date);
+            const end = parseLocalDate(r.end_date || r.start_date);
+            if (!start || !end) return false;
+            return target >= start && target <= end;
+          });
+        }
+        const monthLabel = today.toLocaleDateString("en-US",{month:"long",year:"numeric"});
+        return (
+          <div>
+            <div className="alert blue">📅 Calendar view — {monthLabel} · approved time off and callouts for {branch === "All" ? "all branches" : branch}</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3}}>
+              {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d => (
+                <div key={d} style={{textAlign:"center",fontSize:10,color:"#4A5568",padding:"4px 0",fontWeight:500}}>{d}</div>
+              ))}
+              {cells.map((d, i) => {
+                const dayReqs = d ? reqsForDay(d) : [];
+                const isToday = d && d === today.getDate();
+                return (
+                  <div key={i} style={{
+                    minHeight:60,
+                    background: isToday ? "#22C55E18" : "#1E2535",
+                    border: "1px solid " + (isToday ? "#22C55E" : "#2A3348"),
+                    borderRadius:6, padding:5, opacity: d ? 1 : .25
+                  }}>
+                    <div style={{fontSize:11,fontWeight:isToday?700:500,color: isToday ? "#22C55E" : "#8A95A8",marginBottom:3}}>{d}</div>
+                    {dayReqs.map((r,j) => (
+                      <div key={j} style={{fontSize:10,padding:"2px 5px",borderRadius:4,background:r.type==="callout"?"#EF444418":"#3B82F618",color:r.type==="callout"?"#EF4444":"#3B82F6",marginBottom:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                        {r.employee?.name?.split(" ")[0]}
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {tab === "overtime" && isManager && (
         <OvertimeTab user={user} employees={employees} branch={branch} showToast={showToast} />
@@ -1251,7 +1356,7 @@ function OvertimeTab({ user, employees, branch, showToast }) {
                 <tr><td colSpan={8}><div className="empty-state">No shifts in this period — click "+ Log shift" to add one</div></td></tr>
               ) : sortShifts.rows.map(s => (
                 <tr key={s.id}>
-                  <td style={{fontSize:12}}>{new Date(s.shift_date + "T12:00:00").toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}</td>
+                  <td style={{fontSize:12}}>{formatLocalDate(s.shift_date, {weekday:"short",month:"short",day:"numeric"})}</td>
                   <td><strong>{s.employee?.name || "—"}</strong></td>
                   <td style={{fontFamily:"monospace",fontSize:11}}>{s.start_time ? s.start_time.slice(0,5) : "—"}</td>
                   <td style={{fontFamily:"monospace",fontSize:11}}>{s.end_time ? s.end_time.slice(0,5) : "—"}</td>
@@ -1519,7 +1624,7 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
       </div>
 
       <div className="tabs" style={{marginBottom:14}}>
-        {[["shops","Shops"],["trucks","Trucks"],["log","Log Move"],["history","History"],["order","Order"]].map(([t,l]) => (
+        {[["shops","Shops"],["trucks","Trucks"],["log","Log Move"],["history","History"],["order","Order"],["reports","Reports"]].map(([t,l]) => (
           <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
         ))}
       </div>
@@ -1642,8 +1747,11 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
       {/* History tab */}
       {tab === "history" && (
         <div>
-          <div className="alert blue" style={{marginBottom:14}}>
-            🕓 Last 200 inventory transactions across all branches and trucks.
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:8}}>
+            <div className="alert blue" style={{margin:0,flex:1,minWidth:200}}>
+              🕓 Last 200 inventory transactions across all branches and trucks.
+            </div>
+            <Btn variant="primary" onClick={() => downloadHistoryCSV(history, shops, trucks)}>↓ Download CSV</Btn>
           </div>
           <InventoryHistoryTable history={history} />
         </div>
@@ -1651,6 +1759,10 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
 
       {tab === "order" && (
         <OrderTab user={user} products={products} employees={employees} showToast={showToast} />
+      )}
+
+      {tab === "reports" && (
+        <InventoryReports user={user} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />
       )}
 
       {moveModal && (
@@ -2146,6 +2258,286 @@ function OrderManager({ user, products, showToast }) {
               )}
             </div>
           ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── CSV download helpers ─────────────────────────────────────────────────────
+function csvEscape(v) {
+  if (v == null) return "";
+  const s = String(v);
+  if (s.includes(",") || s.includes("\"") || s.includes("\n")) {
+    return "\"" + s.replace(/"/g, '""') + "\"";
+  }
+  return s;
+}
+
+function downloadCSV(filename, headers, rows) {
+  const lines = [headers.map(csvEscape).join(",")];
+  for (const r of rows) lines.push(r.map(csvEscape).join(","));
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function locationLabel(locationId, shops, trucks) {
+  if (!locationId) return "—";
+  const shop = (shops || []).find(s => s.id === locationId);
+  if (shop) return shop.name;
+  const truck = (trucks || []).find(t => t.id === locationId);
+  if (truck) return `Truck #${truck.truck_number}`;
+  return locationId;
+}
+
+function downloadHistoryCSV(history, shops, trucks) {
+  const rows = history.map(tx => [
+    new Date(tx.created_at).toISOString(),
+    tx.action || "",
+    tx.product?.name || "",
+    tx.product?.category || "",
+    tx.quantity,
+    locationLabel(tx.from_location, shops, trucks),
+    locationLabel(tx.to_location, shops, trucks),
+    tx.employee?.name || "",
+    tx.vendor || "",
+    tx.invoice_number || "",
+    tx.total_cost || "",
+    (tx.notes || "").replace(/\n/g, " ")
+  ]);
+  const headers = ["Date","Action","Product","Category","Quantity","From","To","By","Vendor","Invoice #","Total cost ($)","Notes"];
+  downloadCSV(`inventory_history_${new Date().toISOString().slice(0,10)}.csv`, headers, rows);
+}
+
+// ── Inventory Reports tab ────────────────────────────────────────────────────
+function InventoryReports({ user, products, trucks, employees, shops, showToast }) {
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [periodStart, setPeriodStart] = useState(() => {
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth(), 1).toISOString().slice(0,10);
+  });
+  const [periodEnd, setPeriodEnd] = useState(() => {
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth() + 1, 0).toISOString().slice(0,10);
+  });
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await sb("inventory_transactions",
+        `?select=*,product:products(name,category,unit_cost,unit_of_measure),employee:employees(name,branch,department)&created_at=gte.${periodStart}T00:00:00&created_at=lte.${periodEnd}T23:59:59&order=created_at.desc`);
+      setHistory(data);
+    } catch (err) { showToast("Error loading reports: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+
+  useEffect(() => { load(); }, [periodStart, periodEnd]); // eslint-disable-line
+
+  // Usage transactions = anything that consumed product (usage action, plus load_truck if you want "what was loaded")
+  // We'll focus on `usage` as the primary report, plus a Load Summary for what was moved out of shops.
+  const usageTx = history.filter(tx => tx.action === "usage");
+  const loadTx  = history.filter(tx => tx.action === "load_truck");
+  const distTx  = history.filter(tx => tx.action === "distributor_purchase");
+
+  // Aggregate: by product
+  const byProduct = {};
+  for (const tx of usageTx) {
+    const pid = tx.product_id;
+    if (!byProduct[pid]) byProduct[pid] = { product: tx.product, qty: 0, cost: 0 };
+    byProduct[pid].qty += (tx.quantity || 0);
+    byProduct[pid].cost += (tx.quantity || 0) * (tx.product?.unit_cost || 0);
+  }
+  const byProductRows = Object.entries(byProduct).map(([pid, v]) => ({ product_id: pid, ...v }));
+  byProductRows.sort((a, b) => b.cost - a.cost);
+  const sortByProduct = useSortableData(byProductRows, "cost", "desc");
+
+  // Aggregate: by technician (employee)
+  const byTech = {};
+  for (const tx of usageTx) {
+    if (!tx.employee_id) continue;
+    const eid = tx.employee_id;
+    if (!byTech[eid]) byTech[eid] = { employee: tx.employee, count: 0, qty: 0, cost: 0 };
+    byTech[eid].count += 1;
+    byTech[eid].qty += (tx.quantity || 0);
+    byTech[eid].cost += (tx.quantity || 0) * (tx.product?.unit_cost || 0);
+  }
+  const byTechRows = Object.entries(byTech).map(([eid, v]) => ({ employee_id: eid, ...v }));
+  byTechRows.sort((a, b) => b.cost - a.cost);
+  const sortByTech = useSortableData(byTechRows, "cost", "desc");
+
+  // Aggregate: distributor purchases by vendor
+  const byVendor = {};
+  for (const tx of distTx) {
+    const v = tx.vendor || "(no vendor)";
+    if (!byVendor[v]) byVendor[v] = { vendor: v, count: 0, qty: 0, cost: 0 };
+    byVendor[v].count += 1;
+    byVendor[v].qty += (tx.quantity || 0);
+    byVendor[v].cost += parseFloat(tx.total_cost) || 0;
+  }
+  const byVendorRows = Object.values(byVendor).sort((a, b) => b.cost - a.cost);
+  const sortByVendor = useSortableData(byVendorRows, "cost", "desc");
+
+  // Totals
+  const totalUsageCost = byProductRows.reduce((s, r) => s + r.cost, 0);
+  const totalUsageQty  = byProductRows.reduce((s, r) => s + r.qty, 0);
+  const totalDistCost  = byVendorRows.reduce((s, r) => s + r.cost, 0);
+
+  function downloadByProduct() {
+    const rows = sortByProduct.rows.map(r => [
+      r.product?.name || "—",
+      r.product?.category || "",
+      r.qty,
+      r.product?.unit_of_measure || "",
+      r.cost.toFixed(2)
+    ]);
+    downloadCSV(`usage_by_product_${periodStart}_to_${periodEnd}.csv`,
+      ["Product","Category","Quantity used","Unit","Total cost ($)"], rows);
+  }
+  function downloadByTech() {
+    const rows = sortByTech.rows.map(r => [
+      r.employee?.name || "—",
+      r.employee?.branch || "",
+      r.employee?.department || "",
+      r.count,
+      r.qty,
+      r.cost.toFixed(2)
+    ]);
+    downloadCSV(`usage_by_tech_${periodStart}_to_${periodEnd}.csv`,
+      ["Technician","Branch","Department","Transactions","Total quantity","Total cost ($)"], rows);
+  }
+  function downloadByVendor() {
+    const rows = sortByVendor.rows.map(r => [
+      r.vendor, r.count, r.qty, r.cost.toFixed(2)
+    ]);
+    downloadCSV(`distributor_purchases_${periodStart}_to_${periodEnd}.csv`,
+      ["Vendor","Purchases","Items","Total spent ($)"], rows);
+  }
+  function downloadAllTx() {
+    downloadHistoryCSV(history, shops, trucks);
+  }
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        📊 Aggregated inventory reports for the selected period. Download any view as CSV for spreadsheets, accounting, or further analysis.
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"flex-end"}}>
+        <div className="form-group" style={{marginBottom:0}}>
+          <label className="form-label" style={{fontSize:10}}>Period start</label>
+          <input className="form-input" type="date" value={periodStart}
+            onChange={e => setPeriodStart(e.target.value)} style={{padding:"6px 9px"}} />
+        </div>
+        <div className="form-group" style={{marginBottom:0}}>
+          <label className="form-label" style={{fontSize:10}}>Period end</label>
+          <input className="form-input" type="date" value={periodEnd}
+            onChange={e => setPeriodEnd(e.target.value)} style={{padding:"6px 9px"}} />
+        </div>
+        <div style={{flex:1}} />
+        <Btn variant="primary" onClick={downloadAllTx}>↓ All transactions CSV</Btn>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:10,marginBottom:14}}>
+        <KpiTile label="Usage transactions" value={usageTx.length} color="#22C55E" />
+        <KpiTile label="Total quantity used" value={totalUsageQty.toFixed(1)} color="#3B82F6" />
+        <KpiTile label="Total usage cost" value={"$" + totalUsageCost.toFixed(2)} color="#F59E0B" />
+        <KpiTile label="Distributor spend" value={"$" + totalDistCost.toFixed(2)} color="#A855F7" />
+      </div>
+
+      {loading ? <div className="loading">Loading reports...</div> : (
+        <>
+          <div className="table-wrap" style={{marginBottom:16}}>
+            <div className="table-head">
+              <span className="table-title">Usage by product ({byProductRows.length})</span>
+              <Btn onClick={downloadByProduct}>↓ CSV</Btn>
+            </div>
+            <table>
+              <thead><tr>
+                <SortableTh sortState={sortByProduct} sortKey="name" accessor={r => r.product?.name || ""}>Product</SortableTh>
+                <SortableTh sortState={sortByProduct} sortKey="category" accessor={r => r.product?.category || ""}>Category</SortableTh>
+                <SortableTh sortState={sortByProduct} sortKey="qty">Quantity used</SortableTh>
+                <SortableTh sortState={sortByProduct} sortKey="cost">Total cost</SortableTh>
+              </tr></thead>
+              <tbody>
+                {sortByProduct.rows.length === 0 ? (
+                  <tr><td colSpan={4}><div className="empty-state">No usage logged for this period</div></td></tr>
+                ) : sortByProduct.rows.map(r => (
+                  <tr key={r.product_id}>
+                    <td><strong>{r.product?.name || "—"}</strong></td>
+                    <td><Badge color="gray">{r.product?.category || "—"}</Badge></td>
+                    <td style={{fontFamily:"monospace"}}>{r.qty} {r.product?.unit_of_measure || ""}</td>
+                    <td style={{fontFamily:"monospace"}}>${r.cost.toFixed(2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="table-wrap" style={{marginBottom:16}}>
+            <div className="table-head">
+              <span className="table-title">Usage by technician ({byTechRows.length})</span>
+              <Btn onClick={downloadByTech}>↓ CSV</Btn>
+            </div>
+            <table>
+              <thead><tr>
+                <SortableTh sortState={sortByTech} sortKey="name" accessor={r => r.employee?.name || ""}>Technician</SortableTh>
+                <SortableTh sortState={sortByTech} sortKey="branch" accessor={r => r.employee?.branch || ""}>Branch</SortableTh>
+                <SortableTh sortState={sortByTech} sortKey="department" accessor={r => r.employee?.department || ""}>Dept</SortableTh>
+                <SortableTh sortState={sortByTech} sortKey="count">Transactions</SortableTh>
+                <SortableTh sortState={sortByTech} sortKey="qty">Items used</SortableTh>
+                <SortableTh sortState={sortByTech} sortKey="cost">Total cost</SortableTh>
+              </tr></thead>
+              <tbody>
+                {sortByTech.rows.length === 0 ? (
+                  <tr><td colSpan={6}><div className="empty-state">No tech usage logged for this period</div></td></tr>
+                ) : sortByTech.rows.map(r => (
+                  <tr key={r.employee_id}>
+                    <td><strong>{r.employee?.name || "—"}</strong></td>
+                    <td>{r.employee?.branch || "—"}</td>
+                    <td>{r.employee?.department ? <Badge color={deptColor(r.employee.department)}>{r.employee.department}</Badge> : "—"}</td>
+                    <td style={{fontFamily:"monospace"}}>{r.count}</td>
+                    <td style={{fontFamily:"monospace"}}>{r.qty}</td>
+                    <td style={{fontFamily:"monospace"}}>${r.cost.toFixed(2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="table-wrap">
+            <div className="table-head">
+              <span className="table-title">Distributor purchases ({byVendorRows.length})</span>
+              <Btn onClick={downloadByVendor}>↓ CSV</Btn>
+            </div>
+            <table>
+              <thead><tr>
+                <SortableTh sortState={sortByVendor} sortKey="vendor">Vendor</SortableTh>
+                <SortableTh sortState={sortByVendor} sortKey="count">Purchases</SortableTh>
+                <SortableTh sortState={sortByVendor} sortKey="qty">Items</SortableTh>
+                <SortableTh sortState={sortByVendor} sortKey="cost">Total spent</SortableTh>
+              </tr></thead>
+              <tbody>
+                {sortByVendor.rows.length === 0 ? (
+                  <tr><td colSpan={4}><div className="empty-state">No distributor purchases logged for this period</div></td></tr>
+                ) : sortByVendor.rows.map(r => (
+                  <tr key={r.vendor}>
+                    <td><strong>{r.vendor}</strong></td>
+                    <td style={{fontFamily:"monospace"}}>{r.count}</td>
+                    <td style={{fontFamily:"monospace"}}>{r.qty}</td>
+                    <td style={{fontFamily:"monospace"}}>${r.cost.toFixed(2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </>
       )}
     </div>
@@ -2652,7 +3044,7 @@ function EquipmentPage({ user, employees, showToast }) {
                 </tr></thead>
                 <tbody>
                   {sortCheckedOut.rows.map(co => {
-                    const overdue = co.expected_return && new Date(co.expected_return) < new Date();
+                    const overdue = co.expected_return && parseLocalDate(co.expected_return) < new Date();
                     return (
                       <tr key={co.id}>
                         <td><strong>{co.equipment?.name || "—"}</strong></td>
@@ -2687,7 +3079,7 @@ function EquipmentPage({ user, employees, showToast }) {
                 </tr></thead>
                 <tbody>
                   {sortCheckIn.rows.map(co => {
-                    const overdue = co.expected_return && new Date(co.expected_return) < new Date();
+                    const overdue = co.expected_return && parseLocalDate(co.expected_return) < new Date();
                     return (
                       <tr key={co.id}>
                         <td><strong>{co.equipment?.name || "—"}</strong></td>
@@ -2939,7 +3331,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
   const sortAll = useSortableData(list, "truck_number");
 
   const maintenance = list.filter(t => t.next_oil_miles && t.mileage >= t.next_oil_miles - 500);
-  const regExpired = list.filter(t => t.reg_expires && new Date(t.reg_expires) < new Date());
+  const regExpired = list.filter(t => t.reg_expires && parseLocalDate(t.reg_expires) < new Date());
   const sortMaint = useSortableData(maintenance, "truck_number");
   const sortReg = useSortableData(list, "reg_expires", "asc");
 
@@ -3005,7 +3397,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                   <tr><td colSpan={10}><div className="empty-state">No trucks added yet — click "+ Add truck" to get started</div></td></tr>
                 ) : sortAll.rows.map(t => {
                   const oil = oilStatus(t);
-                  const regExp = t.reg_expires && new Date(t.reg_expires) < new Date();
+                  const regExp = t.reg_expires && parseLocalDate(t.reg_expires) < new Date();
                   const dot = maintenance.includes(t) || regExp ? "#EF4444" : t.has_gps ? "#22C55E" : "#8A95A8";
                   const canEdit = ["super_admin","manager","lead"].includes(user.access_level);
                   return (
@@ -3036,7 +3428,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                       <td style={{fontFamily:"monospace",fontSize:11}}>{t.plate || "—"}</td>
                       <td style={{fontFamily:"monospace"}}>{t.mileage ? t.mileage.toLocaleString() : "—"}</td>
                       <td style={{color:oil.color,fontFamily:"monospace",fontSize:12}}>{oil.label}</td>
-                      <td><Badge color={regExp?"red":!t.reg_expires?"gray":"green"}>{t.reg_expires ? new Date(t.reg_expires).toLocaleDateString("en-US",{month:"short",year:"numeric"}) : "—"}</Badge></td>
+                      <td><Badge color={regExp?"red":!t.reg_expires?"gray":"green"}>{formatLocalDate(t.reg_expires, {month:"short",year:"numeric"})}</Badge></td>
                       <td><Badge color={t.has_gps?"green":"gray"}>{t.has_gps?"Active":"No GPS"}</Badge></td>
                       <td>
                         {canEdit ? (
@@ -3099,7 +3491,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
               <SortableTh sortState={sortReg} sortKey="reg_expires">Reg expires</SortableTh>
               <SortableTh sortState={sortReg} sortKey="reg_status" accessor={t => {
                 if (!t.reg_expires) return "zUnknown";
-                const exp = new Date(t.reg_expires);
+                const exp = parseLocalDate(t.reg_expires);
                 if (exp < new Date()) return "aEXPIRED";
                 if ((exp - new Date()) < 60 * 24 * 60 * 60 * 1000) return "bSoon";
                 return "cCurrent";
@@ -3107,7 +3499,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
             </tr></thead>
             <tbody>
               {sortReg.rows.map(t => {
-                const exp = t.reg_expires ? new Date(t.reg_expires) : null;
+                const exp = t.reg_expires ? parseLocalDate(t.reg_expires) : null;
                 const expired = exp && exp < new Date();
                 const soon = exp && !expired && (exp - new Date()) < 60 * 24 * 60 * 60 * 1000;
                 return (
@@ -3130,6 +3522,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
           employees={employees}
           trucks={trucks}
           editing={truckEditing}
+          user={user}
           onClose={() => { setTruckModalOpen(false); setTruckEditing(null); }}
           onSaved={reloadTrucks}
           showToast={showToast}
@@ -3802,7 +4195,60 @@ function AddEmployeeModal({ onClose, onSaved, showToast }) {
 }
 
 // ── New Truck Modal (shared by Fleet "+ Add truck" and Settings → Trucks) ─────
-function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing }) {
+function DriverHistorySection({ truckId }) {
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    sb("truck_driver_history",
+      `?truck_id=eq.${truckId}&select=*,employee:employees(name)&order=assigned_at.desc`
+    ).then(data => {
+      if (!cancelled) { setHistory(data); setLoading(false); }
+    }).catch(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [truckId]);
+
+  return (
+    <div className="form-group">
+      <label className="form-label">Driver history</label>
+      {loading ? (
+        <div style={{fontSize:12,color:"#8A95A8",padding:"6px 0"}}>Loading history...</div>
+      ) : history.length === 0 ? (
+        <div style={{fontSize:12,color:"#8A95A8",padding:"6px 0",fontStyle:"italic"}}>No previous driver assignments recorded.</div>
+      ) : (
+        <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:200,overflowY:"auto"}}>
+          {history.map((h, idx) => {
+            const isCurrent = !h.unassigned_at;
+            const driverName = h.employee?.name || h.driver_name || "—";
+            return (
+              <div key={h.id} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,fontSize:12}}>
+                <span style={{
+                  width:6, height:6, borderRadius:"50%",
+                  background: isCurrent ? "#22C55E" : "#4A5568",
+                  flexShrink:0
+                }} />
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:500,color:"#E8EDF5"}}>
+                    {driverName}
+                    {isCurrent && <Badge color="green" style={{marginLeft:8,fontSize:9}}>Current</Badge>}
+                  </div>
+                  <div style={{fontSize:10,color:"#8A95A8",marginTop:2}}>
+                    {formatLocalDate(h.assigned_at?.slice(0,10), { month:"short", day:"numeric", year:"numeric" })}
+                    {h.unassigned_at && " → " + formatLocalDate(h.unassigned_at.slice(0,10), { month:"short", day:"numeric", year:"numeric" })}
+                    {h.notes && <span style={{marginLeft:8,fontStyle:"italic"}}>· {h.notes}</span>}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing, user }) {
   const isEdit = !!editing;
   const [form, setForm] = useState(() => editing ? {
     truck_number: editing.truck_number || "",
@@ -3855,6 +4301,7 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
         savedTruck = Array.isArray(result) ? result[0] : result;
       }
       // Assign driver: set the chosen employee's truck_id to this truck
+      // Also record the driver change in truck_driver_history.
       if (form.driver_id) {
         // First unassign any other employee currently pointing at this truck (if editing)
         if (isEdit) {
@@ -3862,10 +4309,19 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
           for (const e of oldDrivers) await sbPatch("employees", e.id, { truck_id: null });
         }
         await sbPatch("employees", form.driver_id, { truck_id: savedTruck.id });
+        const newDriver = employees.find(e => e.id === form.driver_id);
+        // Only record a change if the driver is actually changing
+        const previousDriver = isEdit ? employees.find(e => e.truck_id === editing.id) : null;
+        if (!previousDriver || previousDriver.id !== form.driver_id) {
+          await recordDriverChange(savedTruck.id, form.driver_id, newDriver?.name, user?.id, isEdit ? "Reassigned via Edit Truck" : "Initial assignment");
+        }
       } else if (isEdit) {
         // Driver cleared → unassign current driver
         const cur = employees.find(e => e.truck_id === editing.id);
-        if (cur) await sbPatch("employees", cur.id, { truck_id: null });
+        if (cur) {
+          await sbPatch("employees", cur.id, { truck_id: null });
+          await recordDriverChange(savedTruck.id, null, null, user?.id, "Cleared via Edit Truck");
+        }
       }
       showToast(isEdit ? "Truck updated" : `Truck ${truckNumber} added`);
       onSaved();
@@ -3949,6 +4405,7 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
                 ))}
             </select>
           </div>
+          {isEdit && <DriverHistorySection truckId={editing.id} />}
           {!isEdit && (
             <div className="form-group">
               <label className="form-label" style={{color:"#8A95A8"}}>Truck number (optional — auto-assigned if blank)</label>
@@ -4174,6 +4631,7 @@ function TrucksPage({ user, employees, setEmployees, trucks, setTrucks, showToas
           employees={employees}
           trucks={trucks}
           editing={truckEditing}
+          user={user}
           onClose={() => { setTruckModalOpen(false); setTruckEditing(null); }}
           onSaved={reloadTrucks}
           showToast={showToast}
@@ -4470,7 +4928,7 @@ function SettingsEmployeesTable({ employees }) {
               <td><strong>{e.name}</strong></td>
               <td style={{fontSize:11,color:"#8A95A8"}}>{e.email || "—"}</td>
               <td>{e.branch}</td>
-              <td style={{fontSize:12,color:"#8A95A8"}}>{e.start_date ? new Date(e.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
+              <td style={{fontSize:12,color:"#8A95A8"}}>{formatLocalDate(e.start_date)}</td>
               <td><Badge color={accessColor(e.access_level)}>{accessLabel(e.access_level)}</Badge></td>
               <td><Badge color={statusColor(e.status)}>{e.status}</Badge></td>
               <td><div style={{display:"flex",gap:6}}><Btn>Edit</Btn><Btn variant="red">Deactivate</Btn></div></td>
@@ -4921,6 +5379,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
               employees={employees}
               trucks={trucks}
               editing={truckEditing}
+              user={user}
               onClose={() => { setTruckModalOpen(false); setTruckEditing(null); }}
               onSaved={reloadTrucks}
               showToast={showToast}
@@ -5490,7 +5949,7 @@ function ProfileModal({ person, trucks, creditCards, currentUser, onClose, onSav
                   <div className="mod-card-title"><span style={{width:7,height:7,borderRadius:2,background:"#22C55E",display:"inline-block"}} />HR Info</div>
                   <div className="kv"><span className="kv-key">Branch</span><span className="kv-val">{branchLabel(person)}</span></div>
                   <div className="kv"><span className="kv-key">Department</span><span className="kv-val">{person.department ? <Badge color={deptColor(person.department)}>{person.department}</Badge> : <span style={{color:"#8A95A8"}}>—</span>}</span></div>
-                  <div className="kv"><span className="kv-key">Start date</span><span className="kv-val">{person.start_date ? new Date(person.start_date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</span></div>
+                  <div className="kv"><span className="kv-key">Start date</span><span className="kv-val">{formatLocalDate(person.start_date)}</span></div>
                   <div className="kv"><span className="kv-key">Access level</span><span className="kv-val">{accessLabel(person.access_level)}</span></div>
                   <div className="kv"><span className="kv-key">Email</span><span className="kv-val" style={{fontSize:10}}>{person.email || "—"}</span></div>
                   <div className="kv"><span className="kv-key">Phone</span><span className="kv-val">{person.phone || <span style={{color:"#8A95A8"}}>—</span>}</span></div>
