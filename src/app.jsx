@@ -5130,11 +5130,25 @@ function SettingsUsersTable({ users, currentUserId, onResetPin, onToggleAccess }
   );
 }
 
-function SettingsProductsTable({ products }) {
+function SettingsProductsTable({ products, reloadProducts, showToast }) {
   const sort = useSortableData(products, "name");
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+
+  async function toggleActive(p) {
+    try {
+      await sbPatch("products", p.id, { active: !p.active });
+      showToast(p.active ? "Product deactivated" : "Product activated");
+      reloadProducts();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+  }
+
   return (
     <div className="table-wrap">
-      <div className="table-head"><span className="table-title">Product catalog ({products.filter(p=>p.active).length} active)</span><Btn variant="primary" onClick={()=>{}}>+ Add product</Btn></div>
+      <div className="table-head">
+        <span className="table-title">Product catalog ({products.filter(p=>p.active).length} active)</span>
+        <Btn variant="primary" onClick={() => { setEditing(null); setModalOpen(true); }}>+ Add product</Btn>
+      </div>
       <table>
         <thead><tr>
           <SortableTh sortState={sort} sortKey="name">Product</SortableTh>
@@ -5144,9 +5158,12 @@ function SettingsProductsTable({ products }) {
           <SortableTh sortState={sort} sortKey="reorder_threshold">Reorder min</SortableTh>
           <SortableTh sortState={sort} sortKey="supplier">Supplier</SortableTh>
           <SortableTh sortState={sort} sortKey="active">Active</SortableTh>
+          <th>Actions</th>
         </tr></thead>
         <tbody>
-          {sort.rows.map(p => (
+          {sort.rows.length === 0 ? (
+            <tr><td colSpan={8}><div className="empty-state">No products yet — click "+ Add product" to create one</div></td></tr>
+          ) : sort.rows.map(p => (
             <tr key={p.id}>
               <td><strong>{p.name}</strong>{p.notes ? <span style={{fontSize:11,color:"#8A95A8",marginLeft:6}}>{p.notes}</span> : null}</td>
               <td><Badge color={p.category==="Pest"?"amber":p.category==="Wildlife"?"green":p.category==="Rodent"?"red":p.category==="Mosquito"?"teal":p.category==="Termite"?"purple":"blue"}>{p.category}</Badge></td>
@@ -5155,10 +5172,162 @@ function SettingsProductsTable({ products }) {
               <td style={{fontFamily:"monospace"}}>{p.reorder_threshold > 0 ? p.reorder_threshold : "—"}</td>
               <td>{p.supplier}</td>
               <td><Badge color={p.active?"green":"gray"}>{p.active?"Active":"Inactive"}</Badge></td>
+              <td>
+                <div style={{display:"flex",gap:6}}>
+                  <Btn onClick={() => { setEditing(p); setModalOpen(true); }}>Edit</Btn>
+                  <Btn variant={p.active ? "red" : "primary"} onClick={() => toggleActive(p)}>{p.active ? "Deactivate" : "Reactivate"}</Btn>
+                </div>
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
+      {modalOpen && (
+        <ProductModal
+          product={editing}
+          onClose={() => { setModalOpen(false); setEditing(null); }}
+          onSaved={() => { setModalOpen(false); setEditing(null); reloadProducts(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function ProductModal({ product, onClose, onSaved, showToast }) {
+  const isEdit = !!product;
+  const [form, setForm] = useState({
+    name: product?.name || "",
+    category: product?.category || "Pest",
+    unit_cost: product?.unit_cost != null ? String(product.unit_cost) : "",
+    unit_of_measure: product?.unit_of_measure || "ea",
+    reorder_threshold: product?.reorder_threshold != null ? String(product.reorder_threshold) : "",
+    supplier: product?.supplier || "",
+    notes: product?.notes || "",
+    active: product?.active ?? true
+  });
+  const [saving, setSaving] = useState(false);
+
+  function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+
+  async function save() {
+    if (!form.name.trim()) { showToast("Product name is required", "error"); return; }
+    if (!form.category) { showToast("Category is required", "error"); return; }
+
+    const unitCost = form.unit_cost === "" ? 0 : parseFloat(form.unit_cost);
+    if (isNaN(unitCost) || unitCost < 0) { showToast("Unit cost must be a non-negative number", "error"); return; }
+
+    const reorderMin = form.reorder_threshold === "" ? 0 : parseInt(form.reorder_threshold, 10);
+    if (isNaN(reorderMin) || reorderMin < 0) { showToast("Reorder min must be a non-negative integer", "error"); return; }
+
+    setSaving(true);
+    try {
+      const payload = {
+        name: form.name.trim(),
+        category: form.category,
+        unit_cost: unitCost,
+        unit_of_measure: form.unit_of_measure.trim() || "ea",
+        reorder_threshold: reorderMin,
+        supplier: form.supplier.trim() || null,
+        notes: form.notes.trim() || null,
+        active: form.active
+      };
+      if (isEdit) await sbPatch("products", product.id, payload);
+      else await sbPost("products", payload);
+      showToast(isEdit ? "Product updated" : "Product added");
+      onSaved();
+    } catch (err) {
+      const msg = (err.message || "").toLowerCase();
+      if (msg.includes("unique") || msg.includes("duplicate")) {
+        showToast("A product with that name already exists", "error");
+      } else {
+        showToast("Error: " + (err.message || err), "error");
+      }
+    }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:500}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">{isEdit ? "Edit product" : "+ Add product"}</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+              {isEdit ? "Update product details" : "Add a new product to the catalog"}
+            </div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Product name *</label>
+            <input className="form-input" value={form.name} autoFocus
+              onChange={e => update("name", e.target.value)}
+              placeholder="e.g. Termidor SC, Tomcat Bait Block" />
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Category *</label>
+              <select className="form-input" value={form.category}
+                onChange={e => update("category", e.target.value)}>
+                <option value="Pest">Pest</option>
+                <option value="Wildlife">Wildlife</option>
+                <option value="Rodent">Rodent</option>
+                <option value="Mosquito">Mosquito</option>
+                <option value="Termite">Termite</option>
+                <option value="Insulation">Insulation</option>
+              </select>
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Unit of measure</label>
+              <input className="form-input" value={form.unit_of_measure}
+                onChange={e => update("unit_of_measure", e.target.value)}
+                placeholder="ea, gal, lb, oz, bag" />
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Unit cost ($)</label>
+              <input className="form-input" type="number" step="0.01" min="0" value={form.unit_cost}
+                onChange={e => update("unit_cost", e.target.value)}
+                style={{fontFamily:"monospace"}}
+                placeholder="0.00" />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Catalog reorder min</label>
+              <input className="form-input" type="number" min="0" value={form.reorder_threshold}
+                onChange={e => update("reorder_threshold", e.target.value)}
+                style={{fontFamily:"monospace"}}
+                placeholder="0" />
+              <div style={{fontSize:10,color:"#8A95A8",marginTop:3}}>Optional default; per-shop overrides win in Inventory.</div>
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Supplier</label>
+            <input className="form-input" value={form.supplier}
+              onChange={e => update("supplier", e.target.value)}
+              placeholder="e.g. Veseris, Target Specialty" />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Notes</label>
+            <textarea className="form-input" rows={2} value={form.notes}
+              onChange={e => update("notes", e.target.value)}
+              placeholder="EPA registration #, mixing ratio, anything else..." />
+          </div>
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,cursor:"pointer",marginBottom:14}}>
+            <input type="checkbox" checked={form.active}
+              onChange={e => update("active", e.target.checked)} />
+            Active (shows in inventory and order dropdowns)
+          </label>
+          <div style={{display:"flex",gap:8}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+              {saving ? "Saving..." : isEdit ? "Save changes" : "Add product"}
+            </Btn>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -5363,7 +5532,7 @@ function ShopModal({ shop, onClose, onSaved, showToast }) {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
-function Settings({ user, employees, setEmployees, products, setProducts, trucks, setTrucks, shops, reloadShops, showToast }) {
+function Settings({ user, employees, setEmployees, products, setProducts, reloadProducts, trucks, setTrucks, shops, reloadShops, showToast }) {
   const [tab, setTab] = useState("users");
   const [q, setQ] = useState("");
   const [roleFilter, setRoleFilter] = useState("All");
@@ -5569,7 +5738,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, trucks
       )}
 
       {tab === "products" && (
-        <SettingsProductsTable products={products} />
+        <SettingsProductsTable products={products} reloadProducts={reloadProducts} showToast={showToast} />
       )}
 
       {tab === "employees" && (
@@ -6289,6 +6458,13 @@ export default function App() {
     } catch (err) { /* silent */ }
   }
 
+  async function reloadProducts() {
+    try {
+      const p = await sb("products", "?select=*&order=category,name");
+      setProducts(p);
+    } catch (err) { /* silent */ }
+  }
+
   useEffect(() => {
     if (!currentUser) return;
     Promise.all([
@@ -6408,7 +6584,7 @@ export default function App() {
                 </div>
               </div>
             )}
-            {isManager && page === "settings" && dataLoaded && <Settings user={currentUser} employees={employees} setEmployees={setEmployees} products={products} setProducts={setProducts} trucks={trucks} setTrucks={setTrucks} shops={shops} reloadShops={reloadShops} showToast={showToast} />}
+            {isManager && page === "settings" && dataLoaded && <Settings user={currentUser} employees={employees} setEmployees={setEmployees} products={products} setProducts={setProducts} reloadProducts={reloadProducts} trucks={trucks} setTrucks={setTrucks} shops={shops} reloadShops={reloadShops} showToast={showToast} />}
           </div>
           {profile && (
             <ProfileModal
