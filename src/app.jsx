@@ -234,6 +234,13 @@ function formatLocalDate(dateStr, opts = { month: "short", day: "numeric", year:
   return d ? d.toLocaleDateString("en-US", opts) : "—";
 }
 
+// Look up the current driver of a truck by walking the employees array.
+// More reliable than the PostgREST join, which has been flaky for this relation.
+function driverOf(truck, employees) {
+  if (!truck || !employees) return null;
+  return employees.find(e => e.truck_id === truck.id) || null;
+}
+
 // Records a driver change in truck_driver_history. Closes out any open record
 // for that truck (sets unassigned_at = now), then if newEmployeeId provided
 // opens a new one. Failures are logged but don't block the main op since
@@ -1605,7 +1612,7 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
   const filteredTrucks = Object.entries(truckLocations).filter(([_, t]) =>
     matchBranchFilter(t.truck, branchFilter) &&
     (!q || t.truck.truck_number?.toString().toLowerCase().includes(q.toLowerCase()) ||
-      t.truck.assigned_employee?.name?.toLowerCase().includes(q.toLowerCase()))
+      driverOf(t.truck, employees)?.name?.toLowerCase().includes(q.toLowerCase()))
   );
 
   function openMove(action) {
@@ -1684,7 +1691,7 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
                     <Badge color={t.items > 0 ? "green" : "gray"}>{t.items > 0 ? `${t.items} items` : "Empty"}</Badge>
                   </div>
                   <div style={{fontSize:11,color:"#8A95A8"}}>
-                    {t.truck.assigned_employee?.name || "Unassigned"} · {branchLabel(t.truck)}
+                    {driverOf(t.truck, employees)?.name || "Unassigned"} · {branchLabel(t.truck)}
                   </div>
                   {t.items > 0 && (
                     <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
@@ -1771,6 +1778,7 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
           products={products}
           trucks={trucks}
           shops={shops}
+          employees={employees}
           shopLocations={shopLocations}
           truckLocations={truckLocations}
           user={user}
@@ -2623,7 +2631,7 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
 }
 
 // ── Inventory Move Modal ─────────────────────────────────────────────────────
-function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLocations, truckLocations, user, onClose, onSaved, showToast, catFilter, setCatFilter }) {
+function InventoryMoveModal({ modal, inventory, products, trucks, shops, employees, shopLocations, truckLocations, user, onClose, onSaved, showToast, catFilter, setCatFilter }) {
   const action = modal.action;
   const isView = action === "view_shop" || action === "view_truck";
 
@@ -2724,6 +2732,7 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLoc
       products={products}
       trucks={trucks}
       shops={shops}
+      employees={employees}
       inventory={inventory}
       user={user}
       onClose={onClose}
@@ -2734,7 +2743,7 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, shopLoc
 }
 
 // ── Inventory Cart Modal (multi-product entry) ───────────────────────────────
-function InventoryCartModal({ action, products, trucks, shops, inventory, user, onClose, onSaved, showToast }) {
+function InventoryCartModal({ action, products, trucks, shops, employees, inventory, user, onClose, onSaved, showToast }) {
   const [destination, setDestination] = useState({ from: "", to: "" });
   // Cart: [{ key, product_id, quantity }]
   const [cart, setCart] = useState([]);
@@ -2755,7 +2764,7 @@ function InventoryCartModal({ action, products, trucks, shops, inventory, user, 
   }));
   const truckOptions = trucks.map(t => ({
     value: t.id,
-    label: `Truck #${t.truck_number} · ${t.assigned_employee?.name || "Unassigned"}`
+    label: `Truck #${t.truck_number} · ${driverOf(t, employees)?.name || "Unassigned"}`
   }));
 
   const titles = {
@@ -3581,7 +3590,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
     matchBranchFilter(t, branch) &&
     (!q || t.truck_number?.toLowerCase().includes(q.toLowerCase()) ||
       t.plate?.toLowerCase().includes(q.toLowerCase()) ||
-      t.assigned_employee?.name?.toLowerCase().includes(q.toLowerCase()))
+      driverOf(t, employees)?.name?.toLowerCase().includes(q.toLowerCase()))
   );
   const sortAll = useSortableData(list, "truck_number");
 
@@ -3639,7 +3648,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                 <SortableTh sortState={sortAll} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
                 <SortableTh sortState={sortAll} sortKey="branch">Branch</SortableTh>
                 <SortableTh sortState={sortAll} sortKey="department">Dept</SortableTh>
-                <SortableTh sortState={sortAll} sortKey="driver_name" accessor={t => t.assigned_employee?.name || ""}>Driver</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="driver_name" accessor={t => driverOf(t, employees)?.name || ""}>Driver</SortableTh>
                 <SortableTh sortState={sortAll} sortKey="plate">Plate</SortableTh>
                 <SortableTh sortState={sortAll} sortKey="mileage">Mileage</SortableTh>
                 <SortableTh sortState={sortAll} sortKey="next_oil_miles">Next oil</SortableTh>
@@ -3679,7 +3688,53 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                           t.department ? <Badge color={deptColor(t.department)}>{t.department}</Badge> : <span style={{color:"#8A95A8"}}>—</span>
                         )}
                       </td>
-                      <td>{t.assigned_employee?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
+                      <td>
+                        {canEdit ? (
+                          (() => {
+                            const cur = driverOf(t, employees);
+                            return (
+                              <select
+                                value={cur?.id || ""}
+                                onClick={e => e.stopPropagation()}
+                                onChange={async (e) => {
+                                  const newDriverId = e.target.value;
+                                  const newDriver = newDriverId ? employees.find(emp => emp.id === newDriverId) : null;
+                                  try {
+                                    // Unassign whoever currently drives this truck
+                                    if (cur && cur.id !== newDriverId) {
+                                      await sbPatch("employees", cur.id, { truck_id: null });
+                                    }
+                                    // If the new driver currently has another truck, free it
+                                    if (newDriver && newDriver.truck_id && newDriver.truck_id !== t.id) {
+                                      // Just overwrite — they're being reassigned to this truck
+                                    }
+                                    if (newDriverId) {
+                                      await sbPatch("employees", newDriverId, { truck_id: t.id });
+                                      if (!cur || cur.id !== newDriverId) {
+                                        await recordDriverChange(t.id, newDriverId, newDriver?.name, user?.id, "Assigned via Fleet table");
+                                      }
+                                    } else if (cur) {
+                                      await recordDriverChange(t.id, null, null, user?.id, "Cleared via Fleet table");
+                                    }
+                                    reloadTrucks();
+                                    showToast(newDriverId ? `Driver set to ${newDriver?.name}` : "Driver cleared");
+                                  } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+                                }}
+                                style={{background:"#1E2535",border:"1px solid #2A3348",borderRadius:4,padding:"3px 6px",color: cur ? "#E8EDF5" : "#8A95A8",fontSize:11,fontFamily:"DM Sans,sans-serif",cursor:"pointer",maxWidth:160}}>
+                                <option value="">— Unassigned —</option>
+                                {employees
+                                  .filter(e => e.status !== "inactive")
+                                  .sort((a,b) => a.name.localeCompare(b.name))
+                                  .map(e => (
+                                    <option key={e.id} value={e.id}>{e.name}{e.truck_id && e.truck_id !== t.id ? ` (on Truck ${trucks.find(tk => tk.id === e.truck_id)?.truck_number || "?"})` : ""}</option>
+                                  ))}
+                              </select>
+                            );
+                          })()
+                        ) : (
+                          driverOf(t, employees)?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>
+                        )}
+                      </td>
                       <td style={{fontFamily:"monospace",fontSize:11}}>{t.plate || "—"}</td>
                       <td style={{fontFamily:"monospace"}}>{t.mileage ? t.mileage.toLocaleString() : "—"}</td>
                       <td style={{color:oil.color,fontFamily:"monospace",fontSize:12}}>{oil.label}</td>
@@ -3708,7 +3763,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
           <table>
             <thead><tr>
               <SortableTh sortState={sortMaint} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
-              <SortableTh sortState={sortMaint} sortKey="driver" accessor={t => t.assigned_employee?.name || ""}>Driver</SortableTh>
+              <SortableTh sortState={sortMaint} sortKey="driver" accessor={t => driverOf(t, employees)?.name || ""}>Driver</SortableTh>
               <SortableTh sortState={sortMaint} sortKey="branch">Branch</SortableTh>
               <SortableTh sortState={sortMaint} sortKey="mileage">Current mileage</SortableTh>
               <SortableTh sortState={sortMaint} sortKey="next_oil_miles">Next oil due</SortableTh>
@@ -3722,7 +3777,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                 return (
                   <tr key={t.id}>
                     <td><strong>{t.truck_number}</strong></td>
-                    <td>{t.assigned_employee?.name || "—"}</td>
+                    <td>{driverOf(t, employees)?.name || "—"}</td>
                     <td>{t.branch}</td>
                     <td style={{fontFamily:"monospace"}}>{t.mileage?.toLocaleString()}</td>
                     <td style={{fontFamily:"monospace",color:"#EF4444"}}>{t.next_oil_miles?.toLocaleString()}</td>
@@ -3740,7 +3795,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
           <table>
             <thead><tr>
               <SortableTh sortState={sortReg} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
-              <SortableTh sortState={sortReg} sortKey="driver" accessor={t => t.assigned_employee?.name || ""}>Driver</SortableTh>
+              <SortableTh sortState={sortReg} sortKey="driver" accessor={t => driverOf(t, employees)?.name || ""}>Driver</SortableTh>
               <SortableTh sortState={sortReg} sortKey="branch">Branch</SortableTh>
               <SortableTh sortState={sortReg} sortKey="plate">Plate</SortableTh>
               <SortableTh sortState={sortReg} sortKey="reg_expires">Reg expires</SortableTh>
@@ -3760,7 +3815,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                 return (
                   <tr key={t.id}>
                     <td><strong>{t.truck_number}</strong></td>
-                    <td>{t.assigned_employee?.name || "—"}</td>
+                    <td>{driverOf(t, employees)?.name || "—"}</td>
                     <td>{t.branch}</td>
                     <td style={{fontFamily:"monospace",fontSize:11}}>{t.plate || "—"}</td>
                     <td style={{color:expired?"#EF4444":soon?"#F59E0B":"#E8EDF5"}}>{exp ? exp.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"}</td>
@@ -3826,7 +3881,7 @@ function InspectionsPage({ user, trucks, employees, showToast }) {
     if (statusFilter === "fail" && !(latest && latest.fail_count > 0)) return false;
     if (statusFilter === "needs-inspection" && latest) return false;
     if (q) {
-      const hay = `${t.truck_number} ${t.plate} ${t.year} ${t.make} ${t.model} ${t.assigned_employee?.name || ""}`.toLowerCase();
+      const hay = `${t.truck_number} ${t.plate} ${t.year} ${t.make} ${t.model} ${driverOf(t, employees)?.name || ""}`.toLowerCase();
       if (!hay.includes(q.toLowerCase())) return false;
     }
     return true;
@@ -3877,7 +3932,7 @@ function InspectionsPage({ user, trucks, employees, showToast }) {
           <table>
             <thead><tr>
               <SortableTh sortState={sortInsp} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
-              <SortableTh sortState={sortInsp} sortKey="driver" accessor={t => t.assigned_employee?.name || ""}>Driver</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="driver" accessor={t => driverOf(t, employees)?.name || ""}>Driver</SortableTh>
               <SortableTh sortState={sortInsp} sortKey="branch">Branch</SortableTh>
               <SortableTh sortState={sortInsp} sortKey="last_inspected" accessor={t => latestByTruck[t.id]?.inspected_at}>Last inspected</SortableTh>
               <SortableTh sortState={sortInsp} sortKey="inspector" accessor={t => latestByTruck[t.id]?.inspector_name || ""}>Inspector</SortableTh>
@@ -3894,7 +3949,7 @@ function InspectionsPage({ user, trucks, employees, showToast }) {
                 return (
                   <tr key={t.id}>
                     <td><div style={{display:"flex",alignItems:"center",gap:7}}><div style={{width:8,height:8,borderRadius:"50%",background:dot,flexShrink:0}} /><strong>{t.truck_number}</strong> <span style={{color:"#8A95A8",fontSize:11}}>{t.year} {t.make} {t.model}</span></div></td>
-                    <td>{t.assigned_employee?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
+                    <td>{driverOf(t, employees)?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
                     <td>{t.branch}</td>
                     <td style={{fontSize:12}}>{latest ? new Date(latest.inspected_at).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : <span style={{color:"#F59E0B"}}>Never</span>}</td>
                     <td style={{fontSize:12}}>{latest?.inspector_name || "—"}</td>
@@ -4027,7 +4082,7 @@ function InspectionModal({ truck, user, employees, onClose, onSaved, showToast }
           <div>
             <div className="modal-title">Truck Inspection — #{truck.truck_number}</div>
             <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
-              {truck.year} {truck.make} {truck.model} · Plate {truck.plate} · Driver: {truck.assigned_employee?.name || "Unassigned"}
+              {truck.year} {truck.make} {truck.model} · Plate {truck.plate} · Driver: {(driverOf(truck, employees)?.name || "Unassigned")}
             </div>
             <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
               Inspector: <strong style={{color:"#E8EDF5"}}>{user.name}</strong>
@@ -4505,6 +4560,8 @@ function DriverHistorySection({ truckId }) {
 
 function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing, user }) {
   const isEdit = !!editing;
+  // Find current driver by walking employees (more reliable than the trucks join)
+  const currentDriver = editing ? employees.find(e => e.truck_id === editing.id) : null;
   const [form, setForm] = useState(() => editing ? {
     truck_number: editing.truck_number || "",
     year: editing.year || "",
@@ -4514,7 +4571,7 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
     plate: editing.plate || "",
     branch: editing.branch || "DFW",
     department: editing.department || "",
-    driver_id: editing.assigned_employee_id || ""
+    driver_id: currentDriver?.id || ""
   } : {
     truck_number: "",
     year: "", make: "", model: "", vin: "", plate: "",
@@ -4835,7 +4892,7 @@ function TrucksPage({ user, employees, setEmployees, trucks, setTrucks, showToas
       t.truck_number?.toString().toLowerCase().includes(q.toLowerCase()) ||
       t.plate?.toLowerCase().includes(q.toLowerCase()) ||
       t.vin?.toLowerCase().includes(q.toLowerCase()) ||
-      t.assigned_employee?.name?.toLowerCase().includes(q.toLowerCase()))
+      driverOf(t, employees)?.name?.toLowerCase().includes(q.toLowerCase()))
   );
 
   return (
@@ -4869,7 +4926,7 @@ function TrucksPage({ user, employees, setEmployees, trucks, setTrucks, showToas
                 <td style={{fontFamily:"monospace",fontSize:11}}>{t.vin || <span style={{color:"#8A95A8"}}>—</span>}</td>
                 <td style={{fontFamily:"monospace"}}>{t.plate || <span style={{color:"#8A95A8"}}>—</span>}</td>
                 <td>{t.branch}</td>
-                <td>{t.assigned_employee?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
+                <td>{driverOf(t, employees)?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
                 <td>
                   <div style={{display:"flex",gap:6}}>
                     <Btn onClick={() => { setTruckEditing(t); setTruckModalOpen(true); }}>Edit</Btn>
@@ -5786,7 +5843,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, reload
                     <td style={{fontFamily:"monospace",fontSize:11}}>{t.vin || <span style={{color:"#8A95A8"}}>—</span>}</td>
                     <td style={{fontFamily:"monospace"}}>{t.plate || <span style={{color:"#8A95A8"}}>—</span>}</td>
                     <td>{t.branch}</td>
-                    <td>{t.assigned_employee?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
+                    <td>{driverOf(t, employees)?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
                     <td>
                       <div style={{display:"flex",gap:6}}>
                         <Btn onClick={() => { setTruckEditing(t); setTruckModalOpen(true); }}>Edit</Btn>
