@@ -4558,6 +4558,371 @@ function DriverHistorySection({ truckId }) {
   );
 }
 
+// ── Truck documents (per-truck maintenance + reg + insurance records) ───────
+const TRUCK_DOC_CATEGORIES = [
+  { value: "Registration",  icon: "📋", color: "blue"   },
+  { value: "Insurance",     icon: "🛡",  color: "green"  },
+  { value: "Oil Change",    icon: "🛢",  color: "amber"  },
+  { value: "Repair",        icon: "🔧", color: "red"    },
+  { value: "Inspection",    icon: "✓",  color: "purple" },
+  { value: "Title",         icon: "📜", color: "gray"   },
+  { value: "Other",         icon: "📎", color: "gray"   }
+];
+
+function truckDocColor(cat) {
+  const m = TRUCK_DOC_CATEGORIES.find(c => c.value === cat);
+  return m ? m.color : "gray";
+}
+function truckDocIcon(cat) {
+  const m = TRUCK_DOC_CATEGORIES.find(c => c.value === cat);
+  return m ? m.icon : "📎";
+}
+
+function TruckDocuments({ truck, canManage, currentUser, showToast }) {
+  const [docs, setDocs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [categoryFilter, setCategoryFilter] = useState("All");
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await sb("truck_documents",
+        `?truck_id=eq.${truck.id}&select=*&order=uploaded_at.desc`);
+      setDocs(data);
+    } catch (err) { showToast("Error loading documents: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, [truck.id]); // eslint-disable-line
+
+  async function handleDownload(doc) {
+    try {
+      const url = await sbStorageSignedUrl("truck-documents", doc.storage_path, 60);
+      window.open(url, "_blank");
+    } catch (err) { showToast("Download failed: " + (err.message || err), "error"); }
+  }
+
+  async function handleDelete(doc) {
+    if (!window.confirm(`Delete "${doc.title || doc.file_name}"? This cannot be undone.`)) return;
+    try {
+      await sbStorageDelete("truck-documents", doc.storage_path);
+      await sbDelete("truck_documents", doc.id);
+      showToast("Document deleted");
+      load();
+    } catch (err) { showToast("Delete failed: " + (err.message || err), "error"); }
+  }
+
+  // Summary by category
+  const byCategory = {};
+  for (const d of docs) {
+    byCategory[d.category] = (byCategory[d.category] || 0) + 1;
+  }
+  const filtered = categoryFilter === "All" ? docs : docs.filter(d => d.category === categoryFilter);
+
+  // Find soonest-expiring reg + insurance for the at-a-glance line
+  function soonest(category) {
+    const list = docs.filter(d => d.category === category && d.expires_at);
+    if (list.length === 0) return null;
+    return list.sort((a,b) => a.expires_at.localeCompare(b.expires_at)).reverse()[0]; // most recent expiration
+  }
+  const reg = soonest("Registration");
+  const ins = soonest("Insurance");
+  const oilDocs = docs.filter(d => d.category === "Oil Change" && d.service_date).sort((a,b) => b.service_date.localeCompare(a.service_date));
+  const lastOil = oilDocs[0];
+
+  return (
+    <div>
+      {/* At-a-glance bar */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:8,marginBottom:10}}>
+        <DocSummaryTile label="Registration" doc={reg} kind="expires" />
+        <DocSummaryTile label="Insurance" doc={ins} kind="expires" />
+        <DocSummaryTile label="Last oil change" doc={lastOil} kind="serviced" />
+        <DocSummaryTile label="Total records" valueOverride={docs.length} />
+      </div>
+
+      {/* Category filter chips */}
+      <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:10}}>
+        <button onClick={() => setCategoryFilter("All")}
+          style={{padding:"3px 9px",borderRadius:4,fontSize:11,fontWeight:600,cursor:"pointer",
+            border:"1px solid " + (categoryFilter==="All" ? "#22C55E" : "#2A3348"),
+            background: categoryFilter==="All" ? "rgba(34,197,94,0.15)" : "transparent",
+            color: categoryFilter==="All" ? "#22C55E" : "#8A95A8"}}>
+          All ({docs.length})
+        </button>
+        {TRUCK_DOC_CATEGORIES.map(c => byCategory[c.value] > 0 && (
+          <button key={c.value} onClick={() => setCategoryFilter(c.value)}
+            style={{padding:"3px 9px",borderRadius:4,fontSize:11,fontWeight:600,cursor:"pointer",
+              border:"1px solid " + (categoryFilter===c.value ? "#22C55E" : "#2A3348"),
+              background: categoryFilter===c.value ? "rgba(34,197,94,0.15)" : "transparent",
+              color: categoryFilter===c.value ? "#22C55E" : "#8A95A8"}}>
+            {c.icon} {c.value} ({byCategory[c.value]})
+          </button>
+        ))}
+      </div>
+
+      {canManage && (
+        <div style={{marginBottom:10}}>
+          <Btn variant="primary" onClick={() => setUploadOpen(true)} style={{width:"100%"}}>+ Upload document</Btn>
+        </div>
+      )}
+
+      {loading ? (
+        <div style={{padding:"10px 0",fontSize:12,color:"#8A95A8"}}>Loading documents...</div>
+      ) : filtered.length === 0 ? (
+        <div style={{padding:"12px 0",fontSize:13,color:"#8A95A8",fontStyle:"italic"}}>
+          {docs.length === 0
+            ? (canManage ? "No documents yet — upload registration, insurance, receipts, and inspection reports above." : "No documents on file.")
+            : "No documents in this category."}
+        </div>
+      ) : (
+        <div style={{display:"flex",flexDirection:"column",gap:6}}>
+          {filtered.map(doc => (
+            <TruckDocRow key={doc.id} doc={doc} canManage={canManage}
+              onDownload={() => handleDownload(doc)}
+              onDelete={() => handleDelete(doc)} />
+          ))}
+        </div>
+      )}
+
+      {uploadOpen && (
+        <TruckDocumentUploadModal
+          truck={truck}
+          currentUser={currentUser}
+          onClose={() => setUploadOpen(false)}
+          onSaved={() => { setUploadOpen(false); load(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function DocSummaryTile({ label, doc, kind, valueOverride }) {
+  let value = "—";
+  let color = "#8A95A8";
+  if (valueOverride != null) {
+    value = String(valueOverride);
+    color = "#E8EDF5";
+  } else if (doc) {
+    if (kind === "expires" && doc.expires_at) {
+      const d = parseLocalDate(doc.expires_at);
+      const now = new Date();
+      const daysOut = Math.round((d - now) / (1000 * 60 * 60 * 24));
+      value = formatLocalDate(doc.expires_at, { month: "short", day: "numeric", year: "numeric" });
+      if (daysOut < 0) color = "#EF4444";
+      else if (daysOut < 30) color = "#F59E0B";
+      else color = "#22C55E";
+    } else if (kind === "serviced" && doc.service_date) {
+      value = formatLocalDate(doc.service_date, { month: "short", day: "numeric", year: "numeric" });
+      color = "#22C55E";
+    }
+  }
+  return (
+    <div style={{padding:"6px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6}}>
+      <div style={{fontSize:9,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>{label}</div>
+      <div style={{fontSize:12,fontWeight:600,color}}>{value}</div>
+    </div>
+  );
+}
+
+function TruckDocRow({ doc, canManage, onDownload, onDelete }) {
+  const expDate = doc.expires_at ? parseLocalDate(doc.expires_at) : null;
+  const expSoon = expDate && (expDate - new Date()) < 30 * 24 * 60 * 60 * 1000;
+  const expired = expDate && expDate < new Date();
+
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:10,padding:"8px 10px",background:"#1E2535",border:"1px solid " + (expired ? "#EF4444" : expSoon ? "#F59E0B" : "#2A3348"),borderRadius:6,fontSize:12}}>
+      <div style={{fontSize:18,flexShrink:0}}>{truckDocIcon(doc.category)}</div>
+      <div style={{minWidth:0,flex:1}}>
+        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2}}>
+          <Badge color={truckDocColor(doc.category)}>{doc.category}</Badge>
+          <strong style={{color:"#E8EDF5"}}>{doc.title || doc.file_name}</strong>
+          {expired && <Badge color="red" style={{fontSize:9}}>EXPIRED</Badge>}
+          {!expired && expSoon && <Badge color="amber" style={{fontSize:9}}>Expiring soon</Badge>}
+        </div>
+        <div style={{fontSize:10,color:"#8A95A8"}}>
+          {doc.service_date && <span>Serviced {formatLocalDate(doc.service_date)} · </span>}
+          {doc.expires_at && <span>Expires {formatLocalDate(doc.expires_at)} · </span>}
+          {doc.mileage_at != null && <span>{doc.mileage_at.toLocaleString()} mi · </span>}
+          {doc.cost != null && <span>${parseFloat(doc.cost).toFixed(2)} · </span>}
+          {doc.vendor && <span>{doc.vendor} · </span>}
+          {formatFileSize(doc.file_size)}
+        </div>
+        {doc.description && <div style={{fontSize:10,color:"#8A95A8",marginTop:2,fontStyle:"italic"}}>{doc.description}</div>}
+      </div>
+      <div style={{display:"flex",gap:6,flexShrink:0}}>
+        <Btn onClick={onDownload}>Open</Btn>
+        {canManage && <Btn variant="red" onClick={onDelete}>×</Btn>}
+      </div>
+    </div>
+  );
+}
+
+function TruckDocumentUploadModal({ truck, currentUser, onClose, onSaved, showToast }) {
+  const [file, setFile] = useState(null);
+  const [form, setForm] = useState({
+    category: "Registration",
+    title: "",
+    description: "",
+    service_date: "",
+    expires_at: "",
+    mileage_at: "",
+    cost: "",
+    vendor: ""
+  });
+  const [uploading, setUploading] = useState(false);
+
+  function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+
+  function handleFileChange(e) {
+    const f = e.target.files?.[0];
+    if (!f) { setFile(null); return; }
+    if (f.size > 25 * 1024 * 1024) { showToast("File too large (25MB max)", "error"); e.target.value = ""; return; }
+    setFile(f);
+    // If title is empty, prefill with the filename minus extension
+    if (!form.title) {
+      const dot = f.name.lastIndexOf(".");
+      update("title", dot > 0 ? f.name.slice(0, dot) : f.name);
+    }
+  }
+
+  async function save() {
+    if (!file) { showToast("Pick a file to upload", "error"); return; }
+    setUploading(true);
+    try {
+      const safe = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+      const path = `trucks/${truck.id}/${Date.now()}-${safe}`;
+      await sbStorageUpload("truck-documents", path, file);
+      const payload = {
+        truck_id: truck.id,
+        category: form.category,
+        title: form.title.trim() || null,
+        description: form.description.trim() || null,
+        service_date: form.service_date || null,
+        expires_at: form.expires_at || null,
+        mileage_at: form.mileage_at === "" ? null : parseInt(form.mileage_at, 10),
+        cost: form.cost === "" ? null : parseFloat(form.cost),
+        vendor: form.vendor.trim() || null,
+        file_name: file.name,
+        storage_path: path,
+        mime_type: file.type || null,
+        file_size: file.size,
+        uploaded_by: currentUser?.id || null,
+        uploader_name: currentUser?.name || null
+      };
+      await sbPost("truck_documents", payload);
+      showToast("Document uploaded");
+      onSaved();
+    } catch (err) { showToast("Upload failed: " + (err.message || err), "error"); }
+    setUploading(false);
+  }
+
+  // Which metadata fields make sense depends on the category
+  const showExpires    = ["Registration", "Insurance"].includes(form.category);
+  const showServiceDate = ["Oil Change", "Repair", "Inspection"].includes(form.category);
+  const showMileage    = ["Oil Change", "Repair"].includes(form.category);
+  const showCost       = ["Oil Change", "Repair", "Insurance"].includes(form.category);
+  const showVendor     = form.category !== "Title";
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:520}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">+ Upload truck document</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>Truck #{truck.truck_number} · {truck.year} {truck.make} {truck.model}</div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">File *</label>
+            <input type="file" onChange={handleFileChange}
+              style={{width:"100%",padding:"6px 8px",background:"#0F1623",border:"1px solid #2A3348",borderRadius:6,color:"#E8EDF5",fontSize:12}} />
+            {file && <div style={{fontSize:11,color:"#8A95A8",marginTop:4}}>{file.name} · {formatFileSize(file.size)}</div>}
+          </div>
+          <div className="form-group">
+            <label className="form-label">Category *</label>
+            <select className="form-input" value={form.category}
+              onChange={e => update("category", e.target.value)}>
+              {TRUCK_DOC_CATEGORIES.map(c => <option key={c.value} value={c.value}>{c.icon} {c.value}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Title <span style={{color:"#8A95A8"}}>(short label)</span></label>
+            <input className="form-input" value={form.title}
+              onChange={e => update("title", e.target.value)}
+              placeholder="e.g. 2026 Geico Policy, Oct 2025 Oil Change" />
+          </div>
+
+          {(showServiceDate || showExpires) && (
+            <div style={{display:"grid",gridTemplateColumns: showServiceDate && showExpires ? "1fr 1fr" : "1fr",gap:10,marginBottom:10}}>
+              {showServiceDate && (
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Service date</label>
+                  <input className="form-input" type="date" value={form.service_date}
+                    onChange={e => update("service_date", e.target.value)} />
+                </div>
+              )}
+              {showExpires && (
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Expires</label>
+                  <input className="form-input" type="date" value={form.expires_at}
+                    onChange={e => update("expires_at", e.target.value)} />
+                </div>
+              )}
+            </div>
+          )}
+
+          {(showMileage || showCost) && (
+            <div style={{display:"grid",gridTemplateColumns: showMileage && showCost ? "1fr 1fr" : "1fr",gap:10,marginBottom:10}}>
+              {showMileage && (
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Mileage at service</label>
+                  <input className="form-input" type="number" min="0" value={form.mileage_at}
+                    onChange={e => update("mileage_at", e.target.value)}
+                    style={{fontFamily:"monospace"}} placeholder="0" />
+                </div>
+              )}
+              {showCost && (
+                <div className="form-group" style={{marginBottom:0}}>
+                  <label className="form-label">Cost ($)</label>
+                  <input className="form-input" type="number" step="0.01" min="0" value={form.cost}
+                    onChange={e => update("cost", e.target.value)}
+                    style={{fontFamily:"monospace"}} placeholder="0.00" />
+                </div>
+              )}
+            </div>
+          )}
+
+          {showVendor && (
+            <div className="form-group">
+              <label className="form-label">{form.category === "Insurance" ? "Insurance company" : "Vendor / shop"}</label>
+              <input className="form-input" value={form.vendor}
+                onChange={e => update("vendor", e.target.value)}
+                placeholder={form.category === "Insurance" ? "e.g. State Farm, Geico" : "e.g. Jiffy Lube, Auto Hub"} />
+            </div>
+          )}
+
+          <div className="form-group">
+            <label className="form-label">Notes</label>
+            <textarea className="form-input" rows={2} value={form.description}
+              onChange={e => update("description", e.target.value)}
+              placeholder="Any extra details..." />
+          </div>
+
+          <div style={{display:"flex",gap:8,marginTop:6}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={uploading}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={uploading || !file}>
+              {uploading ? "Uploading..." : "Upload"}
+            </Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing, user }) {
   const isEdit = !!editing;
   // Find current driver by walking employees (more reliable than the trucks join)
@@ -4718,6 +5083,12 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
             </select>
           </div>
           {isEdit && <DriverHistorySection truckId={editing.id} />}
+          {isEdit && (
+            <div className="form-group">
+              <label className="form-label">Documents & maintenance records</label>
+              <TruckDocuments truck={editing} canManage={user?.access_level !== "employee"} currentUser={user} showToast={showToast} />
+            </div>
+          )}
           {!isEdit && (
             <div className="form-group">
               <label className="form-label" style={{color:"#8A95A8"}}>Truck number (optional — auto-assigned if blank)</label>
