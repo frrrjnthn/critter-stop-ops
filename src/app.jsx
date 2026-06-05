@@ -4936,11 +4936,16 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
     plate: editing.plate || "",
     branch: editing.branch || "DFW",
     department: editing.department || "",
-    driver_id: currentDriver?.id || ""
+    driver_id: currentDriver?.id || "",
+    has_gps: editing.has_gps ?? false,
+    mileage: editing.mileage != null ? String(editing.mileage) : "",
+    next_oil_miles: editing.next_oil_miles != null ? String(editing.next_oil_miles) : "",
+    reg_expires: editing.reg_expires || ""
   } : {
     truck_number: "",
     year: "", make: "", model: "", vin: "", plate: "",
-    branch: "DFW", department: "", driver_id: ""
+    branch: "DFW", department: "", driver_id: "",
+    has_gps: false, mileage: "", next_oil_miles: "", reg_expires: ""
   });
   const [saving, setSaving] = useState(false);
 
@@ -4959,6 +4964,16 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
         const nums = trucks.map(t => parseInt(t.truck_number, 10)).filter(n => !isNaN(n));
         truckNumber = String(nums.length ? Math.max(...nums) + 1 : 1);
       }
+      // Validate optional numeric fields
+      const mileageNum = form.mileage === "" ? null : parseInt(form.mileage, 10);
+      if (form.mileage !== "" && (isNaN(mileageNum) || mileageNum < 0)) {
+        showToast("Mileage must be a non-negative number", "error"); setSaving(false); return;
+      }
+      const nextOilNum = form.next_oil_miles === "" ? null : parseInt(form.next_oil_miles, 10);
+      if (form.next_oil_miles !== "" && (isNaN(nextOilNum) || nextOilNum < 0)) {
+        showToast("Next oil mileage must be a non-negative number", "error"); setSaving(false); return;
+      }
+
       const payload = {
         truck_number: truckNumber,
         year: parseInt(form.year, 10),
@@ -4967,7 +4982,11 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
         vin: form.vin.trim().toUpperCase(),
         plate: form.plate.trim().toUpperCase(),
         branch: form.branch,
-        department: form.department || null
+        department: form.department || null,
+        has_gps: !!form.has_gps,
+        mileage: mileageNum,
+        next_oil_miles: nextOilNum,
+        reg_expires: form.reg_expires || null
       };
       let savedTruck;
       if (isEdit) {
@@ -5082,6 +5101,41 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
                 ))}
             </select>
           </div>
+
+          <div style={{borderTop:"1px solid #2A3348",paddingTop:12,marginTop:4,marginBottom:10}}>
+            <div style={{fontSize:10,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:8,fontWeight:600}}>Maintenance & Tracking</div>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,cursor:"pointer",marginBottom:12,padding:"8px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6}}>
+              <input type="checkbox" checked={!!form.has_gps}
+                onChange={e => update("has_gps", e.target.checked)} />
+              <span>GPS tracker installed</span>
+              <span style={{marginLeft:"auto",fontSize:11,color:"#8A95A8"}}>
+                {form.has_gps ? "✓ Active" : "No GPS"}
+              </span>
+            </label>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+              <div className="form-group" style={{marginBottom:0}}>
+                <label className="form-label">Current mileage</label>
+                <input className="form-input" type="number" min="0" value={form.mileage}
+                  onChange={e => update("mileage", e.target.value)}
+                  style={{fontFamily:"monospace"}}
+                  placeholder="e.g. 105000" />
+              </div>
+              <div className="form-group" style={{marginBottom:0}}>
+                <label className="form-label">Next oil at (miles)</label>
+                <input className="form-input" type="number" min="0" value={form.next_oil_miles}
+                  onChange={e => update("next_oil_miles", e.target.value)}
+                  style={{fontFamily:"monospace"}}
+                  placeholder="e.g. 110000" />
+              </div>
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Registration expires</label>
+              <input className="form-input" type="date" value={form.reg_expires}
+                onChange={e => update("reg_expires", e.target.value)} />
+              <div style={{fontSize:10,color:"#8A95A8",marginTop:3}}>Quick reference. The Documents section below can hold the actual reg paperwork.</div>
+            </div>
+          </div>
+
           {isEdit && <DriverHistorySection truckId={editing.id} />}
           {isEdit && (
             <div className="form-group">
