@@ -3568,7 +3568,7 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
 
   async function reloadTrucks() {
     try {
-      const t = await sb("trucks", "?select=*,assigned_employee:employees(name)&order=truck_number");
+      const t = await sb("trucks", "?select=*&order=truck_number");
       setTrucks(t);
       const e = await sb("employees", "?select=*&order=name");
       setEmployees(e);
@@ -3856,7 +3856,7 @@ function InspectionsPage({ user, trucks, employees, showToast }) {
   async function load() {
     setLoading(true);
     try {
-      const data = await sb("inspections", "?select=*,truck:trucks(truck_number,branch,year,make,model,plate,vin,assigned_employee:employees(name))&order=inspected_at.desc");
+      const data = await sb("inspections", "?select=*,truck:trucks(truck_number,branch,year,make,model,plate,vin)&order=inspected_at.desc");
       setInspections(data);
     } catch (err) { showToast("Error loading inspections: " + (err.message || err), "error"); }
     setLoading(false);
@@ -4868,7 +4868,7 @@ function TrucksPage({ user, employees, setEmployees, trucks, setTrucks, showToas
 
   async function reloadTrucks() {
     try {
-      const t = await sb("trucks", "?select=*,assigned_employee:employees(name)&order=truck_number");
+      const t = await sb("trucks", "?select=*&order=truck_number");
       setTrucks(t);
       const e = await sb("employees", "?select=*&order=name");
       setEmployees(e);
@@ -5641,7 +5641,7 @@ function Settings({ user, employees, setEmployees, products, setProducts, reload
 
   async function reloadTrucks() {
     try {
-      const t = await sb("trucks", "?select=*,assigned_employee:employees(name)&order=truck_number");
+      const t = await sb("trucks", "?select=*&order=truck_number");
       setTrucks(t);
       // Also refresh employees so truck_id changes show up
       const e = await sb("employees", "?select=*&order=name");
@@ -6526,7 +6526,7 @@ export default function App() {
     if (!currentUser) return;
     Promise.all([
       sb("employees", "?select=*&order=name").catch(() => []),
-      sb("trucks", "?select=*,assigned_employee:employees(name)&order=truck_number").catch(() => []),
+      sb("trucks", "?select=*&order=truck_number").catch(() => []),
       sb("products", "?select=*&order=category,name").catch(() => []),
       sb("credit_cards", "?select=*&order=assigned_to").catch(() => []),
       sb("inventory", "?select=*").catch(() => []),
