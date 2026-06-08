@@ -300,6 +300,18 @@ function matchBranchFilter(row, filter) {
   return branchKey(row) === filter;
 }
 
+// Permissive variant for dropdown filtering. If the filter is a plain branch
+// like "DFW", also matches employees with combined keys like "DFW|Pest".
+// If the filter is a combined key like "DFW|Pest", only matches that exact combo.
+function matchBranchOrParent(row, filter) {
+  if (!filter || filter === "All") return true;
+  const key = branchKey(row);
+  if (key === filter) return true;
+  // If filter is a plain branch (no "|"), allow any row whose branch matches
+  if (!filter.includes("|") && row.branch === filter) return true;
+  return false;
+}
+
 function Badge({ color = "gray", children }) {
   return <span className={"badge " + color}>{children}</span>;
 }
@@ -807,10 +819,12 @@ function CalloutModal({ form, setForm, isManager, user, employees, branch, onClo
             <select className="form-input" value={form.employee_id}
               onChange={e => setForm(f => ({...f, employee_id: e.target.value}))}>
               <option value="">Select employee...</option>
-              {(isManager ? employees.filter(e => branch === "All" || e.branch === branch) : [user])
+              {(isManager
+                  ? employees.filter(e => e.status !== "inactive" && matchBranchOrParent(e, branch))
+                  : employees.filter(e => e.id === user.id))
                 .sort((a,b) => a.name.localeCompare(b.name))
                 .map(e => (
-                  <option key={e.id} value={e.id}>{e.name} ({e.branch})</option>
+                  <option key={e.id} value={e.id}>{e.name} ({branchLabel(e)})</option>
                 ))}
             </select>
           </div>
@@ -1064,9 +1078,13 @@ function TimeOff({ user, employees, showToast }) {
                 <label className="form-label">Employee</label>
                 <select className="form-input" value={form.employee_id} onChange={e => setForm(f => ({...f, employee_id: e.target.value}))}>
                   <option value="">Select employee...</option>
-                  {(isManager ? employees.filter(e => branch === "All" || e.branch === branch) : [user]).map(e => (
-                    <option key={e.id} value={e.id}>{e.name}</option>
-                  ))}
+                  {(isManager
+                      ? employees.filter(e => e.status !== "inactive" && matchBranchOrParent(e, branch))
+                      : employees.filter(e => e.id === user.id))
+                    .sort((a,b) => a.name.localeCompare(b.name))
+                    .map(e => (
+                      <option key={e.id} value={e.id}>{e.name} ({branchLabel(e)})</option>
+                    ))}
                 </select>
               </div>
               <div className="form-row">
@@ -1481,7 +1499,7 @@ function ShiftModal({ shift, user, employees, branch, onClose, onSaved, showToas
               <option value="">Select employee...</option>
               {employees
                 .filter(e => e.status !== "inactive")
-                .filter(e => matchBranchFilter(e, branch))
+                .filter(e => matchBranchOrParent(e, branch))
                 .sort((a,b) => a.name.localeCompare(b.name))
                 .map(e => <option key={e.id} value={e.id}>{e.name} ({branchLabel(e)})</option>)}
             </select>
@@ -1616,7 +1634,9 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
   );
 
   function openMove(action) {
-    if (!isManager && action !== "usage") {
+    // Managers can do anything. Employees can do truck-related actions for their own work.
+    const employeeAllowed = ["usage","load_truck","return","distributor_purchase"];
+    if (!isManager && !employeeAllowed.includes(action)) {
       showToast("Only managers and leads can perform this action", "error");
       return;
     }
@@ -1709,21 +1729,31 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
       {tab === "log" && (
         <div>
           <div className="alert blue" style={{marginBottom:14}}>
-            ✏ Quick inventory moves. {isManager ? "Choose an action below." : "Only the 'Log usage' action is available to employees."}
+            ✏ Quick inventory moves. {isManager ? "Choose an action below." : "You can load your truck from a shop, return stock, log usage on a job, and record direct distributor purchases."}
           </div>
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:10}}>
+            <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("load_truck")}>
+              <div style={{fontSize:22,marginBottom:6}}>🚛</div>
+              <div style={{fontSize:13,fontWeight:600}}>Load truck</div>
+              <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Move stock from shop to a truck</div>
+            </div>
+            <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("return")}>
+              <div style={{fontSize:22,marginBottom:6}}>↩</div>
+              <div style={{fontSize:13,fontWeight:600}}>Return to shop</div>
+              <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Pull stock off a truck back to shop</div>
+            </div>
+            <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("usage")}>
+              <div style={{fontSize:22,marginBottom:6}}>📊</div>
+              <div style={{fontSize:13,fontWeight:600}}>Log usage</div>
+              <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Record product used on a job</div>
+            </div>
+            <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("distributor_purchase")}>
+              <div style={{fontSize:22,marginBottom:6}}>🏬</div>
+              <div style={{fontSize:13,fontWeight:600}}>Distributor purchase</div>
+              <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Tech bought direct from distributor → adds to their truck</div>
+            </div>
             {isManager && (
               <>
-                <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("load_truck")}>
-                  <div style={{fontSize:22,marginBottom:6}}>🚛</div>
-                  <div style={{fontSize:13,fontWeight:600}}>Load truck</div>
-                  <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Move stock from shop to a truck</div>
-                </div>
-                <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("return")}>
-                  <div style={{fontSize:22,marginBottom:6}}>↩</div>
-                  <div style={{fontSize:13,fontWeight:600}}>Return to shop</div>
-                  <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Pull stock off a truck back to shop</div>
-                </div>
                 <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("add_stock")}>
                   <div style={{fontSize:22,marginBottom:6}}>📥</div>
                   <div style={{fontSize:13,fontWeight:600}}>Add shop stock</div>
@@ -1734,18 +1764,8 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
                   <div style={{fontSize:13,fontWeight:600}}>Adjust / write-off</div>
                   <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Correct quantities or write off damaged stock</div>
                 </div>
-                <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("distributor_purchase")}>
-                  <div style={{fontSize:22,marginBottom:6}}>🏬</div>
-                  <div style={{fontSize:13,fontWeight:600}}>Distributor purchase</div>
-                  <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Tech bought direct from distributor → adds to their truck</div>
-                </div>
               </>
             )}
-            <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("usage")}>
-              <div style={{fontSize:22,marginBottom:6}}>📊</div>
-              <div style={{fontSize:13,fontWeight:600}}>Log usage</div>
-              <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Record product used on a job</div>
-            </div>
           </div>
         </div>
       )}
