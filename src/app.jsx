@@ -11,8 +11,8 @@ const headers = {
   "Prefer": "return=representation"
 };
 
-async function sb(table, params = "") {
-  const res = await fetch(SUPABASE_URL + "/rest/v1/" + table + params, { headers });
+async function sb(table, params = "", opts = {}) {
+  const res = await fetch(SUPABASE_URL + "/rest/v1/" + table + params, { headers, ...opts });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -406,22 +406,60 @@ function Toast({ msg, type, onDone }) {
 function Login({ onLogin }) {
   const [employees, setEmployees] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [selected, setSelected] = useState(null);
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
   const [shake, setShake] = useState(false);
-  const [search, setSearch] = useState("");
+  const [branchPick, setBranchPick] = useState("");
+  const [employeePick, setEmployeePick] = useState("");
 
-  useEffect(() => {
-    sb("employees", "?select=id,name,pin_hash,branch,access_level,status&status=neq.inactive&order=name")
-      .then(data => { setEmployees(data); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, []);
+  async function fetchEmployees() {
+    setLoading(true);
+    setLoadError("");
+    try {
+      // 10 second client-side timeout so we don't hang forever
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      const data = await sb("employees",
+        "?select=id,name,pin_hash,branch,access_level,status&status=neq.inactive&order=name",
+        { signal: controller.signal }
+      );
+      clearTimeout(timer);
+      setEmployees(data || []);
+    } catch (err) {
+      const msg = (err?.name === "AbortError")
+        ? "Connection timed out. Check your internet and tap Retry."
+        : ("Couldn't load employees: " + (err?.message || err));
+      setLoadError(msg);
+    }
+    setLoading(false);
+  }
 
-  const filtered = employees.filter(e =>
-    !search || e.name.toLowerCase().includes(search.toLowerCase())
-  );
+  useEffect(() => { fetchEmployees(); }, []);
 
+  // Group employees by their primary branch (DFW/OKC/ATX/CStat/Office — no dept split)
+  const byBranch = {};
+  for (const e of employees) {
+    const b = e.branch || "Other";
+    if (!byBranch[b]) byBranch[b] = [];
+    byBranch[b].push(e);
+  }
+  // Ordered branch list — keep BASE_BRANCHES order, then any extras
+  const branchList = [...BASE_BRANCHES.filter(b => byBranch[b]?.length > 0),
+                      ...Object.keys(byBranch).filter(b => !BASE_BRANCHES.includes(b)).sort()];
+
+  const peopleForBranch = branchPick ? (byBranch[branchPick] || []).slice().sort((a,b) => a.name.localeCompare(b.name)) : [];
+
+  function handleBranchChange(b) {
+    setBranchPick(b);
+    setEmployeePick(""); // reset person when branch changes
+  }
+  function handlePersonChange(id) {
+    setEmployeePick(id);
+    const u = employees.find(x => x.id === id);
+    if (u) selectUser(u);
+  }
   function selectUser(e) { setSelected(e); setPin(""); setError(""); }
 
   function pressKey(d) {
@@ -454,32 +492,44 @@ function Login({ onLogin }) {
         {!selected ? (
           <>
             <div className="login-label">Who are you?</div>
-            <div style={{marginBottom:10}}>
-              <input className="form-input" placeholder="Search name..." value={search}
-                onChange={e => setSearch(e.target.value)} style={{marginBottom:8}} autoFocus />
-              {loading ? (
-                <div style={{fontSize:12,color:"#8A95A8",padding:"8px 2px"}}>Loading employees...</div>
-              ) : (
-                <select
-                  className="form-input"
-                  value=""
-                  onChange={e => {
-                    const u = employees.find(x => x.id === e.target.value);
-                    if (u) selectUser(u);
-                  }}
-                  style={{cursor:"pointer"}}
-                  size={Math.min(Math.max(filtered.length, 1), 10)}
-                >
-                  {filtered.length === 0 ? (
-                    <option value="" disabled>No matches</option>
-                  ) : filtered.map(u => (
-                    <option key={u.id} value={u.id} style={{padding:"6px 10px"}}>
-                      {u.name} {u.access_level !== "employee" ? "· " + accessLabel(u.access_level) : "· " + u.branch}
-                    </option>
-                  ))}
-                </select>
-              )}
-            </div>
+            {loading ? (
+              <div style={{fontSize:13,color:"#8A95A8",padding:"14px 4px"}}>Loading...</div>
+            ) : loadError ? (
+              <div style={{padding:"12px 4px"}}>
+                <div style={{fontSize:12,color:"#EF4444",marginBottom:10}}>⚠ {loadError}</div>
+                <Btn variant="primary" onClick={fetchEmployees} style={{width:"100%"}}>Retry</Btn>
+              </div>
+            ) : employees.length === 0 ? (
+              <div style={{fontSize:12,color:"#EF4444",padding:"12px 4px"}}>No active employees found. Contact your administrator.</div>
+            ) : (
+              <>
+                <div className="form-group" style={{marginBottom:10}}>
+                  <label className="form-label" style={{fontSize:10}}>Branch</label>
+                  <select className="form-input" value={branchPick}
+                    onChange={e => handleBranchChange(e.target.value)}
+                    autoFocus>
+                    <option value="">— Select your branch —</option>
+                    {branchList.map(b => (
+                      <option key={b} value={b}>{b} ({byBranch[b].length})</option>
+                    ))}
+                  </select>
+                </div>
+                {branchPick && (
+                  <div className="form-group" style={{marginBottom:0}}>
+                    <label className="form-label" style={{fontSize:10}}>Name</label>
+                    <select className="form-input" value={employeePick}
+                      onChange={e => handlePersonChange(e.target.value)}>
+                      <option value="">— Select your name —</option>
+                      {peopleForBranch.map(u => (
+                        <option key={u.id} value={u.id}>
+                          {u.name}{u.access_level !== "employee" ? " · " + accessLabel(u.access_level) : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </>
+            )}
           </>
         ) : (
           <div className="pin-section">
