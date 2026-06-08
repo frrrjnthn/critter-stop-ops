@@ -456,20 +456,30 @@ function Login({ onLogin }) {
             <div className="login-label">Who are you?</div>
             <div style={{marginBottom:10}}>
               <input className="form-input" placeholder="Search name..." value={search}
-                onChange={e => setSearch(e.target.value)} style={{marginBottom:0}} />
+                onChange={e => setSearch(e.target.value)} style={{marginBottom:8}} autoFocus />
+              {loading ? (
+                <div style={{fontSize:12,color:"#8A95A8",padding:"8px 2px"}}>Loading employees...</div>
+              ) : (
+                <select
+                  className="form-input"
+                  value=""
+                  onChange={e => {
+                    const u = employees.find(x => x.id === e.target.value);
+                    if (u) selectUser(u);
+                  }}
+                  style={{cursor:"pointer"}}
+                  size={Math.min(Math.max(filtered.length, 1), 10)}
+                >
+                  {filtered.length === 0 ? (
+                    <option value="" disabled>No matches</option>
+                  ) : filtered.map(u => (
+                    <option key={u.id} value={u.id} style={{padding:"6px 10px"}}>
+                      {u.name} {u.access_level !== "employee" ? "· " + accessLabel(u.access_level) : "· " + u.branch}
+                    </option>
+                  ))}
+                </select>
+              )}
             </div>
-            {loading ? <div className="loading">Loading employees...</div> : (
-              <div className="user-grid">
-                {filtered.map(u => (
-                  <div key={u.id} className={"user-btn"+(selected?.id===u.id?" sel":"")} onClick={() => selectUser(u)}>
-                    <div className="user-btn-name">{u.name}</div>
-                    <div className={"user-btn-role"+(u.access_level!=="employee"?" mgr":"")}>
-                      {u.access_level !== "employee" ? "⚙ " + accessLabel(u.access_level) : u.branch}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
           </>
         ) : (
           <div className="pin-section">
