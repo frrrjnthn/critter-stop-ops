@@ -868,13 +868,13 @@ function HR({ user, employees, setEmployees, onProfile, showToast }) {
 }
 
 // ── Callout Modal ─────────────────────────────────────────────────────────────
-function CalloutModal({ form, setForm, isManager, user, employees, branch, onClose, onSubmit }) {
+function CalloutModal({ form, setForm, isManager, user, employees, branch, isEdit, onClose, onSubmit }) {
   return (
     <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
       <div className="modal modal-sm">
         <div className="modal-top">
           <div>
-            <div className="modal-title">Log a call-out</div>
+            <div className="modal-title">{isEdit ? "Edit call-out" : "Log a call-out"}</div>
             <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
               For payroll tracking. This is logged by a manager, not the employee.
             </div>
@@ -940,7 +940,7 @@ function CalloutModal({ form, setForm, isManager, user, employees, branch, onClo
           </div>
           <div style={{display:"flex",gap:8}}>
             <Btn style={{flex:1}} onClick={onClose}>Cancel</Btn>
-            <Btn variant="primary" style={{flex:1}} onClick={onSubmit}>Save call-out</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={onSubmit}>{isEdit ? "Save changes" : "Save call-out"}</Btn>
           </div>
         </div>
       </div>
@@ -955,9 +955,39 @@ function TimeOff({ user, employees, showToast }) {
   const [tab, setTab] = useState("requests");
   const [branch, setBranch] = useState(user.branch === "All" ? "All" : user.branch);
   const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState({ employee_id:"", type:"pto_request", start_date:"", end_date:"", reason:"", notes:"", callout_type:"sick", paid:false, coverage_found:false, called_in_on_time:true });
 
   const isManager = ["super_admin","manager","lead"].includes(user.access_level);
+
+  function startEditCallout(r) {
+    setEditingId(r.id);
+    setForm({
+      employee_id: r.employee_id || "",
+      type: "callout",
+      start_date: r.start_date || "",
+      end_date: r.end_date || "",
+      reason: r.reason || "",
+      notes: r.notes || "",
+      callout_type: r.callout_type || "sick",
+      paid: !!r.paid,
+      coverage_found: !!r.coverage_found,
+      called_in_on_time: r.called_in_on_time !== false  // default true if undefined
+    });
+    setShowForm(true);
+  }
+
+  async function deleteCallout(r) {
+    if (!window.confirm(`Delete this callout for ${r.employee?.name || "this employee"} on ${formatLocalDate(r.start_date)}? This cannot be undone.`)) return;
+    try {
+      await sbDelete("time_off", r.id);
+      showToast("Callout deleted");
+      await refreshRequests();
+    } catch (err) {
+      console.error("[time_off] delete failed:", err);
+      showToast("Delete failed: " + (err.message || err), "error");
+    }
+  }
 
   useEffect(() => {
     refreshRequests().finally(() => setLoading(false));
@@ -994,15 +1024,21 @@ function TimeOff({ user, employees, showToast }) {
         payload.called_in_on_time = !!form.called_in_on_time;
         payload.status = "logged"; // callouts don't need approval
       }
-      console.log("[time_off] inserting:", payload);
-      const saved = await sbPost("time_off", payload);
+      console.log("[time_off]", editingId ? "updating" : "inserting", payload);
+      let saved;
+      if (editingId) saved = await sbPatch("time_off", editingId, payload);
+      else           saved = await sbPost("time_off", payload);
       console.log("[time_off] saved successfully:", saved);
       // Refetch from DB so the new row shows up with its joined employee relation.
       // This is more reliable than trying to patch state with the POST response.
       await refreshRequests();
       setShowForm(false);
+      const wasEditing = !!editingId;
+      const wasCallout = form.type === "callout";
+      setEditingId(null);
       setForm({ employee_id:"", type:"pto_request", start_date:"", end_date:"", reason:"", notes:"", callout_type:"sick", paid:false, coverage_found:false, called_in_on_time:true });
-      showToast(form.type === "callout" ? "Call-out logged" : "Request submitted");
+      showToast(wasEditing ? (wasCallout ? "Callout updated" : "Request updated")
+                           : (wasCallout ? "Call-out logged" : "Request submitted"));
     } catch (err) {
       console.error("[time_off] save failed:", err);
       showToast("Save failed: " + (err.message || err), "error");
@@ -1144,16 +1180,17 @@ function TimeOff({ user, employees, showToast }) {
           user={user}
           employees={employees}
           branch={branch}
-          onClose={() => setShowForm(false)}
+          isEdit={!!editingId}
+          onClose={() => { setShowForm(false); setEditingId(null); }}
           onSubmit={submitRequest}
         />
       )}
       {showForm && form.type !== "callout" && (
-        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowForm(false)}>
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && (setShowForm(false), setEditingId(null))}>
           <div className="modal modal-sm">
             <div className="modal-top">
               <div className="modal-title">Request time off</div>
-              <div className="modal-close" onClick={() => setShowForm(false)}>✕</div>
+              <div className="modal-close" onClick={() => { setShowForm(false); setEditingId(null); }}>✕</div>
             </div>
             <div className="modal-body">
               <div className="form-group">
@@ -1184,7 +1221,7 @@ function TimeOff({ user, employees, showToast }) {
                 <input type="text" className="form-input" placeholder="Vacation, medical, personal..." value={form.reason} onChange={e => setForm(f => ({...f, reason: e.target.value}))} />
               </div>
               <div style={{display:"flex",gap:8}}>
-                <Btn style={{flex:1}} onClick={() => setShowForm(false)}>Cancel</Btn>
+                <Btn style={{flex:1}} onClick={() => { setShowForm(false); setEditingId(null); }}>Cancel</Btn>
                 <Btn variant="primary" style={{flex:1}} onClick={submitRequest}>Submit</Btn>
               </div>
             </div>
@@ -1196,28 +1233,39 @@ function TimeOff({ user, employees, showToast }) {
         <div className="table-wrap">
           <div className="table-head">
             <span className="table-title">Callout log ({callouts.length})</span>
-            <Btn variant="primary" onClick={() => { setForm(f => ({...f, type:"callout"})); setShowForm(true); }}>+ Log callout</Btn>
+            <Btn variant="primary" onClick={() => { setForm({ employee_id:"", type:"callout", start_date:"", end_date:"", reason:"", notes:"", callout_type:"sick", paid:false, coverage_found:false, called_in_on_time:true }); setEditingId(null); setShowForm(true); }}>+ Log callout</Btn>
           </div>
           <table>
             <thead><tr>
               <SortableTh sortState={sortCallout} sortKey="employee_name" accessor={r => r.employee?.name || ""}>Employee</SortableTh>
               <SortableTh sortState={sortCallout} sortKey="branch" accessor={r => r.employee?.branch || ""}>Branch</SortableTh>
               <SortableTh sortState={sortCallout} sortKey="start_date">Date</SortableTh>
+              <SortableTh sortState={sortCallout} sortKey="callout_type">Type</SortableTh>
+              <SortableTh sortState={sortCallout} sortKey="paid">Paid?</SortableTh>
+              <SortableTh sortState={sortCallout} sortKey="coverage_found">Coverage</SortableTh>
               <SortableTh sortState={sortCallout} sortKey="reason">Reason</SortableTh>
-              <SortableTh sortState={sortCallout} sortKey="notice_given">Notice</SortableTh>
-              <SortableTh sortState={sortCallout} sortKey="status">Status</SortableTh>
+              {isManager && <th>Actions</th>}
             </tr></thead>
             <tbody>
               {sortCallout.rows.length === 0 ? (
-                <tr><td colSpan={6}><div className="empty-state">No callouts logged yet</div></td></tr>
+                <tr><td colSpan={isManager ? 8 : 7}><div className="empty-state">No callouts logged yet</div></td></tr>
               ) : sortCallout.rows.map(r => (
                 <tr key={r.id}>
-                  <td><strong>{r.employee?.name}</strong></td>
+                  <td><strong>{r.employee?.name || "Unknown"}</strong></td>
                   <td>{r.employee?.branch}</td>
-                  <td style={{fontSize:12,color:"#8A95A8"}}>{r.start_date}</td>
-                  <td>{r.reason || "—"}</td>
-                  <td><Badge color={r.notice_given==="no_notice"?"red":r.notice_given==="same_day"?"amber":"green"}>{r.notice_given?.replace("_"," ") || "—"}</Badge></td>
-                  <td><Badge color={r.status==="approved"?"green":r.status==="denied"?"red":"amber"}>{r.status}</Badge></td>
+                  <td style={{fontSize:12,color:"#8A95A8"}}>{formatLocalDate(r.start_date)}</td>
+                  <td><Badge color={r.callout_type==="sick"?"blue":r.callout_type==="no_show"?"red":r.callout_type==="late"?"amber":"gray"}>{r.callout_type || "—"}</Badge></td>
+                  <td>{r.paid ? <Badge color="green">Paid</Badge> : <Badge color="gray">Unpaid</Badge>}</td>
+                  <td>{r.coverage_found ? <Badge color="green">Yes</Badge> : <Badge color="amber">No</Badge>}</td>
+                  <td style={{fontSize:12,color:"#8A95A8",maxWidth:260}}>{r.reason || "—"}</td>
+                  {isManager && (
+                    <td>
+                      <div style={{display:"flex",gap:6}}>
+                        <Btn onClick={() => startEditCallout(r)}>Edit</Btn>
+                        <Btn variant="red" onClick={() => deleteCallout(r)}>Delete</Btn>
+                      </div>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
