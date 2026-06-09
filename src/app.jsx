@@ -396,10 +396,18 @@ function SortableTh({ sortState, sortKey, accessor, children, style }) {
 // ── Toast ─────────────────────────────────────────────────────────────────────
 function Toast({ msg, type, onDone }) {
   useEffect(() => {
-    const t = setTimeout(onDone, 2500);
+    // Errors stick around longer so users can actually read them
+    const t = setTimeout(onDone, type === "error" ? 8000 : 2500);
     return () => clearTimeout(t);
   }, []);
-  return <div className={"toast" + (type === "error" ? " error" : "")}>{msg}</div>;
+  return (
+    <div className={"toast" + (type === "error" ? " error" : "")}
+      onClick={onDone}
+      style={{cursor:"pointer"}}
+      title="Click to dismiss">
+      {msg}
+    </div>
+  );
 }
 
 // ── Login ─────────────────────────────────────────────────────────────────────
@@ -961,30 +969,35 @@ function TimeOff({ user, employees, showToast }) {
     if (!form.employee_id || !form.start_date) { showToast("Please fill required fields", "error"); return; }
     try {
       // For callouts: end_date defaults to start_date if blank (single-day callout)
+      // Convert blank strings to null so optional fields don't trip NOT NULL constraints
       const payload = {
         employee_id: form.employee_id,
         type: form.type,
         start_date: form.start_date,
         end_date: form.end_date || form.start_date,
-        reason: form.reason,
-        notes: form.notes,
+        reason: (form.reason || "").trim() || null,
+        notes: (form.notes || "").trim() || null,
         status: "pending"
       };
       // Attach callout-specific fields if it's a callout
       if (form.type === "callout") {
         payload.callout_type = form.callout_type;
-        payload.paid = form.paid;
-        payload.coverage_found = form.coverage_found;
-        payload.called_in_on_time = form.called_in_on_time;
+        payload.paid = !!form.paid;
+        payload.coverage_found = !!form.coverage_found;
+        payload.called_in_on_time = !!form.called_in_on_time;
         payload.status = "logged"; // callouts don't need approval
       }
+      console.log("[time_off] inserting:", payload);
       const newReq = await sbPost("time_off", payload);
       const emp = employees.find(e => e.id === form.employee_id);
       setRequests(prev => [{ ...newReq[0], employee: emp }, ...prev]);
       setShowForm(false);
       setForm({ employee_id:"", type:"pto_request", start_date:"", end_date:"", reason:"", notes:"", callout_type:"sick", paid:false, coverage_found:false, called_in_on_time:true });
       showToast(form.type === "callout" ? "Call-out logged" : "Request submitted");
-    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    } catch (err) {
+      console.error("[time_off] save failed:", err);
+      showToast("Save failed: " + (err.message || err), "error");
+    }
   }
 
   async function updateStatus(id, status) {
@@ -1527,15 +1540,19 @@ function ShiftModal({ shift, user, employees, branch, onClose, onSaved, showToas
         start_time: form.start_time || null,
         end_time: form.end_time || null,
         hours: parseFloat(form.hours),
-        notes: form.notes.trim() || null,
+        notes: (form.notes || "").trim() || null,
         logged_by: user.id,
         logger_name: user.name
       };
+      console.log("[shifts] inserting:", payload);
       if (isEdit) await sbPatch("shifts", shift.id, payload);
       else await sbPost("shifts", payload);
       showToast(isEdit ? "Shift updated" : "Shift logged");
       onSaved();
-    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    } catch (err) {
+      console.error("[shifts] save failed:", err);
+      showToast("Save failed: " + (err.message || err), "error");
+    }
     setSaving(false);
   }
 
