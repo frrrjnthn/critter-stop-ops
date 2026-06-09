@@ -1061,6 +1061,19 @@ function TimeOff({ user, employees, showToast }) {
     return updateStatus(r.id, "cancelled");
   }
 
+  async function deleteRequest(r) {
+    const label = r.type === "callout" ? "callout" : "time off request";
+    if (!window.confirm(`Permanently delete this ${label} for ${r.employee?.name || "this employee"}${r.start_date ? " on " + formatLocalDate(r.start_date) : ""}? This cannot be undone.`)) return;
+    try {
+      await sbDelete("time_off", r.id);
+      showToast("Deleted");
+      await refreshRequests();
+    } catch (err) {
+      console.error("[time_off] delete failed:", err);
+      showToast("Delete failed: " + (err.message || err), "error");
+    }
+  }
+
   const filtered = requests.filter(r => {
     if (!matchBranchOrParent(r.employee, branch)) return false;
     if (!isManager && r.employee_id !== user.id) return false;
@@ -1122,6 +1135,7 @@ function TimeOff({ user, employees, showToast }) {
                                 <Btn variant="primary" style={{padding:"3px 9px",fontSize:11}} onClick={() => updateStatus(r.id,"approved")}>✓ Approve</Btn>
                                 <Btn variant="red" style={{padding:"3px 9px",fontSize:11}} onClick={() => updateStatus(r.id,"denied")}>✕ Deny</Btn>
                                 {canCancel && <Btn style={{padding:"3px 9px",fontSize:11}} onClick={() => cancelRequest(r)}>Cancel</Btn>}
+                                <Btn variant="red" style={{padding:"3px 9px",fontSize:11}} onClick={() => deleteRequest(r)}>Delete</Btn>
                               </div>
                             </td>
                           )}
@@ -1159,7 +1173,10 @@ function TimeOff({ user, employees, showToast }) {
                         <td><Badge color={r.status==="approved"?"green":r.status==="denied"?"red":r.status==="cancelled"?"gray":"amber"}>{r.status}</Badge></td>
                         <td><Badge color={r.type==="callout"?"red":"blue"}>{r.type==="callout"?"Callout":"Time Off"}</Badge></td>
                         <td>
-                          {canCancel && <Btn style={{padding:"3px 9px",fontSize:11}} onClick={() => cancelRequest(r)}>Cancel</Btn>}
+                          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                            {canCancel && <Btn style={{padding:"3px 9px",fontSize:11}} onClick={() => cancelRequest(r)}>Cancel</Btn>}
+                            {isManager && <Btn variant="red" style={{padding:"3px 9px",fontSize:11}} onClick={() => deleteRequest(r)}>Delete</Btn>}
+                          </div>
                         </td>
                       </tr>
                       );
