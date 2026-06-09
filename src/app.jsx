@@ -965,7 +965,7 @@ function TimeOff({ user, employees, showToast }) {
 
   async function refreshRequests() {
     try {
-      const data = await sb("time_off", "?select=*,employee:employees(name,branch,department)&order=created_at.desc");
+      const data = await sb("time_off", "?select=*,employee:employees!time_off_employee_id_fkey(name,branch,department)&order=created_at.desc");
       setRequests(data || []);
     } catch (err) {
       console.error("[time_off] refresh failed:", err);
@@ -1313,7 +1313,7 @@ function OvertimeTab({ user, employees, branch, showToast }) {
     setLoading(true);
     try {
       const data = await sb("shifts",
-        `?select=*,employee:employees(name,branch,department)&shift_date=gte.${periodStart}&shift_date=lte.${periodEnd}&order=shift_date.desc`);
+        `?select=*,employee:employees!shifts_employee_id_fkey(name,branch,department)&shift_date=gte.${periodStart}&shift_date=lte.${periodEnd}&order=shift_date.desc`);
       setShifts(data);
     } catch (err) { showToast("Error loading shifts: " + (err.message || err), "error"); }
     setLoading(false);
@@ -4620,7 +4620,7 @@ function DriverHistorySection({ truckId }) {
   useEffect(() => {
     let cancelled = false;
     sb("truck_driver_history",
-      `?truck_id=eq.${truckId}&select=*,employee:employees(name)&order=assigned_at.desc`
+      `?truck_id=eq.${truckId}&select=*,employee:employees!truck_driver_history_employee_id_fkey(name)&order=assigned_at.desc`
     ).then(data => {
       if (!cancelled) { setHistory(data); setLoading(false); }
     }).catch(() => { if (!cancelled) setLoading(false); });
