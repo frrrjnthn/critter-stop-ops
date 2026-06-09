@@ -960,10 +960,17 @@ function TimeOff({ user, employees, showToast }) {
   const isManager = ["super_admin","manager","lead"].includes(user.access_level);
 
   useEffect(() => {
-    sb("time_off", "?select=*,employee:employees(name,branch)&order=created_at.desc")
-      .then(data => { setRequests(data); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, []);
+    refreshRequests().finally(() => setLoading(false));
+  }, []); // eslint-disable-line
+
+  async function refreshRequests() {
+    try {
+      const data = await sb("time_off", "?select=*,employee:employees(name,branch,department)&order=created_at.desc");
+      setRequests(data || []);
+    } catch (err) {
+      console.error("[time_off] refresh failed:", err);
+    }
+  }
 
   async function submitRequest() {
     if (!form.employee_id || !form.start_date) { showToast("Please fill required fields", "error"); return; }
@@ -988,9 +995,11 @@ function TimeOff({ user, employees, showToast }) {
         payload.status = "logged"; // callouts don't need approval
       }
       console.log("[time_off] inserting:", payload);
-      const newReq = await sbPost("time_off", payload);
-      const emp = employees.find(e => e.id === form.employee_id);
-      setRequests(prev => [{ ...newReq[0], employee: emp }, ...prev]);
+      const saved = await sbPost("time_off", payload);
+      console.log("[time_off] saved successfully:", saved);
+      // Refetch from DB so the new row shows up with its joined employee relation.
+      // This is more reliable than trying to patch state with the POST response.
+      await refreshRequests();
       setShowForm(false);
       setForm({ employee_id:"", type:"pto_request", start_date:"", end_date:"", reason:"", notes:"", callout_type:"sick", paid:false, coverage_found:false, called_in_on_time:true });
       showToast(form.type === "callout" ? "Call-out logged" : "Request submitted");
@@ -1017,7 +1026,7 @@ function TimeOff({ user, employees, showToast }) {
   }
 
   const filtered = requests.filter(r => {
-    if (!matchBranchFilter(r.employee, branch)) return false;
+    if (!matchBranchOrParent(r.employee, branch)) return false;
     if (!isManager && r.employee_id !== user.id) return false;
     return true;
   });
@@ -1323,7 +1332,7 @@ function OvertimeTab({ user, employees, branch, showToast }) {
 
   // Filter by branch + employee
   const filtered = shifts.filter(s =>
-    matchBranchFilter(s.employee, branch) &&
+    matchBranchOrParent(s.employee, branch) &&
     (empFilter === "All" || s.employee_id === empFilter)
   );
 
@@ -1545,8 +1554,10 @@ function ShiftModal({ shift, user, employees, branch, onClose, onSaved, showToas
         logger_name: user.name
       };
       console.log("[shifts] inserting:", payload);
-      if (isEdit) await sbPatch("shifts", shift.id, payload);
-      else await sbPost("shifts", payload);
+      let saved;
+      if (isEdit) saved = await sbPatch("shifts", shift.id, payload);
+      else saved = await sbPost("shifts", payload);
+      console.log("[shifts] saved successfully:", saved);
       showToast(isEdit ? "Shift updated" : "Shift logged");
       onSaved();
     } catch (err) {
