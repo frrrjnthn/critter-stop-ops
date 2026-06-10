@@ -209,6 +209,38 @@ tr:hover td{background:#1E2535;cursor:pointer}
 .kv-val{font-weight:500;font-family:'DM Mono',monospace;font-size:11px;color:#E8EDF5}
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#22C55E;color:#0E1117;padding:10px 20px;border-radius:24px;font-size:13px;font-weight:600;z-index:500;white-space:nowrap;transition:opacity .3s}
 .toast.error{background:#EF4444;color:white}
+
+/* Mobile drawer toggle (hidden by default, visible on small screens) */
+.menu-toggle{display:none;position:fixed;top:10px;left:10px;width:38px;height:38px;background:#1E2535;border:1px solid #2A3348;border-radius:6px;color:#E8EDF5;font-size:18px;cursor:pointer;z-index:400;align-items:center;justify-content:center}
+.sidebar-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:200}
+
+/* Responsive: phones / narrow tablets */
+@media (max-width: 700px) {
+  /* Sidebar becomes a slide-in drawer */
+  .sidebar{position:fixed;top:0;left:0;height:100vh;width:240px;z-index:300;transform:translateX(-100%);transition:transform .25s ease}
+  .sidebar.open{transform:translateX(0)}
+  .sidebar-backdrop.open{display:block}
+  .menu-toggle{display:flex}
+  .main{padding:54px 12px 16px;max-width:none}
+  .page-header{padding-left:44px;margin-bottom:8px}
+  .page-title{font-size:18px}
+  .page-sub{font-size:11px}
+  /* Tighter tables */
+  .table-wrap table{font-size:12px}
+  .table-wrap th,.table-wrap td{padding:6px 6px}
+  .table-head{padding:8px 10px;flex-wrap:wrap;gap:6px}
+  .table-title{font-size:12px}
+  /* Hide columns flagged as mobile-hide */
+  .mobile-hide{display:none !important}
+  /* Allow horizontal scroll as a safety net for any remaining wide tables */
+  .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  /* Make modals nearly full-width on mobile */
+  .modal{max-width:96vw !important;max-height:92vh}
+  .modal-body{padding:12px}
+  /* Stat tiles slimmer */
+  .stat-row{gap:6px}
+  .branch-bar{flex-wrap:wrap}
+}
 `;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -376,11 +408,12 @@ function useSortableData(rows, defaultKey, defaultDir = "asc") {
   return { rows: sortedRows, sortKey, sortDir, requestSort };
 }
 
-function SortableTh({ sortState, sortKey, accessor, children, style }) {
+function SortableTh({ sortState, sortKey, accessor, children, style, className }) {
   const active = sortState.sortKey === sortKey;
   const arrow = !active ? "↕" : sortState.sortDir === "asc" ? "↑" : "↓";
   return (
     <th
+      className={className}
       onClick={() => sortState.requestSort(sortKey, accessor)}
       style={{cursor:"pointer",userSelect:"none",...(style||{})}}
       title="Click to sort"
@@ -3819,14 +3852,14 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
             <table>
               <thead><tr>
                 <SortableTh sortState={sortAll} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
-                <SortableTh sortState={sortAll} sortKey="branch">Branch</SortableTh>
-                <SortableTh sortState={sortAll} sortKey="department">Dept</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="branch" className="mobile-hide">Branch</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="department" className="mobile-hide">Dept</SortableTh>
                 <SortableTh sortState={sortAll} sortKey="driver_name" accessor={t => driverOf(t, employees)?.name || ""}>Driver</SortableTh>
-                <SortableTh sortState={sortAll} sortKey="plate">Plate</SortableTh>
-                <SortableTh sortState={sortAll} sortKey="mileage">Mileage</SortableTh>
-                <SortableTh sortState={sortAll} sortKey="next_oil_miles">Next oil</SortableTh>
-                <SortableTh sortState={sortAll} sortKey="reg_expires">Reg expires</SortableTh>
-                <SortableTh sortState={sortAll} sortKey="has_gps">GPS</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="plate" className="mobile-hide">Plate</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="mileage" className="mobile-hide">Mileage</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="next_oil_miles" className="mobile-hide">Next oil</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="reg_expires" className="mobile-hide">Reg expires</SortableTh>
+                <SortableTh sortState={sortAll} sortKey="has_gps" className="mobile-hide">GPS</SortableTh>
                 <th>Actions</th>
               </tr></thead>
               <tbody>
@@ -3840,8 +3873,8 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                   return (
                     <tr key={t.id}>
                       <td><div style={{display:"flex",alignItems:"center",gap:7}}><div style={{width:8,height:8,borderRadius:"50%",background:dot,flexShrink:0}} /><strong>{t.truck_number}</strong></div></td>
-                      <td>{t.branch}</td>
-                      <td>
+                      <td className="mobile-hide">{t.branch}</td>
+                      <td className="mobile-hide">
                         {canEdit ? (
                           <select
                             value={t.department || ""}
@@ -3908,11 +3941,11 @@ function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) 
                           driverOf(t, employees)?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>
                         )}
                       </td>
-                      <td style={{fontFamily:"monospace",fontSize:11}}>{t.plate || "—"}</td>
-                      <td style={{fontFamily:"monospace"}}>{t.mileage ? t.mileage.toLocaleString() : "—"}</td>
-                      <td style={{color:oil.color,fontFamily:"monospace",fontSize:12}}>{oil.label}</td>
-                      <td><Badge color={regExp?"red":!t.reg_expires?"gray":"green"}>{formatLocalDate(t.reg_expires, {month:"short",year:"numeric"})}</Badge></td>
-                      <td><Badge color={t.has_gps?"green":"gray"}>{t.has_gps?"Active":"No GPS"}</Badge></td>
+                      <td className="mobile-hide" style={{fontFamily:"monospace",fontSize:11}}>{t.plate || "—"}</td>
+                      <td className="mobile-hide" style={{fontFamily:"monospace"}}>{t.mileage ? t.mileage.toLocaleString() : "—"}</td>
+                      <td className="mobile-hide" style={{color:oil.color,fontFamily:"monospace",fontSize:12}}>{oil.label}</td>
+                      <td className="mobile-hide"><Badge color={regExp?"red":!t.reg_expires?"gray":"green"}>{formatLocalDate(t.reg_expires, {month:"short",year:"numeric"})}</Badge></td>
+                      <td className="mobile-hide"><Badge color={t.has_gps?"green":"gray"}>{t.has_gps?"Active":"No GPS"}</Badge></td>
                       <td>
                         {canEdit ? (
                           <div style={{display:"flex",gap:6}}>
@@ -4105,12 +4138,12 @@ function InspectionsPage({ user, trucks, employees, showToast }) {
           <table>
             <thead><tr>
               <SortableTh sortState={sortInsp} sortKey="truck_number" accessor={t => parseInt(t.truck_number,10) || t.truck_number}>Truck</SortableTh>
-              <SortableTh sortState={sortInsp} sortKey="driver" accessor={t => driverOf(t, employees)?.name || ""}>Driver</SortableTh>
-              <SortableTh sortState={sortInsp} sortKey="branch">Branch</SortableTh>
-              <SortableTh sortState={sortInsp} sortKey="last_inspected" accessor={t => latestByTruck[t.id]?.inspected_at}>Last inspected</SortableTh>
-              <SortableTh sortState={sortInsp} sortKey="inspector" accessor={t => latestByTruck[t.id]?.inspector_name || ""}>Inspector</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="driver" accessor={t => driverOf(t, employees)?.name || ""} className="mobile-hide">Driver</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="branch" className="mobile-hide">Branch</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="last_inspected" accessor={t => latestByTruck[t.id]?.inspected_at} className="mobile-hide">Last inspected</SortableTh>
+              <SortableTh sortState={sortInsp} sortKey="inspector" accessor={t => latestByTruck[t.id]?.inspector_name || ""} className="mobile-hide">Inspector</SortableTh>
               <SortableTh sortState={sortInsp} sortKey="status" accessor={t => latestByTruck[t.id]?.overall_status || "zNo"}>Status</SortableTh>
-              <th>Issues</th>
+              <th className="mobile-hide">Issues</th>
               <th>Actions</th>
             </tr></thead>
             <tbody>
@@ -4121,17 +4154,28 @@ function InspectionsPage({ user, trucks, employees, showToast }) {
                 const dot = !latest ? "#F59E0B" : latest.fail_count > 0 ? "#EF4444" : "#22C55E";
                 return (
                   <tr key={t.id}>
-                    <td><div style={{display:"flex",alignItems:"center",gap:7}}><div style={{width:8,height:8,borderRadius:"50%",background:dot,flexShrink:0}} /><strong>{t.truck_number}</strong> <span style={{color:"#8A95A8",fontSize:11}}>{t.year} {t.make} {t.model}</span></div></td>
-                    <td>{driverOf(t, employees)?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
-                    <td>{t.branch}</td>
-                    <td style={{fontSize:12}}>{latest ? new Date(latest.inspected_at).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : <span style={{color:"#F59E0B"}}>Never</span>}</td>
-                    <td style={{fontSize:12}}>{latest?.inspector_name || "—"}</td>
-                    <td>{latest ? <Badge color={latest.fail_count > 0 ? "red" : "green"}>{latest.overall_status}</Badge> : <Badge color="amber">No inspection</Badge>}</td>
-                    <td style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>{latest?.notes || "—"}</td>
+                    <td>
+                      <div style={{display:"flex",alignItems:"center",gap:7}}>
+                        <div style={{width:8,height:8,borderRadius:"50%",background:dot,flexShrink:0}} />
+                        <div style={{minWidth:0}}>
+                          <div><strong>#{t.truck_number}</strong> <span style={{color:"#8A95A8",fontSize:11}}>{t.year} {t.make} {t.model}</span></div>
+                          <div style={{fontSize:10,color:"#8A95A8",marginTop:1}}>
+                            {driverOf(t, employees)?.name || "Unassigned"} · {t.branch}
+                            {latest && <> · last {new Date(latest.inspected_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}</>}
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="mobile-hide">{driverOf(t, employees)?.name || <span style={{color:"#8A95A8"}}>Unassigned</span>}</td>
+                    <td className="mobile-hide">{t.branch}</td>
+                    <td className="mobile-hide" style={{fontSize:12}}>{latest ? new Date(latest.inspected_at).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : <span style={{color:"#F59E0B"}}>Never</span>}</td>
+                    <td className="mobile-hide" style={{fontSize:12}}>{latest?.inspector_name || "—"}</td>
+                    <td>{latest ? <Badge color={latest.fail_count > 0 ? "red" : "green"}>{latest.overall_status}</Badge> : <Badge color="amber">Needs</Badge>}</td>
+                    <td className="mobile-hide" style={{fontSize:11,color:"#8A95A8",maxWidth:240}}>{latest?.notes || "—"}</td>
                     <td>
                       {canInspect && (
                         <Btn variant="primary" onClick={() => setModalTruck(t)}>
-                          {latest ? "Re-inspect" : "Start inspection"}
+                          {latest ? "Re-inspect" : "Start"}
                         </Btn>
                       )}
                     </td>
@@ -7092,6 +7136,7 @@ function ProfileModal({ person, trucks, creditCards, currentUser, onClose, onSav
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [page, setPage] = useState("home");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [profile, setProfile] = useState(null);
   const [employees, setEmployees] = useState([]);
   const [trucks, setTrucks] = useState([]);
@@ -7165,7 +7210,7 @@ export default function App() {
     if (!currentUser) return null;
     if (!isManager && MANAGER_PAGES.includes(id)) return null;
     return (
-      <div key={id} className={"nav-item"+(page===id?" active":"")} onClick={() => setPage(id)}>
+      <div key={id} className={"nav-item"+(page===id?" active":"")} onClick={() => { setPage(id); setSidebarOpen(false); }}>
         <span style={{width:18,textAlign:"center",fontSize:13}}>{icon}</span>
         {label}
         {badge && <span className={"nav-badge"+(badge.c?" "+badge.c:"")}>{badge.n}</span>}
@@ -7183,7 +7228,9 @@ export default function App() {
         <Login onLogin={login} />
       ) : (
         <div className="app">
-          <nav className="sidebar">
+          <button className="menu-toggle" onClick={() => setSidebarOpen(true)} aria-label="Open menu">☰</button>
+          <div className={"sidebar-backdrop" + (sidebarOpen ? " open" : "")} onClick={() => setSidebarOpen(false)} />
+          <nav className={"sidebar" + (sidebarOpen ? " open" : "")}>
             <div className="sb-logo">
               <div className="sb-logo-icon">🦎</div>
               <div><div className="sb-logo-text">Critter Stop</div><div className="sb-logo-sub">OPS PLATFORM</div></div>
