@@ -1999,6 +1999,345 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
   );
 }
 
+// ── Truck Inventory (initial setup + monthly count) ──────────────────────────
+// Sets ABSOLUTE quantities on a truck rather than moving them from a shop.
+// Use cases: (1) capture starting inventory on a fleet that already had product
+// before the system existed, (2) monthly reconciliation count where the tech
+// reports what's actually on the truck. Each row with a variance creates an
+// inventory_transactions row with action='count' for the audit trail.
+function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
+  const isManager = ["super_admin","manager","lead"].includes(user.access_level);
+
+  // Default the truck: if the logged-in user has an assigned truck, use it.
+  // Otherwise empty so they pick.
+  const myTruck = trucks.find(t => {
+    const driver = driverOf(t, employees);
+    return driver?.id === user.id;
+  });
+
+  const [truckId, setTruckId] = useState(myTruck?.id || "");
+  const [currentInventory, setCurrentInventory] = useState([]); // inventory rows for selected truck
+  const [loading, setLoading] = useState(false);
+  const [counts, setCounts] = useState({}); // { product_id: stringValue }
+  const [categoryFilter, setCategoryFilter] = useState("All");
+  const [search, setSearch] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [recentCounts, setRecentCounts] = useState([]); // recent count transactions for this truck
+
+  // Load inventory + recent count history whenever truck changes
+  useEffect(() => {
+    if (!truckId) {
+      setCurrentInventory([]);
+      setRecentCounts([]);
+      return;
+    }
+    setLoading(true);
+    Promise.all([
+      sb("inventory", `?location_type=eq.truck&location_id=eq.${truckId}&select=*`).catch(() => []),
+      sb("inventory_transactions",
+        `?action=eq.count&from_location=eq.${truckId}&select=*,product:products(name,category)&order=created_at.desc&limit=50`
+      ).catch(() => [])
+    ]).then(([inv, hist]) => {
+      setCurrentInventory(inv);
+      setRecentCounts(hist);
+      // Reset count inputs when truck changes
+      setCounts({});
+    }).finally(() => setLoading(false));
+  }, [truckId]);
+
+  // Map product_id -> current quantity
+  const currentByProduct = {};
+  for (const row of currentInventory) {
+    currentByProduct[row.product_id] = { qty: row.quantity || 0, rowId: row.id };
+  }
+
+  // Filter products
+  const cats = ["All","Pest","Wildlife","Rodent","Mosquito","Termite","Insulation"];
+  const filteredProducts = products
+    .filter(p => p.active)
+    .filter(p => categoryFilter === "All" || p.category === categoryFilter)
+    .filter(p => !search || p.name.toLowerCase().includes(search.toLowerCase()))
+    .sort((a,b) => a.name.localeCompare(b.name));
+
+  // Calculate changes (rows where input differs from current)
+  const changes = [];
+  for (const p of products) {
+    const input = counts[p.id];
+    if (input === undefined || input === "") continue;
+    const actual = parseInt(input, 10);
+    if (isNaN(actual) || actual < 0) continue;
+    const system = currentByProduct[p.id]?.qty || 0;
+    if (actual !== system) {
+      changes.push({ product: p, system, actual, variance: actual - system });
+    }
+  }
+  const positiveVariance = changes.filter(c => c.variance > 0).reduce((s,c) => s + c.variance, 0);
+  const negativeVariance = changes.filter(c => c.variance < 0).reduce((s,c) => s + Math.abs(c.variance), 0);
+
+  function setCount(productId, value) {
+    setCounts(prev => ({ ...prev, [productId]: value }));
+  }
+
+  function prefillUnchanged() {
+    const next = { ...counts };
+    let filled = 0;
+    for (const p of filteredProducts) {
+      if (next[p.id] === undefined || next[p.id] === "") {
+        const cur = currentByProduct[p.id]?.qty || 0;
+        next[p.id] = String(cur);
+        filled++;
+      }
+    }
+    setCounts(next);
+    showToast(`Prefilled ${filled} products with current system values`);
+  }
+
+  function clearAll() {
+    if (Object.keys(counts).length === 0) return;
+    if (!window.confirm("Clear all entered counts?")) return;
+    setCounts({});
+  }
+
+  async function submitCount() {
+    if (!truckId) { showToast("Pick a truck first", "error"); return; }
+    if (changes.length === 0) { showToast("No changes to submit", "error"); return; }
+    setSaving(true);
+    try {
+      const batchId = (typeof crypto !== "undefined" && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : (Date.now() + "-" + Math.random()).toString();
+      const truck = trucks.find(t => t.id === truckId);
+      const truckLabel = truck ? `Truck #${truck.truck_number}` : "Truck";
+
+      for (const c of changes) {
+        // 1. Set absolute inventory
+        const existing = currentByProduct[c.product.id];
+        if (existing) {
+          await sbPatch("inventory", existing.rowId, {
+            quantity: c.actual,
+            updated_at: new Date().toISOString()
+          });
+        } else {
+          await sbPost("inventory", {
+            product_id: c.product.id,
+            location_type: "truck",
+            location_id: truckId,
+            quantity: c.actual
+          });
+        }
+        // 2. Log the count transaction for the audit trail
+        await sbPost("inventory_transactions", {
+          product_id: c.product.id,
+          employee_id: user.id,
+          action: "count",
+          quantity: c.variance, // positive if found more, negative if less
+          from_location: truckId,
+          to_location: truckId,
+          notes: `Counted ${c.actual}, system had ${c.system} (variance ${c.variance > 0 ? "+" : ""}${c.variance})`,
+          batch_id: batchId
+        });
+      }
+      showToast(`Count saved — ${changes.length} adjustment${changes.length === 1 ? "" : "s"} on ${truckLabel}`);
+      setCounts({});
+      // Refetch
+      const [inv, hist] = await Promise.all([
+        sb("inventory", `?location_type=eq.truck&location_id=eq.${truckId}&select=*`).catch(() => []),
+        sb("inventory_transactions",
+          `?action=eq.count&from_location=eq.${truckId}&select=*,product:products(name,category)&order=created_at.desc&limit=50`
+        ).catch(() => [])
+      ]);
+      setCurrentInventory(inv);
+      setRecentCounts(hist);
+    } catch (err) {
+      console.error("[truck_inventory] save failed:", err);
+      showToast("Save failed: " + (err.message || err), "error");
+    }
+    setSaving(false);
+  }
+
+  const selectedTruck = trucks.find(t => t.id === truckId);
+  const selectedDriver = selectedTruck ? driverOf(selectedTruck, employees) : null;
+  const hasNoExistingInventory = currentInventory.length === 0;
+
+  // Group recent counts by batch (one count session = one batch)
+  const recentBatches = (function() {
+    const m = new Map();
+    for (const tx of recentCounts) {
+      const key = tx.batch_id || tx.id;
+      if (!m.has(key)) m.set(key, []);
+      m.get(key).push(tx);
+    }
+    return Array.from(m.values()).map(rows => ({
+      batch_id: rows[0].batch_id || rows[0].id,
+      date: rows[0].created_at,
+      count: rows.length,
+      net_variance: rows.reduce((s, r) => s + (r.quantity || 0), 0),
+      rows
+    })).slice(0, 10);
+  })();
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        📋 <strong>Truck inventory count.</strong> Use this for <em>initial inventory</em> (set what's already on your truck when starting) and <em>monthly counts</em> (reconcile what's actually there vs what the system thinks). Enter the <strong>actual quantity</strong> for each product — the system will compute the variance and update accordingly.
+      </div>
+
+      {/* Truck selector */}
+      <div className="mod-card" style={{marginBottom:14}}>
+        <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>1 · Truck</div>
+        <div className="form-group" style={{marginBottom:0}}>
+          <label className="form-label">Which truck are you counting?</label>
+          <select className="form-input" value={truckId} onChange={e => setTruckId(e.target.value)}>
+            <option value="">— Select truck —</option>
+            {trucks
+              .filter(t => isManager || driverOf(t, employees)?.id === user.id)
+              .sort((a,b) => (parseInt(a.truck_number,10) || 0) - (parseInt(b.truck_number,10) || 0))
+              .map(t => {
+                const d = driverOf(t, employees);
+                return <option key={t.id} value={t.id}>Truck #{t.truck_number} · {d?.name || "Unassigned"} · {t.branch}{t.department ? " " + t.department : ""}</option>;
+              })}
+          </select>
+          {!isManager && trucks.filter(t => driverOf(t, employees)?.id === user.id).length === 0 && (
+            <div style={{fontSize:11,color:"#F59E0B",marginTop:6}}>
+              You're not assigned to a truck. Ask a manager to assign you in Fleet → Edit → Assigned driver.
+            </div>
+          )}
+        </div>
+        {selectedTruck && (
+          <div style={{marginTop:10,padding:"8px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,fontSize:11,color:"#8A95A8"}}>
+            Selected: <strong style={{color:"#E8EDF5"}}>Truck #{selectedTruck.truck_number}</strong> · {selectedDriver?.name || "Unassigned"} · {selectedTruck.year} {selectedTruck.make} {selectedTruck.model}
+            {hasNoExistingInventory && <div style={{color:"#22C55E",marginTop:3,fontSize:11}}>✓ No prior inventory recorded — this will be the starting baseline.</div>}
+          </div>
+        )}
+      </div>
+
+      {truckId && (
+        <>
+          {/* Search + category filter */}
+          <div className="mod-card" style={{marginBottom:14}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>2 · Count products</div>
+
+            <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
+              <div style={{flex:1,minWidth:160,display:"flex",alignItems:"center",gap:8,background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:"6px 11px"}}>
+                <span style={{color:"#4A5568"}}>⌕</span>
+                <input style={{background:"none",border:"none",outline:"none",color:"#E8EDF5",fontSize:13,flex:1,fontFamily:"DM Sans,sans-serif"}}
+                  placeholder="Search products..." value={search} onChange={e=>setSearch(e.target.value)} />
+              </div>
+              <Btn onClick={prefillUnchanged}>↓ Prefill unchanged</Btn>
+              {Object.keys(counts).length > 0 && <Btn onClick={clearAll}>Clear all</Btn>}
+            </div>
+
+            <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:10}}>
+              {cats.map(c => (
+                <button key={c} onClick={() => setCategoryFilter(c)}
+                  style={{
+                    padding:"3px 9px",borderRadius:4,fontSize:11,fontWeight:600,cursor:"pointer",
+                    border:"1px solid " + (categoryFilter===c ? "#22C55E" : "#2A3348"),
+                    background: categoryFilter===c ? "rgba(34,197,94,0.15)" : "transparent",
+                    color: categoryFilter===c ? "#22C55E" : "#8A95A8"
+                  }}>{c}</button>
+              ))}
+            </div>
+
+            {loading ? (
+              <div style={{padding:"20px 0",fontSize:13,color:"#8A95A8",textAlign:"center"}}>Loading inventory...</div>
+            ) : filteredProducts.length === 0 ? (
+              <div style={{padding:"20px 0",fontSize:13,color:"#8A95A8",textAlign:"center",fontStyle:"italic"}}>
+                No products match the filters
+              </div>
+            ) : (
+              <div className="table-wrap" style={{margin:0}}>
+                <table>
+                  <thead><tr>
+                    <th>Product</th>
+                    <th className="mobile-hide">Category</th>
+                    <th style={{textAlign:"right"}}>System</th>
+                    <th style={{textAlign:"right"}}>Actual count</th>
+                    <th style={{textAlign:"right"}}>Variance</th>
+                  </tr></thead>
+                  <tbody>
+                    {filteredProducts.map(p => {
+                      const system = currentByProduct[p.id]?.qty || 0;
+                      const input = counts[p.id];
+                      const inputNum = input === undefined || input === "" ? null : parseInt(input, 10);
+                      const variance = (inputNum !== null && !isNaN(inputNum)) ? inputNum - system : null;
+                      const varianceColor = variance == null ? "#8A95A8" : variance === 0 ? "#22C55E" : variance > 0 ? "#3B82F6" : "#F59E0B";
+                      return (
+                        <tr key={p.id}>
+                          <td>
+                            <div><strong>{p.name}</strong></div>
+                            <div className="mobile-hide" style={{fontSize:10,color:"#8A95A8"}}>{p.unit_of_measure || "ea"}</div>
+                          </td>
+                          <td className="mobile-hide"><Badge color="gray">{p.category}</Badge></td>
+                          <td style={{textAlign:"right",fontFamily:"monospace",color:"#8A95A8",fontSize:12}}>{system}</td>
+                          <td style={{textAlign:"right"}}>
+                            <input
+                              type="number"
+                              min="0"
+                              inputMode="numeric"
+                              value={input ?? ""}
+                              onChange={e => setCount(p.id, e.target.value)}
+                              placeholder={String(system)}
+                              style={{width:70,padding:"4px 6px",background:"#0F1623",border:"1px solid " + (variance != null && variance !== 0 ? varianceColor : "#2A3348"),borderRadius:4,color:"#E8EDF5",fontFamily:"monospace",textAlign:"right",fontSize:12}}
+                            />
+                          </td>
+                          <td style={{textAlign:"right",fontFamily:"monospace",fontSize:12,color:varianceColor,fontWeight:variance != null && variance !== 0 ? 600 : 400}}>
+                            {variance == null ? "—" : variance > 0 ? `+${variance}` : variance}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* Submit bar */}
+          <div className="mod-card" style={{position:"sticky",bottom:10,zIndex:50,background:"#161B25"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+              <div style={{flex:1,minWidth:160}}>
+                <div style={{fontSize:11,color:"#8A95A8"}}>3 · Review</div>
+                <div style={{fontSize:13,marginTop:2}}>
+                  {changes.length === 0 ? (
+                    <span style={{color:"#8A95A8"}}>No changes yet — enter actual counts above</span>
+                  ) : (
+                    <span>
+                      <strong>{changes.length}</strong> adjustment{changes.length === 1 ? "" : "s"}
+                      {positiveVariance > 0 && <span style={{color:"#3B82F6",marginLeft:8}}>+{positiveVariance} found</span>}
+                      {negativeVariance > 0 && <span style={{color:"#F59E0B",marginLeft:8}}>−{negativeVariance} short</span>}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <Btn variant="primary" onClick={submitCount} disabled={saving || changes.length === 0} style={{padding:"10px 18px"}}>
+                {saving ? "Saving..." : `Submit count (${changes.length})`}
+              </Btn>
+            </div>
+          </div>
+
+          {/* Recent counts for this truck */}
+          {recentBatches.length > 0 && (
+            <div className="mod-card" style={{marginTop:14}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Recent counts</div>
+              <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                {recentBatches.map(b => (
+                  <div key={b.batch_id} style={{padding:"8px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,fontSize:12}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <strong>{new Date(b.date).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</strong>
+                      <span style={{fontSize:11,color:"#8A95A8"}}>{b.count} adjustment{b.count === 1 ? "" : "s"} · net {b.net_variance > 0 ? "+" : ""}{b.net_variance}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── Inventory History Table (sortable) ───────────────────────────────────────
 function InventoryHistoryTable({ history, shops, trucks }) {
   // Group by batch_id; rows without a batch_id are treated as their own "batch of 1"
@@ -2073,7 +2412,7 @@ function InventoryHistoryTable({ history, shops, trucks }) {
                 onClick={g.is_batch ? () => toggleExpand(g.batch_id) : undefined}>
                 <td style={{fontSize:11,color:"#8A95A8"}}>{new Date(g.created_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</td>
                 <td>
-                  <Badge color={g.action === "load_truck" ? "blue" : g.action === "return" ? "amber" : g.action === "usage" ? "green" : g.action === "adjust" ? "red" : g.action === "distributor_purchase" ? "purple" : "gray"}>{g.action}</Badge>
+                  <Badge color={g.action === "load_truck" ? "blue" : g.action === "return" ? "amber" : g.action === "usage" ? "green" : g.action === "adjust" ? "red" : g.action === "distributor_purchase" ? "purple" : g.action === "count" ? "teal" : "gray"}>{g.action === "count" ? "Count" : g.action}</Badge>
                 </td>
                 <td>
                   {g.is_batch ? (
@@ -2638,6 +2977,7 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
   const usageTx = history.filter(tx => tx.action === "usage");
   const loadTx  = history.filter(tx => tx.action === "load_truck");
   const distTx  = history.filter(tx => tx.action === "distributor_purchase");
+  const countTx = history.filter(tx => tx.action === "count");
 
   // Aggregate: by product
   const byProduct = {};
@@ -2830,6 +3170,75 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
               </tbody>
             </table>
           </div>
+
+          {/* Inventory count discrepancies — variance from monthly truck counts */}
+          {countTx.length > 0 && (() => {
+            // Group by truck
+            const byTruck = {};
+            for (const tx of countTx) {
+              const tid = tx.from_location || "unknown";
+              if (!byTruck[tid]) byTruck[tid] = { rows: [], positive: 0, negative: 0, count: 0 };
+              byTruck[tid].rows.push(tx);
+              if (tx.quantity > 0) byTruck[tid].positive += tx.quantity;
+              if (tx.quantity < 0) byTruck[tid].negative += Math.abs(tx.quantity);
+              byTruck[tid].count++;
+            }
+            const truckRows = Object.entries(byTruck).map(([tid, v]) => {
+              const truck = trucks.find(t => t.id === tid);
+              return {
+                truck_id: tid,
+                truck_label: truck ? `#${truck.truck_number}` : "—",
+                driver: truck ? (driverOf(truck, employees)?.name || "Unassigned") : "—",
+                ...v
+              };
+            }).sort((a, b) => (b.positive + b.negative) - (a.positive + a.negative));
+
+            function downloadCountCSV() {
+              const rows = countTx.map(tx => {
+                const truck = trucks.find(t => t.id === tx.from_location);
+                return [
+                  new Date(tx.created_at).toISOString(),
+                  truck ? `#${truck.truck_number}` : "",
+                  truck ? (driverOf(truck, employees)?.name || "") : "",
+                  tx.product?.name || "",
+                  tx.product?.category || "",
+                  tx.quantity > 0 ? `+${tx.quantity}` : tx.quantity,
+                  (tx.notes || "").replace(/\n/g, " ")
+                ];
+              });
+              downloadCSV(`inventory_count_variances_${periodStart}_to_${periodEnd}.csv`,
+                ["Date","Truck","Driver","Product","Category","Variance","Notes"], rows);
+            }
+
+            return (
+              <div className="table-wrap" style={{marginTop:16}}>
+                <div className="table-head">
+                  <span className="table-title">Inventory count variances ({countTx.length} line item{countTx.length === 1 ? "" : "s"})</span>
+                  <Btn onClick={downloadCountCSV}>↓ CSV</Btn>
+                </div>
+                <table>
+                  <thead><tr>
+                    <th>Truck</th>
+                    <th className="mobile-hide">Driver</th>
+                    <th style={{textAlign:"right"}}>Counts</th>
+                    <th style={{textAlign:"right"}}>+ Found</th>
+                    <th style={{textAlign:"right"}}>− Short</th>
+                  </tr></thead>
+                  <tbody>
+                    {truckRows.map(r => (
+                      <tr key={r.truck_id}>
+                        <td><strong>{r.truck_label}</strong></td>
+                        <td className="mobile-hide">{r.driver}</td>
+                        <td style={{textAlign:"right",fontFamily:"monospace"}}>{r.count}</td>
+                        <td style={{textAlign:"right",fontFamily:"monospace",color:r.positive > 0 ? "#3B82F6" : "#8A95A8"}}>{r.positive > 0 ? "+" + r.positive : "—"}</td>
+                        <td style={{textAlign:"right",fontFamily:"monospace",color:r.negative > 0 ? "#F59E0B" : "#8A95A8"}}>{r.negative > 0 ? "−" + r.negative : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            );
+          })()}
         </>
       )}
     </div>
@@ -7218,7 +7627,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",equipment:"Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",truck_inventory:"Truck Inventory Count",equipment:"Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -7241,6 +7650,7 @@ export default function App() {
               {navItem("hr","HR & Onboarding","✦")}
               {navItem("timeoff","Time Off & Callouts","◈")}
               {navItem("inventory","Inventory","◧")}
+              {navItem("truck_inventory","Truck Inventory","📋")}
               {navItem("equipment","Equipment","🔧")}
               {navItem("fleet","Fleet","◉")}
               {navItem("inspections","Inspections","✓")}
@@ -7271,6 +7681,7 @@ export default function App() {
             {dataLoaded && page === "hr" && <HR user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {page === "timeoff" && <TimeOff user={currentUser} employees={employees} showToast={showToast} />}
             {page === "inventory" && <Inventory user={currentUser} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />}
+            {page === "truck_inventory" && <TruckInventoryPage user={currentUser} products={products} trucks={trucks} employees={employees} showToast={showToast} />}
             {page === "equipment" && <EquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
             {dataLoaded && page === "inspections" && <InspectionsPage user={currentUser} trucks={trucks} employees={employees} showToast={showToast} />}
