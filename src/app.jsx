@@ -2110,7 +2110,20 @@ function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
       const truckLabel = truck ? `Truck #${truck.truck_number}` : "Truck";
 
       for (const c of changes) {
-        // 1. Set absolute inventory
+        // Log the count transaction FIRST. If this fails (e.g. due to a constraint),
+        // we haven't yet touched any inventory quantities, so the system stays
+        // consistent. The inventory update only happens after the audit row exists.
+        await sbPost("inventory_transactions", {
+          product_id: c.product.id,
+          employee_id: user.id,
+          action: "count",
+          quantity: c.variance, // positive if found more, negative if less
+          from_location: truckId,
+          to_location: truckId,
+          notes: `Counted ${c.actual}, system had ${c.system} (variance ${c.variance > 0 ? "+" : ""}${c.variance})`,
+          batch_id: batchId
+        });
+        // Then set absolute inventory
         const existing = currentByProduct[c.product.id];
         if (existing) {
           await sbPatch("inventory", existing.rowId, {
@@ -2125,17 +2138,6 @@ function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
             quantity: c.actual
           });
         }
-        // 2. Log the count transaction for the audit trail
-        await sbPost("inventory_transactions", {
-          product_id: c.product.id,
-          employee_id: user.id,
-          action: "count",
-          quantity: c.variance, // positive if found more, negative if less
-          from_location: truckId,
-          to_location: truckId,
-          notes: `Counted ${c.actual}, system had ${c.system} (variance ${c.variance > 0 ? "+" : ""}${c.variance})`,
-          batch_id: batchId
-        });
       }
       showToast(`Count saved — ${changes.length} adjustment${changes.length === 1 ? "" : "s"} on ${truckLabel}`);
       setCounts({});
