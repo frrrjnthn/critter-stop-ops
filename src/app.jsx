@@ -1804,14 +1804,18 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
     };
   }
   for (const row of inventory) {
-    if (row.location_type === "shop" && row.quantity > 0) {
+    if (row.location_type === "shop") {
       const key = row.location_id;
       if (!shopLocations[key]) {
         // Stale row pointing to a deactivated/deleted shop — still display under a placeholder
         shopLocations[key] = { shop: null, label: "(Unknown shop)", branchKey: "", items: 0, value: 0, products: {} };
       }
-      shopLocations[key].items += row.quantity;
-      shopLocations[key].value += (row.quantity * (row.product?.unit_cost || 0));
+      if (row.quantity > 0) {
+        shopLocations[key].items += row.quantity;
+        shopLocations[key].value += (row.quantity * (row.product?.unit_cost || 0));
+      }
+      // Keep zero-quantity rows in the map so the shop view can show the full
+      // catalog (products added in Settings) and preserve reorder thresholds.
       shopLocations[key].products[row.product_id] = row;
     }
   }
@@ -2011,6 +2015,7 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
           user={user}
           onClose={() => setMoveModal(null)}
           onSaved={() => { loadInventory(); if (tab === "history") loadHistory(); setMoveModal(null); }}
+          onRefresh={() => loadInventory()}
           showToast={showToast}
           catFilter={catFilter}
           setCatFilter={setCatFilter}
@@ -3270,7 +3275,7 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
 }
 
 // ── Inventory Move Modal ─────────────────────────────────────────────────────
-function InventoryMoveModal({ modal, inventory, products, trucks, shops, employees, shopLocations, truckLocations, user, onClose, onSaved, showToast, catFilter, setCatFilter }) {
+function InventoryMoveModal({ modal, inventory, products, trucks, shops, employees, shopLocations, truckLocations, user, onClose, onSaved, onRefresh, showToast, catFilter, setCatFilter }) {
   const action = modal.action;
   const isView = action === "view_shop" || action === "view_truck";
 
@@ -3285,22 +3290,49 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, employe
     total_cost: ""
   });
   const [saving, setSaving] = useState(false);
+  const [hideEmpty, setHideEmpty] = useState(false);
 
   function update(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
 
   // View modes: just show what's at the location, no form
   if (isView) {
     const loc = action === "view_shop" ? shopLocations[modal.location] : truckLocations[modal.location];
-    const productRows = loc ? Object.values(loc.products) : [];
+    let productRows = loc ? Object.values(loc.products) : [];
+    // Shops always show the FULL Settings catalog so every shop lines up with
+    // Settings → Products. Catalog products with no inventory row at this shop
+    // appear as quantity 0 (synthetic rows with id: null).
+    const isShopView = action === "view_shop";
+    if (isShopView) {
+      const have = new Set(productRows.map(r => r.product_id));
+      for (const p of (products || []).filter(p => p.active)) {
+        if (!have.has(p.id)) {
+          productRows.push({ id: null, product_id: p.id, product: p, quantity: 0, reorder_threshold: null });
+        }
+      }
+    }
     productRows.sort((a, b) => (a.product?.name || "").localeCompare(b.product?.name || ""));
+    const inStockRows = productRows.filter(r => r.quantity > 0);
+    const shownRows = isShopView && hideEmpty ? inStockRows : productRows;
     const canEdit = ["super_admin","manager","lead"].includes(user.access_level);
     const belowThresh = productRows.filter(r => r.reorder_threshold != null && r.quantity <= r.reorder_threshold);
-    async function updateThreshold(rowId, newValue) {
+    async function updateThreshold(row, newValue) {
       try {
         const v = newValue === "" ? null : parseInt(newValue, 10);
         if (newValue !== "" && (isNaN(v) || v < 0)) { showToast("Threshold must be a positive number", "error"); return; }
-        await sbPatch("inventory", rowId, { reorder_threshold: v });
-        onSaved();
+        if (row.id) {
+          await sbPatch("inventory", row.id, { reorder_threshold: v });
+        } else {
+          // Catalog product with no inventory row at this shop yet — create it at qty 0
+          await sbPost("inventory", {
+            product_id: row.product_id,
+            location_type: "shop",
+            location_id: modal.location,
+            quantity: 0,
+            reorder_threshold: v
+          });
+        }
+        showToast("Reorder threshold saved");
+        (onRefresh || onSaved)();
       } catch (err) { showToast("Error: " + (err.message || err), "error"); }
     }
     return (
@@ -3310,24 +3342,35 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, employe
             <div>
               <div className="modal-title">{action === "view_shop" ? "🏪" : "🚛"} {modal.label}</div>
               <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
-                {productRows.length} SKUs · {loc?.items || 0} items · ${(loc?.value || 0).toFixed(2)} value
+                {isShopView
+                  ? `${inStockRows.length} of ${productRows.length} catalog products in stock · ${loc?.items || 0} items · $${(loc?.value || 0).toFixed(2)} value`
+                  : `${productRows.length} SKUs · ${loc?.items || 0} items · $${(loc?.value || 0).toFixed(2)} value`}
                 {belowThresh.length > 0 && <span style={{color:"#F59E0B",marginLeft:8}}>· ⚠ {belowThresh.length} below reorder threshold</span>}
               </div>
             </div>
             <div className="modal-close" onClick={onClose}>✕</div>
           </div>
           <div className="modal-body">
-            {productRows.length === 0 ? (
+            {isShopView && (
+              <label style={{display:"flex",gap:7,alignItems:"center",fontSize:12,color:"#8A95A8",marginBottom:8,cursor:"pointer"}}>
+                <input type="checkbox" checked={hideEmpty}
+                  onChange={e => setHideEmpty(e.target.checked)} />
+                Hide out-of-stock products
+              </label>
+            )}
+            {shownRows.length === 0 ? (
               <div className="empty-state">No inventory at this location</div>
             ) : (
               <div className="table-wrap">
                 <table>
                   <thead><tr><th>Product</th><th>Category</th><th>Qty</th><th>Reorder at</th><th>Value</th></tr></thead>
                   <tbody>
-                    {productRows.map(r => {
+                    {shownRows.map(r => {
                       const below = r.reorder_threshold != null && r.quantity <= r.reorder_threshold;
+                      const empty = r.quantity <= 0;
                       return (
-                        <tr key={r.id} style={below ? {background:"rgba(245,158,11,0.05)"} : {}}>
+                        <tr key={r.id || "cat-" + r.product_id}
+                          style={below ? {background:"rgba(245,158,11,0.05)"} : empty ? {opacity:0.55} : {}}>
                           <td><strong>{r.product?.name || "—"}</strong>{below && <span style={{color:"#F59E0B",fontSize:10,marginLeft:6}}>⚠ reorder</span>}</td>
                           <td><Badge color="gray">{r.product?.category || "—"}</Badge></td>
                           <td style={{fontFamily:"monospace"}}>{r.quantity} {r.product?.unit_of_measure || ""}</td>
@@ -3337,7 +3380,7 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, employe
                                 onBlur={(e) => {
                                   const newVal = e.target.value;
                                   const oldVal = r.reorder_threshold == null ? "" : String(r.reorder_threshold);
-                                  if (newVal !== oldVal) updateThreshold(r.id, newVal);
+                                  if (newVal !== oldVal) updateThreshold(r, newVal);
                                 }}
                                 placeholder="—"
                                 style={{width:60,padding:"3px 6px",background:"#0F1623",border:"1px solid #2A3348",borderRadius:4,color:"#E8EDF5",fontFamily:"monospace",textAlign:"center",fontSize:12}} />
