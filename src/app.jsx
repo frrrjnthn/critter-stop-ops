@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 
 // ── Supabase client (no package needed — direct REST calls) ───────────────────
 const SUPABASE_URL = "https://gxshnagrbipphhktijkb.supabase.co";
@@ -349,6 +349,25 @@ function Badge({ color = "gray", children }) {
 }
 function Btn({ variant = "ghost", onClick, children, style, disabled }) {
   return <button className={"btn btn-" + variant} onClick={onClick} style={style} disabled={disabled}>{children}</button>;
+}
+// Small error boundary so a crash in one section (like Reports) shows an actual
+// message instead of a blank page, making bugs diagnosable from the field.
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error("[ErrorBoundary:" + (this.props.label || "?") + "]", error, info); }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{padding:14,background:"rgba(239,68,68,0.08)",border:"1px solid #EF4444",borderRadius:8,color:"#EF4444",fontSize:13}}>
+          <div style={{fontWeight:700,marginBottom:6}}>Something broke in {this.props.label || "this section"}.</div>
+          <div style={{fontFamily:"monospace",fontSize:12,whiteSpace:"pre-wrap"}}>{String(this.state.error?.message || this.state.error)}</div>
+          <div style={{marginTop:8}}><Btn onClick={() => this.setState({ error: null })}>Try again</Btn></div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 function BranchBar({ value, onChange, disabled }) {
   return (
@@ -1974,7 +1993,9 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
       )}
 
       {tab === "reports" && (
-        <InventoryReports user={user} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />
+        <ErrorBoundary label="Reports">
+          <InventoryReports user={user} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />
+        </ErrorBoundary>
       )}
 
       {moveModal && (
@@ -2967,7 +2988,8 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
     try {
       const data = await sb("inventory_transactions",
         `?select=*,product:products(name,category,unit_cost,unit_of_measure),employee:employees(name,branch,department)&created_at=gte.${periodStart}T00:00:00&created_at=lte.${periodEnd}T23:59:59&order=created_at.desc`);
-      setHistory(data);
+      console.log("[reports] loaded " + (data?.length ?? 0) + " transactions for " + periodStart + " → " + periodEnd);
+      setHistory(Array.isArray(data) ? data : []);
     } catch (err) { showToast("Error loading reports: " + (err.message || err), "error"); }
     setLoading(false);
   }
@@ -2986,8 +3008,8 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
   for (const tx of usageTx) {
     const pid = tx.product_id;
     if (!byProduct[pid]) byProduct[pid] = { product: tx.product, qty: 0, cost: 0 };
-    byProduct[pid].qty += (tx.quantity || 0);
-    byProduct[pid].cost += (tx.quantity || 0) * (tx.product?.unit_cost || 0);
+    byProduct[pid].qty += (Number(tx.quantity) || 0);
+    byProduct[pid].cost += (Number(tx.quantity) || 0) * (Number(tx.product?.unit_cost) || 0);
   }
   const byProductRows = Object.entries(byProduct).map(([pid, v]) => ({ product_id: pid, ...v }));
   byProductRows.sort((a, b) => b.cost - a.cost);
@@ -3000,8 +3022,8 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
     const eid = tx.employee_id;
     if (!byTech[eid]) byTech[eid] = { employee: tx.employee, count: 0, qty: 0, cost: 0 };
     byTech[eid].count += 1;
-    byTech[eid].qty += (tx.quantity || 0);
-    byTech[eid].cost += (tx.quantity || 0) * (tx.product?.unit_cost || 0);
+    byTech[eid].qty += (Number(tx.quantity) || 0);
+    byTech[eid].cost += (Number(tx.quantity) || 0) * (Number(tx.product?.unit_cost) || 0);
   }
   const byTechRows = Object.entries(byTech).map(([eid, v]) => ({ employee_id: eid, ...v }));
   byTechRows.sort((a, b) => b.cost - a.cost);
@@ -3013,8 +3035,8 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
     const v = tx.vendor || "(no vendor)";
     if (!byVendor[v]) byVendor[v] = { vendor: v, count: 0, qty: 0, cost: 0 };
     byVendor[v].count += 1;
-    byVendor[v].qty += (tx.quantity || 0);
-    byVendor[v].cost += parseFloat(tx.total_cost) || 0;
+    byVendor[v].qty += (Number(tx.quantity) || 0);
+    byVendor[v].cost += (Number(tx.total_cost) || 0);
   }
   const byVendorRows = Object.values(byVendor).sort((a, b) => b.cost - a.cost);
   const sortByVendor = useSortableData(byVendorRows, "cost", "desc");
@@ -7346,6 +7368,883 @@ function CompanyDocsPage({ user, showToast }) {
   );
 }
 
+// ── Resources (SOPs & Training) ───────────────────────────────────────────────
+const RESOURCE_CATEGORIES = [
+  { value: "SOP",          icon: "📋", color: "#22C55E" },
+  { value: "Training",     icon: "🎓", color: "#3B82F6" },
+  { value: "Policy",       icon: "📜", color: "#A855F7" },
+  { value: "Safety",       icon: "🦺", color: "#EF4444" },
+  { value: "Product Info", icon: "🧪", color: "#F59E0B" },
+  { value: "Reference",    icon: "📖", color: "#14B8A6" },
+  { value: "Other",        icon: "📎", color: "#8A95A8" },
+];
+
+function ResourcesPage({ user, showToast }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [q, setQ] = useState("");
+  const [catFilter, setCatFilter] = useState("All");
+  const [modal, setModal] = useState(null); // null | {mode:"add"} | {mode:"edit", item}
+
+  const canManage = user.access_level === "super_admin";
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await sb("resources", "?select=*&order=created_at.desc");
+      setItems(Array.isArray(data) ? data : []);
+    } catch (err) { showToast("Error loading resources: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, []); // eslint-disable-line
+
+  async function openItem(item) {
+    try {
+      if (item.content_type === "link") { window.open(item.url, "_blank"); return; }
+      const url = await sbStorageSignedUrl("resources", item.storage_path, 60);
+      window.open(url, "_blank");
+    } catch (err) { showToast("Open failed: " + (err.message || err), "error"); }
+  }
+
+  async function handleDelete(item) {
+    if (!window.confirm(`Delete "${item.title}"? This cannot be undone.`)) return;
+    try {
+      if (item.content_type === "file" && item.storage_path) {
+        try { await sbStorageDelete("resources", item.storage_path); } catch (e) { /* storage row may already be gone */ }
+      }
+      await sbDelete("resources", item.id);
+      showToast("Resource deleted");
+      load();
+    } catch (err) { showToast("Delete failed: " + (err.message || err), "error"); }
+  }
+
+  const filtered = items.filter(it => {
+    if (catFilter !== "All" && it.category !== catFilter) return false;
+    if (!q) return true;
+    const hay = [it.title, it.description, it.tags, it.department].filter(Boolean).join(" ").toLowerCase();
+    return hay.includes(q.toLowerCase());
+  });
+  const byCat = {};
+  for (const c of RESOURCE_CATEGORIES) byCat[c.value] = filtered.filter(it => it.category === c.value);
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        📚 SOPs, training links, and reference material for the whole team. {canManage ? "You can add, edit, and delete resources." : "View-only — contact Jon to add or change resources."}
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+        <div style={{flex:1,minWidth:200,display:"flex",alignItems:"center",gap:8,background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,padding:"6px 11px"}}>
+          <span style={{color:"#4A5568"}}>⌕</span>
+          <input style={{background:"none",border:"none",outline:"none",color:"#E8EDF5",fontSize:13,flex:1,fontFamily:"DM Sans,sans-serif"}} placeholder="Search title, description, tags..." value={q} onChange={e=>setQ(e.target.value)} />
+        </div>
+        {canManage && <Btn variant="primary" onClick={() => setModal({ mode: "add" })}>+ Add resource</Btn>}
+      </div>
+
+      <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap"}}>
+        {["All", ...RESOURCE_CATEGORIES.map(c=>c.value)].map(c => (
+          <button key={c} onClick={() => setCatFilter(c)}
+            style={{padding:"5px 11px",borderRadius:14,fontSize:12,cursor:"pointer",fontFamily:"DM Sans,sans-serif",
+              border:"1px solid " + (catFilter===c ? "#22C55E" : "#2A3348"),
+              background: catFilter===c ? "rgba(34,197,94,0.15)" : "transparent",
+              color: catFilter===c ? "#22C55E" : "#8A95A8"}}>
+            {c === "All" ? `All (${filtered.length})` : `${RESOURCE_CATEGORIES.find(x=>x.value===c)?.icon} ${c} (${items.filter(it=>it.category===c).length})`}
+          </button>
+        ))}
+      </div>
+
+      {loading ? (
+        <div style={{padding:"10px 0",fontSize:12,color:"#8A95A8"}}>Loading resources...</div>
+      ) : filtered.length === 0 ? (
+        <div style={{padding:"14px 0",fontSize:13,color:"#8A95A8",fontStyle:"italic"}}>
+          {items.length === 0 ? (canManage ? "No resources yet — add your first SOP or training link above." : "No resources yet.") : "Nothing matches your search."}
+        </div>
+      ) : (
+        RESOURCE_CATEGORIES.filter(c => byCat[c.value].length > 0).map(c => (
+          <div key={c.value} style={{marginBottom:18}}>
+            <div style={{fontSize:12,fontWeight:700,color:c.color,textTransform:"uppercase",letterSpacing:0.6,marginBottom:8}}>{c.icon} {c.value}</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10}}>
+              {byCat[c.value].map(it => (
+                <div key={it.id} style={{background:"#1E2535",border:"1px solid #2A3348",borderRadius:8,padding:12,display:"flex",flexDirection:"column",gap:6}}>
+                  <div style={{display:"flex",justifyContent:"space-between",gap:6,alignItems:"flex-start"}}>
+                    <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",lineHeight:1.35}}>{it.title}</div>
+                    <Badge color={it.content_type === "link" ? "blue" : "green"}>{it.content_type === "link" ? "Link" : "File"}</Badge>
+                  </div>
+                  {it.description && <div style={{fontSize:12,color:"#8A95A8",lineHeight:1.4}}>{it.description}</div>}
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                    {it.department && <Badge color={deptColor(it.department)}>{it.department}</Badge>}
+                    {it.tags && it.tags.split(",").map(t => t.trim()).filter(Boolean).slice(0,4).map(t => (
+                      <span key={t} style={{fontSize:10,color:"#8A95A8",background:"#141A28",border:"1px solid #2A3348",borderRadius:10,padding:"2px 8px"}}>{t}</span>
+                    ))}
+                  </div>
+                  <div style={{fontSize:10,color:"#4A5568",marginTop:2}}>Added by {it.adder_name || "—"}{it.created_at ? " · " + new Date(it.created_at).toLocaleDateString() : ""}</div>
+                  <div style={{display:"flex",gap:6,marginTop:4}}>
+                    <Btn style={{flex:1}} onClick={() => openItem(it)}>Open</Btn>
+                    {canManage && <Btn onClick={() => setModal({ mode: "edit", item: it })}>Edit</Btn>}
+                    {canManage && <Btn variant="red" onClick={() => handleDelete(it)}>Delete</Btn>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))
+      )}
+
+      {modal && (
+        <ResourceModal
+          mode={modal.mode}
+          item={modal.item}
+          user={user}
+          onClose={() => setModal(null)}
+          onSaved={() => { setModal(null); load(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function ResourceModal({ mode, item, user, onClose, onSaved, showToast }) {
+  const [form, setForm] = useState(() => ({
+    title: item?.title || "",
+    description: item?.description || "",
+    category: item?.category || "SOP",
+    department: item?.department || "",
+    tags: item?.tags || "",
+    content_type: item?.content_type || "file",
+    url: item?.url || "",
+  }));
+  const [file, setFile] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const update = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  function pickFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (f.size > 50 * 1024 * 1024) { showToast("File too large (50MB max)", "error"); e.target.value = ""; return; }
+    setFile(f);
+    if (!form.title) update("title", f.name.replace(/\.[^/.]+$/, ""));
+  }
+
+  async function save() {
+    if (!form.title.trim()) { showToast("Title is required", "error"); return; }
+    if (form.content_type === "link" && !form.url.trim()) { showToast("URL is required for a link", "error"); return; }
+    if (form.content_type === "file" && mode === "add" && !file) { showToast("Pick a file to upload", "error"); return; }
+    setSaving(true);
+    try {
+      const body = {
+        title: form.title.trim(),
+        description: form.description.trim() || null,
+        category: form.category,
+        department: form.department || null,
+        tags: form.tags.trim() || null,
+        content_type: form.content_type,
+        url: form.content_type === "link" ? form.url.trim() : null,
+      };
+      if (form.content_type === "file" && file) {
+        const safe = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const path = `resources/${Date.now()}-${safe}`;
+        await sbStorageUpload("resources", path, file);
+        body.file_name = file.name;
+        body.storage_path = path;
+        body.mime_type = file.type || null;
+        body.file_size = file.size;
+        if (mode === "edit" && item?.storage_path) {
+          try { await sbStorageDelete("resources", item.storage_path); } catch (e) { /* old file may be gone */ }
+        }
+      }
+      if (mode === "add") {
+        body.added_by = user.id;
+        body.adder_name = user.name;
+        await sbPost("resources", body);
+        showToast("Resource added");
+      } else {
+        await sbPatch("resources", item.id, body);
+        showToast("Resource updated");
+      }
+      onSaved();
+    } catch (err) { showToast("Save failed: " + (err.message || err), "error"); }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && !saving && onClose()}>
+      <div className="modal" style={{maxWidth:480}}>
+        <div className="modal-top">
+          <div className="modal-title">{mode === "add" ? "Add resource" : "Edit resource"}</div>
+          <div className="modal-close" onClick={() => !saving && onClose()}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Title *</label>
+            <input className="form-input" value={form.title} onChange={e => update("title", e.target.value)} placeholder="e.g. Trap Check SOP v3" autoFocus />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Description</label>
+            <textarea className="form-input" rows={2} value={form.description} onChange={e => update("description", e.target.value)} placeholder="What is this and when should the team use it?" />
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <div className="form-group" style={{flex:1}}>
+              <label className="form-label">Category</label>
+              <select className="form-input" value={form.category} onChange={e => update("category", e.target.value)}>
+                {RESOURCE_CATEGORIES.map(c => <option key={c.value} value={c.value}>{c.icon} {c.value}</option>)}
+              </select>
+            </div>
+            <div className="form-group" style={{flex:1}}>
+              <label className="form-label">Department (optional)</label>
+              <select className="form-input" value={form.department} onChange={e => update("department", e.target.value)}>
+                <option value="">All departments</option>
+                <option value="Pest">Pest</option>
+                <option value="Wildlife">Wildlife</option>
+                <option value="Insulation">Insulation</option>
+                <option value="Project Manager">Project Manager</option>
+                <option value="Office">Office</option>
+              </select>
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Tags (comma-separated, for search)</label>
+            <input className="form-input" value={form.tags} onChange={e => update("tags", e.target.value)} placeholder="e.g. rodent, exclusion, wildlife" />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Content type</label>
+            <div style={{display:"flex",gap:6}}>
+              {["file","link"].map(t => (
+                <button key={t} onClick={() => update("content_type", t)}
+                  style={{flex:1,padding:"7px 0",borderRadius:6,cursor:"pointer",fontSize:12,fontFamily:"DM Sans,sans-serif",
+                    border:"1px solid " + (form.content_type===t ? "#22C55E" : "#2A3348"),
+                    background: form.content_type===t ? "rgba(34,197,94,0.15)" : "transparent",
+                    color: form.content_type===t ? "#22C55E" : "#8A95A8"}}>
+                  {t === "file" ? "📄 Upload file" : "🔗 Paste a link"}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {form.content_type === "link" ? (
+            <div className="form-group">
+              <label className="form-label">URL *</label>
+              <input className="form-input" value={form.url} onChange={e => update("url", e.target.value)} placeholder="https://..." />
+            </div>
+          ) : (
+            <div className="form-group">
+              <label className="form-label">{mode === "edit" ? "Replace file (optional)" : "File * (50MB max)"}</label>
+              <input type="file" className="form-input" onChange={pickFile} />
+              {mode === "edit" && !file && item?.file_name && (
+                <div style={{fontSize:11,color:"#8A95A8",marginTop:4}}>Current: {item.file_name}</div>
+              )}
+              {file && <div style={{fontSize:11,color:"#22C55E",marginTop:4}}>{file.name} · {formatFileSize(file.size)}</div>}
+            </div>
+          )}
+
+          <div style={{display:"flex",gap:8,marginTop:6}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>{saving ? "Saving..." : (mode === "add" ? "Add" : "Save")}</Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Evaluations / Field Care Observations ────────────────────────────────────
+// Grading key mirrors the paper Field Care Observation Form:
+// 9-10 Mastery · 7-8 Skilled/Exemplary · 5-6 Unremarkable/Trained · 3-4 Novice/Needs Work · 1-2 Probationer/Red Flag(s)
+// Total average 6-10 = PASS, 1-5 = FAIL. Automatic fails override the average.
+const EVAL_KEY = "9-10: Mastery · 7-8: Skilled / Exemplary · 5-6: Unremarkable / Trained · 3-4: Novice / Needs Work · 1-2: Probationer / Red Flag(s) · Leave blank if N/A";
+
+const NONVERBAL_SECTION = { name: "Non-Verbal", items: ["Smile","Eye Contact","Pitch","Gestures","Body Movement","Sincere / Genuine","Dress & Grooming"] };
+
+const EVAL_RUBRICS = {
+  pest: {
+    label: "Pest Control",
+    icon: "🐜",
+    serviceTypeLabel: "Type of Service Observed",
+    serviceTypes: ["Q","BI","M","WTY","G","Other"],
+    sections: [
+      { name: "Safety", items: ["Driving","Product Application","Product Storage","Product Disposal","PPE"] },
+      { name: "Field Care", items: [
+        "Followed Steps in Order",
+        "De-web / Inspect for webs & nests",
+        "Inspect yard / Fill Bait Boxes / Dust Crack & Crevices",
+        "Granulate",
+        "Power-Spray: Eaves, Foundation, Concrete meets grass",
+        "Interior, with shoe covers (order may vary)",
+        "Paperwork (Door Hanging bag / envelope)",
+      ]},
+      NONVERBAL_SECTION,
+      { name: "Customer Care", items: [
+        "Introduction with Webster",
+        "Call Customer by Name",
+        "Explain what you are there to do - quote notes / instructions - Ask ?s",
+        "Share knowledge about seasonal pests",
+        "Time-Stamping",
+        "Review completed work",
+        "Set Appropriate Expectations",
+        "Ask for payment (if balance)",
+        "Ask 2 Questions",
+        "Warranty Reminder",
+        "Thank you",
+        "Written Notes / Comments / Instructions",
+      ]},
+      { name: "Small Gestures", items: ["Small Gestures"] },
+    ],
+    autoFail: "Violation of Law",
+  },
+  trap_check: {
+    label: "Trap Check",
+    icon: "🪤",
+    serviceTypeLabel: "Type of Trap Check Observed",
+    serviceTypes: ["TC #1","TC #2","TC #3","Additional","Call Back","Collect Traps","Collect & Fog","Other"],
+    sections: [
+      { name: "Safety", items: [
+        "Driving",
+        "Ladder Set Up (1 ft out per 4 ft up, off gutters)",
+        "Harnessed on High or Steep Roofs",
+        "Tile Roof: Bottom 1/3 of Tile Only",
+        "Attic: 3 Points of Contact, Joists Only",
+        "No Music in Attic",
+        "PPE (mask, gloves, headlamp, laced shoes)",
+      ]},
+      { name: "Trap Check", items: [
+        "Reviewed Job Notes & Invoice Beforehand",
+        "Checked Trail Cameras First (if present)",
+        "Interior Work Done First",
+        "Asked About Noises Since Last Visit",
+        "Traps Checked / Reset / Rebaited",
+        "Verified Every Home Feature on Invoice",
+        "Inspected All Roof Returns (incl. 2nd story)",
+        "Searched & Sealed Fascia Gaps / Spot Work",
+        "Checked Drip Edge & Builder's Gap",
+        "Hardware Cloth Used (not silicone alone)",
+        "Close-Out Criteria Verified (all 3)",
+        "Entry Point Photo Sent to SM & Chisam",
+        "Fog Duration Correct (15 min / 20 min if >1,500 sq ft)",
+        "FieldPulse Trap Check Form Completed",
+      ]},
+      NONVERBAL_SECTION,
+      { name: "Customer Care", items: [
+        "ETA Text Sent ~20-30 Min Out",
+        "Delay Communicated Early (if running late)",
+        "Introduced Self / Confirmed Customer Name",
+        "Explained Interior-First Plan",
+        "Announced Move to Exterior Work",
+        "Set Appropriate Expectations",
+        "Explained What Was Found & Next Steps",
+        "Reviewed Completed Work with Customer",
+        "Warranty / Annual Inspection Reminder",
+        "Balance Collected or Payment Link Explained",
+        "Thank You",
+        "Written Notes / Comments in FieldPulse",
+      ]},
+    ],
+    autoFail: "Violation of Law · Closed out a customer with an animal caught, noises still reported, or an unsealed entry point · Gave up searching before the entry point was found",
+  },
+  exclusion: {
+    label: "Exclusion",
+    icon: "🏠",
+    serviceTypeLabel: "Type of Exclusion Observed",
+    serviceTypes: ["Full Exclusion","Partial / Spot Work","Call Back","Annual Inspection","Other"],
+    sections: [
+      { name: "Safety", items: [
+        "Driving",
+        "Ladder Set Up (1 ft out per 4 ft up, off gutters)",
+        "Harnessed on High or Steep Roofs",
+        "Tile Roof: Bottom 1/3 of Tile Only",
+        "Attic: 3 Points of Contact, Joists Only",
+        "No Music in Attic",
+        "Staple Gun (Not Screws) for Attic Vent Sealing",
+        "Roofing Screws Water-Sealed / No Screws in Metal Roof",
+        "PPE (mask, gloves, laced shoes)",
+      ]},
+      { name: "Exclusion Work", items: [
+        "Reviewed Job Notes & Invoice Beforehand",
+        "Materials Prepped (ridge vent guard, sheet metal, etc.)",
+        "Traps Baited in Attic (10-20, at least 4 of each type)",
+        "Gable / Attic Vents Sealed From Inside First",
+        "One-Way Door Installed When Criteria Met",
+        "One-Way Door Secure, No Gaps at Exit",
+        "Hardware Cloth on Features That Breathe",
+        "Roof Returns: Sheet Metal With Lip, All 3 Boards",
+        "Metal Tucked Behind Drip Edge / Trim",
+        "Anything Finger-Sized Sealed (dime rule)",
+        "Silicone Never Used Alone on Rodent-Sized Gaps",
+        "Fascia Gaps / Spot Work Found & Sealed",
+        "Paint Match Obtained & Applied",
+      ]},
+      NONVERBAL_SECTION,
+      { name: "Customer Care", items: [
+        "ETA Text Sent ~20-30 Min Out",
+        "Delay Communicated Early (if running late)",
+        "Introduced Self / Confirmed Customer Name",
+        "Asked About Exterior Paint / Paint Match",
+        "Did Not Overpromise Off-Invoice Work",
+        "Set Appropriate Expectations",
+        "Paint Sample Left Inside Garage Door",
+        "Walk-Through Offered & Completed",
+        "Explained Trap Check Expectations",
+        "Guarantee / Warranty Explained",
+        "Garage Door Closed on Departure",
+        "Site Left Clean / Home Better Than Found",
+        "Thank You",
+        "FieldPulse Exclusion Form Completed (newest team member)",
+      ]},
+    ],
+    autoFail: "Violation of Law · Sealed in an animal larger than a rat · Screwed from the attic cavity outward or into a metal roof · Left screws in a roof unsealed · Stepped through a ceiling",
+  },
+  insulation: {
+    label: "Insulation Removal / Install",
+    icon: "🧤",
+    serviceTypeLabel: "Type of Job Observed",
+    serviceTypes: ["Removal","Blow-In Fiberglass","Blow-In Cellulose","Radiant Barrier","Solar Attic Fan","Other"],
+    sections: [
+      { name: "Safety", items: [
+        "Driving with Trailer",
+        "Coupler Locked, Chains Crossed, Cable Plugged",
+        "Attic: 3 Points of Contact, Joists Only",
+        "No Music in Attic",
+        "Hose Never Dropped on Drywall Ceiling",
+        "PPE (respirator / mask, gloves, headlamp)",
+        "Shift Rotation & Hydration (30-45 min)",
+        "Gas Handling / Vacuum & Cannister Filled",
+      ]},
+      { name: "Set Up & Protection", items: [
+        "Trailer Capacity Confirmed Before Leaving",
+        "Full Load-Out Verified (bags, hoses, catch box)",
+        "Can Light Cover Material Packed",
+        "Pre-Work Ceiling Walk-Through Completed",
+        "Ceiling Photos Uploaded to FieldPulse",
+        "Garage Attic Entrance Used When Available",
+        "Hose Path Lined: Bags + Cardboard on Corners",
+        "Vacuum Set Up Outside (unless raining)",
+      ]},
+      { name: "Work Quality", items: [
+        "All Blown-In Insulation Removed (incl. eaves)",
+        "All Feces & Nesting Material Removed",
+        "Debris 3\"+ Hand-Removed Before Vacuuming",
+        "Clogs Diagnosed & Cleared Properly",
+        "Bags Filled Dense Before Swapping",
+        "Duct / Wiring / Water Damage Inspection Done",
+        "Chewed Wires Marked & Reported Immediately",
+        "Fog Duration Correct (15 min / 20 min if >1,500 sq ft)",
+        "Can Light Covers Installed Before Blow-In",
+        "Air Flow Spot Sealing Completed",
+        "Measurement Rulers Stapled Up",
+        "Correct Depth Blown (~13.5\" FG / ~10.5\" cellulose)",
+        "Blower Rental Receipt Kept for Refund",
+      ]},
+      NONVERBAL_SECTION,
+      { name: "Customer Care", items: [
+        "ETA Text Sent ~20-30 Min Out",
+        "Delay Communicated Early (if running late)",
+        "Introduced Self / Confirmed Customer Name",
+        "Ceiling Walk-Through Explained (protects both parties)",
+        "Trailer Overnight Permission Asked (if >2,000 sq ft)",
+        "Attic Photos Shown to Customer for Review",
+        "Set Appropriate Expectations",
+        "Site Left Clean",
+        "Thank You",
+        "FieldPulse Forms & Photos Completed",
+      ]},
+    ],
+    autoFail: "Violation of Law · Stepped through or damaged a ceiling · Screwed from the attic cavity outward",
+  },
+};
+
+function evalSectionAvg(scores, rubricType, sectionName) {
+  const rubric = EVAL_RUBRICS[rubricType];
+  const section = rubric?.sections.find(s => s.name === sectionName);
+  if (!section) return null;
+  const vals = section.items.map(it => Number(scores?.[sectionName + "::" + it])).filter(v => v >= 1 && v <= 10);
+  if (!vals.length) return null;
+  return vals.reduce((a, b) => a + b, 0) / vals.length;
+}
+function evalFinalScore(scores, rubricType) {
+  const rubric = EVAL_RUBRICS[rubricType];
+  if (!rubric) return null;
+  const avgs = rubric.sections.map(s => evalSectionAvg(scores, rubricType, s.name)).filter(v => v != null);
+  if (!avgs.length) return null;
+  return avgs.reduce((a, b) => a + b, 0) / avgs.length;
+}
+
+function EvaluationsPage({ user, employees, showToast }) {
+  const [evals, setEvals] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(null); // {mode:"new"} | {mode:"view", ev}
+  const [typeFilter, setTypeFilter] = useState("All");
+
+  const isManager = ["super_admin","manager","lead"].includes(user.access_level);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const params = isManager
+        ? "?select=*&order=eval_date.desc,created_at.desc"
+        : `?select=*&employee_id=eq.${user.id}&order=eval_date.desc,created_at.desc`;
+      const data = await sb("evaluations", params);
+      setEvals(Array.isArray(data) ? data : []);
+    } catch (err) { showToast("Error loading evaluations: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, []); // eslint-disable-line
+
+  async function handleDelete(ev) {
+    if (!window.confirm(`Delete this ${EVAL_RUBRICS[ev.rubric_type]?.label || ""} evaluation of ${ev.employee_name}? This cannot be undone.`)) return;
+    try { await sbDelete("evaluations", ev.id); showToast("Evaluation deleted"); load(); }
+    catch (err) { showToast("Delete failed: " + (err.message || err), "error"); }
+  }
+
+  function downloadCSV() {
+    const header = ["Date","Employee","Rubric","Service Type","Evaluator","Final Score","Result","Auto Fail","Address","Progress on Goals","New Goals","Highpoints"];
+    const rows = filtered.map(ev => [
+      ev.eval_date || "", ev.employee_name || "", EVAL_RUBRICS[ev.rubric_type]?.label || ev.rubric_type,
+      ev.service_type || "", ev.evaluator_name || "",
+      ev.final_score != null ? Number(ev.final_score).toFixed(2) : "",
+      ev.result || "", ev.auto_fail ? "YES" : "", ev.address || "",
+      ev.progress_goals || "", ev.new_goals || "", ev.highpoints || "",
+    ]);
+    const csv = [header, ...rows].map(r => r.map(csvEscape).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `evaluations_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  const filtered = evals.filter(ev => typeFilter === "All" || ev.rubric_type === typeFilter);
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        ✍️ Field Care observations & evaluations. {isManager ? "Managers and leads can score technicians against the same rubrics as the paper forms." : "You can view evaluations completed on you."}
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",flex:1}}>
+          {["All", ...Object.keys(EVAL_RUBRICS)].map(t => (
+            <button key={t} onClick={() => setTypeFilter(t)}
+              style={{padding:"5px 11px",borderRadius:14,fontSize:12,cursor:"pointer",fontFamily:"DM Sans,sans-serif",
+                border:"1px solid " + (typeFilter===t ? "#22C55E" : "#2A3348"),
+                background: typeFilter===t ? "rgba(34,197,94,0.15)" : "transparent",
+                color: typeFilter===t ? "#22C55E" : "#8A95A8"}}>
+              {t === "All" ? `All (${evals.length})` : `${EVAL_RUBRICS[t].icon} ${EVAL_RUBRICS[t].label} (${evals.filter(e=>e.rubric_type===t).length})`}
+            </button>
+          ))}
+        </div>
+        {isManager && <Btn onClick={downloadCSV}>↓ CSV</Btn>}
+        {isManager && <Btn variant="primary" onClick={() => setModal({ mode: "new" })}>+ New evaluation</Btn>}
+      </div>
+
+      {loading ? (
+        <div style={{padding:"10px 0",fontSize:12,color:"#8A95A8"}}>Loading evaluations...</div>
+      ) : filtered.length === 0 ? (
+        <div style={{padding:"14px 0",fontSize:13,color:"#8A95A8",fontStyle:"italic"}}>No evaluations yet.</div>
+      ) : (
+        <div style={{overflowX:"auto"}}>
+          <table className="table">
+            <thead><tr>
+              <th>Date</th><th>Employee</th><th className="mobile-hide">Rubric</th><th className="mobile-hide">Evaluator</th><th>Score</th><th>Result</th><th></th>
+            </tr></thead>
+            <tbody>
+              {filtered.map(ev => (
+                <tr key={ev.id}>
+                  <td style={{whiteSpace:"nowrap"}}>{ev.eval_date || "—"}</td>
+                  <td>{ev.employee_name}</td>
+                  <td className="mobile-hide">{EVAL_RUBRICS[ev.rubric_type]?.icon} {EVAL_RUBRICS[ev.rubric_type]?.label || ev.rubric_type}</td>
+                  <td className="mobile-hide">{ev.evaluator_name || "—"}</td>
+                  <td style={{fontWeight:700}}>{ev.final_score != null ? Number(ev.final_score).toFixed(1) : "—"}</td>
+                  <td>
+                    <Badge color={ev.result === "PASS" ? "green" : "red"}>{ev.result}{ev.auto_fail ? " · AUTO" : ""}</Badge>
+                  </td>
+                  <td>
+                    <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
+                      <Btn onClick={() => setModal({ mode: "view", ev })}>View</Btn>
+                      {user.access_level === "super_admin" && <Btn variant="red" onClick={() => handleDelete(ev)}>Delete</Btn>}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {modal?.mode === "new" && (
+        <NewEvaluationModal user={user} employees={employees} onClose={() => setModal(null)}
+          onSaved={() => { setModal(null); load(); }} showToast={showToast} />
+      )}
+      {modal?.mode === "view" && (
+        <EvaluationDetailModal ev={modal.ev} onClose={() => setModal(null)} />
+      )}
+    </div>
+  );
+}
+
+function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
+  const [rubricType, setRubricType] = useState("pest");
+  const [form, setForm] = useState({
+    employee_id: "", eval_date: new Date().toISOString().slice(0,10),
+    service_type: "", address: "", start_time: "", end_time: "",
+    progress_goals: "", new_goals: "", highpoints: "",
+    employee_signature: "", manager_signature: user.name || "",
+    auto_fail: false, auto_fail_reason: "",
+  });
+  const [scores, setScores] = useState({});
+  const [saving, setSaving] = useState(false);
+  const update = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const rubric = EVAL_RUBRICS[rubricType];
+
+  const activeEmployees = (employees || []).filter(e => e.status !== "inactive").sort((a,b) => (a.name||"").localeCompare(b.name||""));
+
+  const finalScore = evalFinalScore(scores, rubricType);
+  const result = form.auto_fail ? "FAIL" : finalScore == null ? null : (finalScore >= 6 ? "PASS" : "FAIL");
+
+  function setScore(section, item, v) {
+    const key = section + "::" + item;
+    setScores(s => {
+      const next = { ...s };
+      if (v === "") delete next[key]; else next[key] = Number(v);
+      return next;
+    });
+  }
+
+  async function save() {
+    if (!form.employee_id) { showToast("Pick who you observed", "error"); return; }
+    if (finalScore == null && !form.auto_fail) { showToast("Score at least one item (or mark an automatic fail)", "error"); return; }
+    setSaving(true);
+    try {
+      const emp = activeEmployees.find(e => String(e.id) === String(form.employee_id));
+      const sectionAvgs = {};
+      for (const s of rubric.sections) {
+        const avg = evalSectionAvg(scores, rubricType, s.name);
+        if (avg != null) sectionAvgs[s.name] = Math.round(avg * 100) / 100;
+      }
+      await sbPost("evaluations", {
+        employee_id: form.employee_id,
+        employee_name: emp?.name || "",
+        evaluator_id: user.id,
+        evaluator_name: user.name,
+        rubric_type: rubricType,
+        service_type: form.service_type || null,
+        address: form.address || null,
+        eval_date: form.eval_date,
+        start_time: form.start_time || null,
+        end_time: form.end_time || null,
+        scores,
+        section_averages: sectionAvgs,
+        final_score: finalScore != null ? Math.round(finalScore * 100) / 100 : null,
+        result,
+        auto_fail: form.auto_fail,
+        auto_fail_reason: form.auto_fail ? (form.auto_fail_reason || null) : null,
+        progress_goals: form.progress_goals || null,
+        new_goals: form.new_goals || null,
+        highpoints: form.highpoints || null,
+        employee_signature: form.employee_signature || null,
+        manager_signature: form.manager_signature || null,
+      });
+      showToast("Evaluation saved");
+      onSaved();
+    } catch (err) { showToast("Save failed: " + (err.message || err), "error"); }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && !saving && onClose()}>
+      <div className="modal" style={{maxWidth:640,maxHeight:"92vh",overflowY:"auto"}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">New Field Care Observation</div>
+            <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>{EVAL_KEY}</div>
+          </div>
+          <div className="modal-close" onClick={() => !saving && onClose()}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Rubric</label>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {Object.entries(EVAL_RUBRICS).map(([k, r]) => (
+                <button key={k} onClick={() => { setRubricType(k); setScores({}); update("service_type",""); }}
+                  style={{flex:"1 1 40%",padding:"8px 0",borderRadius:6,cursor:"pointer",fontSize:12,fontFamily:"DM Sans,sans-serif",
+                    border:"1px solid " + (rubricType===k ? "#22C55E" : "#2A3348"),
+                    background: rubricType===k ? "rgba(34,197,94,0.15)" : "transparent",
+                    color: rubricType===k ? "#22C55E" : "#8A95A8"}}>
+                  {r.icon} {r.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <div className="form-group" style={{flex:"1 1 45%"}}>
+              <label className="form-label">Expert (person observed) *</label>
+              <select className="form-input" value={form.employee_id} onChange={e => update("employee_id", e.target.value)}>
+                <option value="">Select...</option>
+                {activeEmployees.map(e => <option key={e.id} value={e.id}>{e.name}{e.branch ? " · " + e.branch : ""}</option>)}
+              </select>
+            </div>
+            <div className="form-group" style={{flex:"1 1 45%"}}>
+              <label className="form-label">Date</label>
+              <input type="date" className="form-input" value={form.eval_date} onChange={e => update("eval_date", e.target.value)} />
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <div className="form-group" style={{flex:"1 1 45%"}}>
+              <label className="form-label">{rubric.serviceTypeLabel}</label>
+              <select className="form-input" value={form.service_type} onChange={e => update("service_type", e.target.value)}>
+                <option value="">Select...</option>
+                {rubric.serviceTypes.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div className="form-group" style={{flex:"1 1 45%"}}>
+              <label className="form-label">Address</label>
+              <input className="form-input" value={form.address} onChange={e => update("address", e.target.value)} placeholder="Job address" />
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <div className="form-group" style={{flex:1}}>
+              <label className="form-label">Service start</label>
+              <input type="time" className="form-input" value={form.start_time} onChange={e => update("start_time", e.target.value)} />
+            </div>
+            <div className="form-group" style={{flex:1}}>
+              <label className="form-label">Service end</label>
+              <input type="time" className="form-input" value={form.end_time} onChange={e => update("end_time", e.target.value)} />
+            </div>
+          </div>
+
+          {rubric.sections.map(section => {
+            const avg = evalSectionAvg(scores, rubricType, section.name);
+            return (
+              <div key={section.name} style={{marginTop:12,border:"1px solid #2A3348",borderRadius:8,overflow:"hidden"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 11px",background:"#141A28"}}>
+                  <div style={{fontSize:12,fontWeight:700,color:"#E8EDF5",textTransform:"uppercase",letterSpacing:0.5}}>{section.name}</div>
+                  <div style={{fontSize:12,fontWeight:700,color: avg == null ? "#4A5568" : avg >= 6 ? "#22C55E" : "#EF4444"}}>
+                    {section.name} avg: {avg == null ? "—" : avg.toFixed(1)}
+                  </div>
+                </div>
+                {section.items.map(item => (
+                  <div key={item} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,padding:"6px 11px",borderTop:"1px solid #1E2535"}}>
+                    <div style={{fontSize:12,color:"#C6CEDC",flex:1,lineHeight:1.35}}>{item}</div>
+                    <select className="form-input" style={{width:76,padding:"4px 6px",fontSize:12}}
+                      value={scores[section.name + "::" + item] ?? ""}
+                      onChange={e => setScore(section.name, item, e.target.value)}>
+                      <option value="">N/A</option>
+                      {[10,9,8,7,6,5,4,3,2,1].map(n => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+
+          <div style={{marginTop:14,padding:"10px 12px",borderRadius:8,border:"1px solid " + (result === "PASS" ? "#22C55E" : result === "FAIL" ? "#EF4444" : "#2A3348"),
+            background: result === "PASS" ? "rgba(34,197,94,0.08)" : result === "FAIL" ? "rgba(239,68,68,0.08)" : "transparent",
+            display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{fontSize:12,color:"#8A95A8"}}>Final Average Score <span style={{fontSize:10}}>(6-10 PASS · 1-5 FAIL)</span></div>
+            <div style={{fontSize:18,fontWeight:800,color: result === "PASS" ? "#22C55E" : result === "FAIL" ? "#EF4444" : "#8A95A8"}}>
+              {finalScore == null ? "—" : finalScore.toFixed(2)} {result ? "· " + result : ""}
+            </div>
+          </div>
+
+          <div className="form-group" style={{marginTop:10}}>
+            <label style={{display:"flex",gap:8,alignItems:"flex-start",cursor:"pointer",fontSize:12,color:"#EF4444"}}>
+              <input type="checkbox" checked={form.auto_fail} onChange={e => update("auto_fail", e.target.checked)} style={{marginTop:2}} />
+              <span><b>AUTOMATIC FAIL</b> — {rubric.autoFail}</span>
+            </label>
+            {form.auto_fail && (
+              <input className="form-input" style={{marginTop:6}} value={form.auto_fail_reason}
+                onChange={e => update("auto_fail_reason", e.target.value)} placeholder="What happened?" />
+            )}
+          </div>
+
+          <div className="form-group"><label className="form-label">Progress on Goals</label>
+            <textarea className="form-input" rows={2} value={form.progress_goals} onChange={e => update("progress_goals", e.target.value)} /></div>
+          <div className="form-group"><label className="form-label">New Goals</label>
+            <textarea className="form-input" rows={2} value={form.new_goals} onChange={e => update("new_goals", e.target.value)} /></div>
+          <div className="form-group"><label className="form-label">Highpoints Observed</label>
+            <textarea className="form-input" rows={2} value={form.highpoints} onChange={e => update("highpoints", e.target.value)} /></div>
+
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <div className="form-group" style={{flex:1}}>
+              <label className="form-label">Employee signature (type name)</label>
+              <input className="form-input" value={form.employee_signature} onChange={e => update("employee_signature", e.target.value)} />
+            </div>
+            <div className="form-group" style={{flex:1}}>
+              <label className="form-label">Field Care Manager signature</label>
+              <input className="form-input" value={form.manager_signature} onChange={e => update("manager_signature", e.target.value)} />
+            </div>
+          </div>
+
+          <div style={{display:"flex",gap:8,marginTop:6}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>{saving ? "Saving..." : "Save evaluation"}</Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EvaluationDetailModal({ ev, onClose }) {
+  const rubric = EVAL_RUBRICS[ev.rubric_type];
+  const scores = ev.scores || {};
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:600,maxHeight:"92vh",overflowY:"auto"}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">{rubric?.icon} {rubric?.label || ev.rubric_type} · {ev.employee_name}</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+              {ev.eval_date} · Observed by {ev.evaluator_name || "—"}{ev.service_type ? " · " + ev.service_type : ""}{ev.address ? " · " + ev.address : ""}
+            </div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div style={{marginBottom:12,padding:"10px 12px",borderRadius:8,
+            border:"1px solid " + (ev.result === "PASS" ? "#22C55E" : "#EF4444"),
+            background: ev.result === "PASS" ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)",
+            display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{fontSize:12,color:"#8A95A8"}}>Final Average Score</div>
+            <div style={{fontSize:18,fontWeight:800,color: ev.result === "PASS" ? "#22C55E" : "#EF4444"}}>
+              {ev.final_score != null ? Number(ev.final_score).toFixed(2) : "—"} · {ev.result}{ev.auto_fail ? " (AUTOMATIC)" : ""}
+            </div>
+          </div>
+          {ev.auto_fail && ev.auto_fail_reason && (
+            <div className="alert red" style={{marginBottom:12}}>Automatic fail: {ev.auto_fail_reason}</div>
+          )}
+          {(rubric?.sections || []).map(section => (
+            <div key={section.name} style={{marginBottom:12,border:"1px solid #2A3348",borderRadius:8,overflow:"hidden"}}>
+              <div style={{display:"flex",justifyContent:"space-between",padding:"7px 11px",background:"#141A28"}}>
+                <div style={{fontSize:12,fontWeight:700,color:"#E8EDF5",textTransform:"uppercase",letterSpacing:0.5}}>{section.name}</div>
+                <div style={{fontSize:12,fontWeight:700,color:"#8A95A8"}}>avg {ev.section_averages?.[section.name] != null ? Number(ev.section_averages[section.name]).toFixed(1) : "—"}</div>
+              </div>
+              {section.items.map(item => {
+                const v = scores[section.name + "::" + item];
+                return (
+                  <div key={item} style={{display:"flex",justifyContent:"space-between",gap:10,padding:"5px 11px",borderTop:"1px solid #1E2535"}}>
+                    <div style={{fontSize:12,color:"#C6CEDC",flex:1}}>{item}</div>
+                    <div style={{fontSize:12,fontWeight:700,minWidth:30,textAlign:"right",
+                      color: v == null ? "#4A5568" : v >= 6 ? "#22C55E" : "#EF4444"}}>{v ?? "N/A"}</div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+          {ev.progress_goals && <div style={{marginBottom:10}}><div className="form-label">Progress on Goals</div><div style={{fontSize:13,color:"#C6CEDC",whiteSpace:"pre-wrap"}}>{ev.progress_goals}</div></div>}
+          {ev.new_goals && <div style={{marginBottom:10}}><div className="form-label">New Goals</div><div style={{fontSize:13,color:"#C6CEDC",whiteSpace:"pre-wrap"}}>{ev.new_goals}</div></div>}
+          {ev.highpoints && <div style={{marginBottom:10}}><div className="form-label">Highpoints Observed</div><div style={{fontSize:13,color:"#C6CEDC",whiteSpace:"pre-wrap"}}>{ev.highpoints}</div></div>}
+          <div style={{display:"flex",gap:14,fontSize:12,color:"#8A95A8",marginTop:8}}>
+            <div>Employee: <b style={{color:"#E8EDF5"}}>{ev.employee_signature || "—"}</b></div>
+            <div>Manager: <b style={{color:"#E8EDF5"}}>{ev.manager_signature || "—"}</b></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Profile Modal ─────────────────────────────────────────────────────────────
 function ProfileModal({ person, trucks, creditCards, currentUser, onClose, onSaved, showToast, canEdit }) {
   const [editing, setEditing] = useState(false);
@@ -7629,7 +8528,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",truck_inventory:"Truck Inventory Count",equipment:"Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",truck_inventory:"Truck Inventory Count",equipment:"Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",resources:"Resources",evaluations:"Evaluations",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -7658,6 +8557,8 @@ export default function App() {
               {navItem("inspections","Inspections","✓")}
               {navItem("cards","Credit Cards","◆")}
               {navItem("documents","Documents","📁")}
+              {navItem("resources","Resources","📚")}
+              {navItem("evaluations","Evaluations","✍️")}
             </div>
             {isManager && <div className="sb-section"><div className="sb-section-label">Comms & Admin</div>{navItem("slack","Slack Alerts","◫")}{navItem("settings","Settings","⚙")}</div>}
             <div className="sb-footer">
@@ -7689,6 +8590,8 @@ export default function App() {
             {dataLoaded && page === "inspections" && <InspectionsPage user={currentUser} trucks={trucks} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "cards" && <CardsPage user={currentUser} employees={employees} showToast={showToast} />}
             {page === "documents" && <CompanyDocsPage user={currentUser} showToast={showToast} />}
+            {page === "resources" && <ResourcesPage user={currentUser} showToast={showToast} />}
+            {dataLoaded && page === "evaluations" && <EvaluationsPage user={currentUser} employees={employees} showToast={showToast} />}
             {page === "slack" && (
               <div className="table-wrap">
                 <div className="table-head"><span className="table-title">Slack integration</span><Btn variant="primary">Send alerts now</Btn></div>
