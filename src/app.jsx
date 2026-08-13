@@ -7699,7 +7699,7 @@ const EVAL_KEY = "9-10: Mastery · 7-8: Skilled / Exemplary · 5-6: Unremarkable
 
 const NONVERBAL_SECTION = { name: "Non-Verbal", items: ["Smile","Eye Contact","Pitch","Gestures","Body Movement","Sincere / Genuine","Dress & Grooming"] };
 
-const EVAL_RUBRICS = {
+const DEFAULT_EVAL_RUBRICS = {
   pest: {
     label: "Pest Control",
     icon: "🐜",
@@ -7895,29 +7895,63 @@ const EVAL_RUBRICS = {
   },
 };
 
-function evalSectionAvg(scores, rubricType, sectionName) {
-  const rubric = EVAL_RUBRICS[rubricType];
-  const section = rubric?.sections.find(s => s.name === sectionName);
+function evalSectionAvg(scores, rubric, sectionName) {
+  const section = rubric?.sections?.find(s => s.name === sectionName);
   if (!section) return null;
   const vals = section.items.map(it => Number(scores?.[sectionName + "::" + it])).filter(v => v >= 1 && v <= 10);
   if (!vals.length) return null;
   return vals.reduce((a, b) => a + b, 0) / vals.length;
 }
-function evalFinalScore(scores, rubricType) {
-  const rubric = EVAL_RUBRICS[rubricType];
+function evalFinalScore(scores, rubric) {
   if (!rubric) return null;
-  const avgs = rubric.sections.map(s => evalSectionAvg(scores, rubricType, s.name)).filter(v => v != null);
+  const avgs = (rubric.sections || []).map(s => evalSectionAvg(scores, rubric, s.name)).filter(v => v != null);
   if (!avgs.length) return null;
   return avgs.reduce((a, b) => a + b, 0) / avgs.length;
+}
+
+function rubricRowToDef(row) {
+  return {
+    label: row.label,
+    icon: row.icon || "📝",
+    serviceTypeLabel: row.service_type_label || "Type of Service Observed",
+    serviceTypes: Array.isArray(row.service_types) ? row.service_types : [],
+    sections: Array.isArray(row.sections) ? row.sections : [],
+    autoFail: row.auto_fail || "Violation of Law",
+    _rowId: row.id,
+    _active: row.active !== false,
+    _sortOrder: row.sort_order ?? 0,
+  };
 }
 
 function EvaluationsPage({ user, employees, showToast }) {
   const [evals, setEvals] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [modal, setModal] = useState(null); // {mode:"new"} | {mode:"view", ev}
+  const [modal, setModal] = useState(null); // {mode:"new"} | {mode:"view", ev} | {mode:"rubrics"}
   const [typeFilter, setTypeFilter] = useState("All");
+  const [rubrics, setRubrics] = useState(DEFAULT_EVAL_RUBRICS);
+  const [rubricsFromDb, setRubricsFromDb] = useState(false);
 
   const isManager = ["super_admin","manager","lead"].includes(user.access_level);
+
+  async function loadRubrics() {
+    try {
+      const rows = await sb("evaluation_rubrics", "?select=*&order=sort_order.asc,created_at.asc");
+      if (Array.isArray(rows) && rows.length > 0) {
+        const map = {};
+        for (const r of rows) map[r.rubric_key] = rubricRowToDef(r);
+        setRubrics(map);
+        setRubricsFromDb(true);
+      }
+    } catch (err) {
+      // Table missing or offline — fall back to the built-in defaults silently
+      console.log("[evaluations] using built-in rubrics:", err.message || err);
+    }
+  }
+
+  // Rubric used for DISPLAYING an eval: prefer the snapshot taken when it was
+  // scored, so editing a rubric never breaks how past evaluations render.
+  const rubricOf = (ev) => ev.rubric_snapshot || rubrics[ev.rubric_type] || DEFAULT_EVAL_RUBRICS[ev.rubric_type] || null;
+  const activeRubrics = Object.fromEntries(Object.entries(rubrics).filter(([_, r]) => r._active !== false));
 
   async function load() {
     setLoading(true);
@@ -7930,10 +7964,10 @@ function EvaluationsPage({ user, employees, showToast }) {
     } catch (err) { showToast("Error loading evaluations: " + (err.message || err), "error"); }
     setLoading(false);
   }
-  useEffect(() => { load(); }, []); // eslint-disable-line
+  useEffect(() => { load(); loadRubrics(); }, []); // eslint-disable-line
 
   async function handleDelete(ev) {
-    if (!window.confirm(`Delete this ${EVAL_RUBRICS[ev.rubric_type]?.label || ""} evaluation of ${ev.employee_name}? This cannot be undone.`)) return;
+    if (!window.confirm(`Delete this ${rubricOf(ev)?.label || ""} evaluation of ${ev.employee_name}? This cannot be undone.`)) return;
     try { await sbDelete("evaluations", ev.id); showToast("Evaluation deleted"); load(); }
     catch (err) { showToast("Delete failed: " + (err.message || err), "error"); }
   }
@@ -7941,7 +7975,7 @@ function EvaluationsPage({ user, employees, showToast }) {
   function downloadCSV() {
     const header = ["Date","Employee","Rubric","Service Type","Evaluator","Final Score","Result","Auto Fail","Address","Progress on Goals","New Goals","Highpoints"];
     const rows = filtered.map(ev => [
-      ev.eval_date || "", ev.employee_name || "", EVAL_RUBRICS[ev.rubric_type]?.label || ev.rubric_type,
+      ev.eval_date || "", ev.employee_name || "", rubricOf(ev)?.label || ev.rubric_type,
       ev.service_type || "", ev.evaluator_name || "",
       ev.final_score != null ? Number(ev.final_score).toFixed(2) : "",
       ev.result || "", ev.auto_fail ? "YES" : "", ev.address || "",
@@ -7966,16 +8000,17 @@ function EvaluationsPage({ user, employees, showToast }) {
 
       <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
         <div style={{display:"flex",gap:6,flexWrap:"wrap",flex:1}}>
-          {["All", ...Object.keys(EVAL_RUBRICS)].map(t => (
+          {["All", ...Object.keys(rubrics)].map(t => (
             <button key={t} onClick={() => setTypeFilter(t)}
               style={{padding:"5px 11px",borderRadius:14,fontSize:12,cursor:"pointer",fontFamily:"DM Sans,sans-serif",
                 border:"1px solid " + (typeFilter===t ? "#22C55E" : "#2A3348"),
                 background: typeFilter===t ? "rgba(34,197,94,0.15)" : "transparent",
                 color: typeFilter===t ? "#22C55E" : "#8A95A8"}}>
-              {t === "All" ? `All (${evals.length})` : `${EVAL_RUBRICS[t].icon} ${EVAL_RUBRICS[t].label} (${evals.filter(e=>e.rubric_type===t).length})`}
+              {t === "All" ? `All (${evals.length})` : `${rubrics[t]?.icon || ""} ${rubrics[t]?.label || t} (${evals.filter(e=>e.rubric_type===t).length})`}
             </button>
           ))}
         </div>
+        {user.access_level === "super_admin" && <Btn onClick={() => setModal({ mode: "rubrics" })}>⚙ Edit rubrics</Btn>}
         {isManager && <Btn onClick={downloadCSV}>↓ CSV</Btn>}
         {isManager && <Btn variant="primary" onClick={() => setModal({ mode: "new" })}>+ New evaluation</Btn>}
       </div>
@@ -7995,7 +8030,7 @@ function EvaluationsPage({ user, employees, showToast }) {
                 <tr key={ev.id}>
                   <td style={{whiteSpace:"nowrap"}}>{ev.eval_date || "—"}</td>
                   <td>{ev.employee_name}</td>
-                  <td className="mobile-hide">{EVAL_RUBRICS[ev.rubric_type]?.icon} {EVAL_RUBRICS[ev.rubric_type]?.label || ev.rubric_type}</td>
+                  <td className="mobile-hide">{rubricOf(ev)?.icon} {rubricOf(ev)?.label || ev.rubric_type}</td>
                   <td className="mobile-hide">{ev.evaluator_name || "—"}</td>
                   <td style={{fontWeight:700}}>{ev.final_score != null ? Number(ev.final_score).toFixed(1) : "—"}</td>
                   <td>
@@ -8015,18 +8050,23 @@ function EvaluationsPage({ user, employees, showToast }) {
       )}
 
       {modal?.mode === "new" && (
-        <NewEvaluationModal user={user} employees={employees} onClose={() => setModal(null)}
+        <NewEvaluationModal user={user} employees={employees} rubrics={activeRubrics} onClose={() => setModal(null)}
           onSaved={() => { setModal(null); load(); }} showToast={showToast} />
       )}
       {modal?.mode === "view" && (
-        <EvaluationDetailModal ev={modal.ev} onClose={() => setModal(null)} />
+        <EvaluationDetailModal ev={modal.ev} rubric={rubricOf(modal.ev)} onClose={() => setModal(null)} />
+      )}
+      {modal?.mode === "rubrics" && (
+        <RubricEditorModal rubrics={rubrics} rubricsFromDb={rubricsFromDb} onClose={() => setModal(null)}
+          onSaved={() => { loadRubrics(); }} showToast={showToast} />
       )}
     </div>
   );
 }
 
-function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
-  const [rubricType, setRubricType] = useState("pest");
+function NewEvaluationModal({ user, employees, rubrics, onClose, onSaved, showToast }) {
+  const rubricKeys = Object.keys(rubrics);
+  const [rubricType, setRubricType] = useState(rubricKeys[0] || "pest");
   const [form, setForm] = useState({
     employee_id: "", eval_date: new Date().toISOString().slice(0,10),
     service_type: "", address: "", start_time: "", end_time: "",
@@ -8037,11 +8077,11 @@ function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
   const [scores, setScores] = useState({});
   const [saving, setSaving] = useState(false);
   const update = (k, v) => setForm(f => ({ ...f, [k]: v }));
-  const rubric = EVAL_RUBRICS[rubricType];
+  const rubric = rubrics[rubricType];
 
   const activeEmployees = (employees || []).filter(e => e.status !== "inactive").sort((a,b) => (a.name||"").localeCompare(b.name||""));
 
-  const finalScore = evalFinalScore(scores, rubricType);
+  const finalScore = evalFinalScore(scores, rubric);
   const result = form.auto_fail ? "FAIL" : finalScore == null ? null : (finalScore >= 6 ? "PASS" : "FAIL");
 
   function setScore(section, item, v) {
@@ -8061,7 +8101,7 @@ function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
       const emp = activeEmployees.find(e => String(e.id) === String(form.employee_id));
       const sectionAvgs = {};
       for (const s of rubric.sections) {
-        const avg = evalSectionAvg(scores, rubricType, s.name);
+        const avg = evalSectionAvg(scores, rubric, s.name);
         if (avg != null) sectionAvgs[s.name] = Math.round(avg * 100) / 100;
       }
       await sbPost("evaluations", {
@@ -8070,6 +8110,7 @@ function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
         evaluator_id: user.id,
         evaluator_name: user.name,
         rubric_type: rubricType,
+        rubric_snapshot: { label: rubric.label, icon: rubric.icon, serviceTypeLabel: rubric.serviceTypeLabel, serviceTypes: rubric.serviceTypes, sections: rubric.sections, autoFail: rubric.autoFail },
         service_type: form.service_type || null,
         address: form.address || null,
         eval_date: form.eval_date,
@@ -8107,7 +8148,7 @@ function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
           <div className="form-group">
             <label className="form-label">Rubric</label>
             <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              {Object.entries(EVAL_RUBRICS).map(([k, r]) => (
+              {Object.entries(rubrics).map(([k, r]) => (
                 <button key={k} onClick={() => { setRubricType(k); setScores({}); update("service_type",""); }}
                   style={{flex:"1 1 40%",padding:"8px 0",borderRadius:6,cursor:"pointer",fontSize:12,fontFamily:"DM Sans,sans-serif",
                     border:"1px solid " + (rubricType===k ? "#22C55E" : "#2A3348"),
@@ -8134,10 +8175,10 @@ function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
           </div>
           <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
             <div className="form-group" style={{flex:"1 1 45%"}}>
-              <label className="form-label">{rubric.serviceTypeLabel}</label>
+              <label className="form-label">{rubric?.serviceTypeLabel || "Type of Service Observed"}</label>
               <select className="form-input" value={form.service_type} onChange={e => update("service_type", e.target.value)}>
                 <option value="">Select...</option>
-                {rubric.serviceTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                {(rubric?.serviceTypes || []).map(t => <option key={t} value={t}>{t}</option>)}
               </select>
             </div>
             <div className="form-group" style={{flex:"1 1 45%"}}>
@@ -8156,8 +8197,8 @@ function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
             </div>
           </div>
 
-          {rubric.sections.map(section => {
-            const avg = evalSectionAvg(scores, rubricType, section.name);
+          {(rubric?.sections || []).map(section => {
+            const avg = evalSectionAvg(scores, rubric, section.name);
             return (
               <div key={section.name} style={{marginTop:12,border:"1px solid #2A3348",borderRadius:8,overflow:"hidden"}}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 11px",background:"#141A28"}}>
@@ -8193,7 +8234,7 @@ function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
           <div className="form-group" style={{marginTop:10}}>
             <label style={{display:"flex",gap:8,alignItems:"flex-start",cursor:"pointer",fontSize:12,color:"#EF4444"}}>
               <input type="checkbox" checked={form.auto_fail} onChange={e => update("auto_fail", e.target.checked)} style={{marginTop:2}} />
-              <span><b>AUTOMATIC FAIL</b> — {rubric.autoFail}</span>
+              <span><b>AUTOMATIC FAIL</b> — {rubric?.autoFail}</span>
             </label>
             {form.auto_fail && (
               <input className="form-input" style={{marginTop:6}} value={form.auto_fail_reason}
@@ -8229,8 +8270,7 @@ function NewEvaluationModal({ user, employees, onClose, onSaved, showToast }) {
   );
 }
 
-function EvaluationDetailModal({ ev, onClose }) {
-  const rubric = EVAL_RUBRICS[ev.rubric_type];
+function EvaluationDetailModal({ ev, rubric, onClose }) {
   const scores = ev.scores || {};
   return (
     <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
@@ -8282,6 +8322,223 @@ function EvaluationDetailModal({ ev, onClose }) {
             <div>Employee: <b style={{color:"#E8EDF5"}}>{ev.employee_signature || "—"}</b></div>
             <div>Manager: <b style={{color:"#E8EDF5"}}>{ev.manager_signature || "—"}</b></div>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Rubric Editor (super_admin) ───────────────────────────────────────────────
+// Rubrics live in the evaluation_rubrics table. On first open, the built-in
+// defaults are seeded into the table so there is always something to edit.
+function RubricEditorModal({ rubrics, rubricsFromDb, onClose, onSaved, showToast }) {
+  const [seeding, setSeeding] = useState(!rubricsFromDb);
+  const [seedError, setSeedError] = useState(null);
+  const [selectedKey, setSelectedKey] = useState(Object.keys(rubrics)[0] || null);
+  const [draft, setDraft] = useState(null); // editable copy of the selected rubric
+  const [saving, setSaving] = useState(false);
+
+  // Seed defaults into the DB the first time the editor is opened
+  useEffect(() => {
+    (async () => {
+      if (rubricsFromDb) { setSeeding(false); return; }
+      try {
+        let i = 0;
+        for (const [key, r] of Object.entries(DEFAULT_EVAL_RUBRICS)) {
+          await sbPost("evaluation_rubrics", {
+            rubric_key: key, label: r.label, icon: r.icon,
+            service_type_label: r.serviceTypeLabel, service_types: r.serviceTypes,
+            sections: r.sections, auto_fail: r.autoFail, active: true, sort_order: i++
+          });
+        }
+        showToast("Default rubrics imported — you can now edit them");
+        setSeeding(false);
+        onSaved();
+      } catch (err) {
+        setSeedError(String(err.message || err));
+        setSeeding(false);
+      }
+    })();
+  }, []); // eslint-disable-line
+
+  function toDraft(key) {
+    const r = rubrics[key];
+    if (!r) return null;
+    return {
+      key,
+      rowId: r._rowId || null,
+      label: r.label || "",
+      icon: r.icon || "📝",
+      serviceTypeLabel: r.serviceTypeLabel || "Type of Service Observed",
+      serviceTypesText: (r.serviceTypes || []).join("\n"),
+      autoFail: r.autoFail || "Violation of Law",
+      active: r._active !== false,
+      sections: (r.sections || []).map(s => ({ name: s.name, itemsText: (s.items || []).join("\n") })),
+    };
+  }
+
+  useEffect(() => { setDraft(selectedKey ? toDraft(selectedKey) : null); }, [selectedKey, rubrics]); // eslint-disable-line
+
+  function newRubric() {
+    setSelectedKey(null);
+    setDraft({
+      key: null, rowId: null, label: "", icon: "📝",
+      serviceTypeLabel: "Type of Service Observed", serviceTypesText: "Other",
+      autoFail: "Violation of Law", active: true,
+      sections: [{ name: "Safety", itemsText: "" }],
+    });
+  }
+
+  const upd = (k, v) => setDraft(d => ({ ...d, [k]: v }));
+  const updSection = (i, k, v) => setDraft(d => {
+    const secs = [...d.sections]; secs[i] = { ...secs[i], [k]: v }; return { ...d, sections: secs };
+  });
+  const moveSection = (i, dir) => setDraft(d => {
+    const j = i + dir;
+    if (j < 0 || j >= d.sections.length) return d;
+    const secs = [...d.sections]; [secs[i], secs[j]] = [secs[j], secs[i]];
+    return { ...d, sections: secs };
+  });
+  const deleteSection = (i) => setDraft(d => ({ ...d, sections: d.sections.filter((_, x) => x !== i) }));
+  const addSection = () => setDraft(d => ({ ...d, sections: [...d.sections, { name: "New Section", itemsText: "" }] }));
+
+  async function save() {
+    if (!draft.label.trim()) { showToast("Rubric name is required", "error"); return; }
+    const sections = draft.sections
+      .map(s => ({ name: s.name.trim(), items: s.itemsText.split("\n").map(x => x.trim()).filter(Boolean) }))
+      .filter(s => s.name && s.items.length > 0);
+    if (sections.length === 0) { showToast("Add at least one section with at least one line item", "error"); return; }
+    const names = sections.map(s => s.name.toLowerCase());
+    if (new Set(names).size !== names.length) { showToast("Section names must be unique within a rubric", "error"); return; }
+    setSaving(true);
+    try {
+      const body = {
+        label: draft.label.trim(),
+        icon: draft.icon.trim() || "📝",
+        service_type_label: draft.serviceTypeLabel.trim() || "Type of Service Observed",
+        service_types: draft.serviceTypesText.split("\n").map(x => x.trim()).filter(Boolean),
+        sections,
+        auto_fail: draft.autoFail.trim() || "Violation of Law",
+        active: draft.active,
+      };
+      if (draft.rowId) {
+        await sbPatch("evaluation_rubrics", draft.rowId, body);
+        showToast("Rubric updated");
+      } else {
+        const key = draft.label.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || ("rubric_" + Date.now());
+        body.rubric_key = rubrics[key] ? key + "_" + Date.now() : key;
+        body.sort_order = Object.keys(rubrics).length;
+        await sbPost("evaluation_rubrics", body);
+        showToast("Rubric created");
+        setSelectedKey(body.rubric_key);
+      }
+      onSaved();
+    } catch (err) { showToast("Save failed: " + (err.message || err), "error"); }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && !saving && onClose()}>
+      <div className="modal" style={{maxWidth:680,maxHeight:"92vh",overflowY:"auto"}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">⚙ Edit evaluation rubrics</div>
+            <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Changes apply to new evaluations. Past evaluations keep the version of the form they were scored on.</div>
+          </div>
+          <div className="modal-close" onClick={() => !saving && onClose()}>✕</div>
+        </div>
+        <div className="modal-body">
+          {seeding ? (
+            <div style={{padding:"10px 0",fontSize:12,color:"#8A95A8"}}>Importing default rubrics into the database...</div>
+          ) : seedError ? (
+            <div className="alert">
+              Couldn't reach the evaluation_rubrics table — run the rubrics migration in the Supabase SQL Editor first, then reopen this editor.
+              <div style={{fontFamily:"monospace",fontSize:11,marginTop:6}}>{seedError}</div>
+            </div>
+          ) : (
+            <>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:12}}>
+                {Object.entries(rubrics).map(([k, r]) => (
+                  <button key={k} onClick={() => setSelectedKey(k)}
+                    style={{padding:"6px 12px",borderRadius:14,fontSize:12,cursor:"pointer",fontFamily:"DM Sans,sans-serif",
+                      border:"1px solid " + (selectedKey===k ? "#22C55E" : "#2A3348"),
+                      background: selectedKey===k ? "rgba(34,197,94,0.15)" : "transparent",
+                      color: r._active === false ? "#4A5568" : selectedKey===k ? "#22C55E" : "#8A95A8",
+                      textDecoration: r._active === false ? "line-through" : "none"}}>
+                    {r.icon} {r.label}
+                  </button>
+                ))}
+                <button onClick={newRubric}
+                  style={{padding:"6px 12px",borderRadius:14,fontSize:12,cursor:"pointer",fontFamily:"DM Sans,sans-serif",
+                    border:"1px dashed #2A3348",background:"transparent",color:"#8A95A8"}}>
+                  + New rubric
+                </button>
+              </div>
+
+              {draft && (
+                <>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    <div className="form-group" style={{flex:"2 1 200px"}}>
+                      <label className="form-label">Rubric name *</label>
+                      <input className="form-input" value={draft.label} onChange={e => upd("label", e.target.value)} placeholder="e.g. Trap Check" />
+                    </div>
+                    <div className="form-group" style={{flex:"0 1 90px"}}>
+                      <label className="form-label">Icon</label>
+                      <input className="form-input" value={draft.icon} onChange={e => upd("icon", e.target.value)} />
+                    </div>
+                    <div className="form-group" style={{flex:"1 1 140px"}}>
+                      <label className="form-label">Visible for new evals</label>
+                      <select className="form-input" value={draft.active ? "yes" : "no"} onChange={e => upd("active", e.target.value === "yes")}>
+                        <option value="yes">Active</option>
+                        <option value="no">Hidden (retired)</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    <div className="form-group" style={{flex:"1 1 200px"}}>
+                      <label className="form-label">Service type field label</label>
+                      <input className="form-input" value={draft.serviceTypeLabel} onChange={e => upd("serviceTypeLabel", e.target.value)} />
+                    </div>
+                    <div className="form-group" style={{flex:"1 1 200px"}}>
+                      <label className="form-label">Service type options (one per line)</label>
+                      <textarea className="form-input" rows={3} value={draft.serviceTypesText} onChange={e => upd("serviceTypesText", e.target.value)} />
+                    </div>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Automatic fail conditions</label>
+                    <textarea className="form-input" rows={2} value={draft.autoFail} onChange={e => upd("autoFail", e.target.value)} />
+                  </div>
+
+                  <div style={{fontSize:12,fontWeight:700,color:"#E8EDF5",textTransform:"uppercase",letterSpacing:0.5,margin:"10px 0 6px"}}>Sections & line items</div>
+                  {draft.sections.map((sec, i) => (
+                    <div key={i} style={{border:"1px solid #2A3348",borderRadius:8,padding:10,marginBottom:8}}>
+                      <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6}}>
+                        <input className="form-input" style={{flex:1,fontWeight:700}} value={sec.name}
+                          onChange={e => updSection(i, "name", e.target.value)} placeholder="Section name" />
+                        <Btn onClick={() => moveSection(i, -1)} disabled={i === 0}>↑</Btn>
+                        <Btn onClick={() => moveSection(i, 1)} disabled={i === draft.sections.length - 1}>↓</Btn>
+                        <Btn variant="red" onClick={() => deleteSection(i)}>✕</Btn>
+                      </div>
+                      <textarea className="form-input" rows={Math.min(10, Math.max(3, sec.itemsText.split("\n").length))}
+                        value={sec.itemsText} onChange={e => updSection(i, "itemsText", e.target.value)}
+                        placeholder={"One line item per line, e.g.\nDriving\nPPE (mask, gloves)"} />
+                      <div style={{fontSize:10,color:"#4A5568",marginTop:3}}>
+                        {sec.itemsText.split("\n").map(x=>x.trim()).filter(Boolean).length} item(s) — one per line; add, remove, or reorder lines freely
+                      </div>
+                    </div>
+                  ))}
+                  <Btn onClick={addSection} style={{width:"100%"}}>+ Add section</Btn>
+
+                  <div style={{display:"flex",gap:8,marginTop:12}}>
+                    <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Close</Btn>
+                    <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+                      {saving ? "Saving..." : (draft.rowId ? "Save changes" : "Create rubric")}
+                    </Btn>
+                  </div>
+                </>
+              )}
+            </>
+          )}
         </div>
       </div>
     </div>
