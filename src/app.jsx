@@ -2053,10 +2053,10 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
 // before the system existed, (2) monthly reconciliation count where the tech
 // reports what's actually on the truck. Each row with a variance creates an
 // inventory_transactions row with action='count' for the audit trail.
-function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
+function TruckInventoryPage({ user, products, trucks, shops, employees, showToast }) {
   const isManager = ["super_admin","manager","lead"].includes(user.access_level);
 
-  // Default the truck: if the logged-in user has an assigned truck, use it.
+  // Default the location: if the logged-in user has an assigned truck, use it.
   // Otherwise empty so they pick.
   const myTruck = trucks.find(t => {
     const driver = driverOf(t, employees);
@@ -2064,6 +2064,23 @@ function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
   });
 
   const [truckId, setTruckId] = useState(myTruck?.id || "");
+  const activeShops = (shops || []).filter(sh => sh.active);
+  // Shops and trucks share one picker; UUIDs are unique across both tables
+  const locType = activeShops.some(sh => sh.id === truckId) ? "shop" : "truck";
+  const selectedShop = locType === "shop" ? activeShops.find(sh => sh.id === truckId) : null;
+  // Monthly count status board (managers/leads)
+  const [lastCounts, setLastCounts] = useState({}); // location_id -> most recent count date
+  async function loadCountStatus() {
+    try {
+      const since = new Date(Date.now() - 100 * 86400000).toISOString();
+      const rows = await sbAll("inventory_transactions",
+        `?action=eq.count&created_at=gte.${since}&select=from_location,created_at&order=created_at.desc`);
+      const m = {};
+      for (const r of rows) if (r.from_location && !m[r.from_location]) m[r.from_location] = r.created_at;
+      setLastCounts(m);
+    } catch (err) { console.log("[count] status load failed:", err.message || err); }
+  }
+  useEffect(() => { loadCountStatus(); }, []); // eslint-disable-line
   const [currentInventory, setCurrentInventory] = useState([]); // inventory rows for selected truck
   const [loading, setLoading] = useState(false);
   const [counts, setCounts] = useState({}); // { product_id: stringValue }
@@ -2081,7 +2098,7 @@ function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
     }
     setLoading(true);
     Promise.all([
-      sb("inventory", `?location_type=eq.truck&location_id=eq.${truckId}&select=*`).catch(() => []),
+      sb("inventory", `?location_type=eq.${locType}&location_id=eq.${truckId}&select=*`).catch(() => []),
       sb("inventory_transactions",
         `?action=eq.count&from_location=eq.${truckId}&select=*,product:products(name,category)&order=created_at.desc&limit=50`
       ).catch(() => [])
@@ -2155,7 +2172,7 @@ function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
         ? crypto.randomUUID()
         : (Date.now() + "-" + Math.random()).toString();
       const truck = trucks.find(t => t.id === truckId);
-      const truckLabel = truck ? `Truck #${truck.truck_number}` : "Truck";
+      const truckLabel = locType === "shop" ? (selectedShop?.name || "Shop") : truck ? `Truck #${truck.truck_number}` : "Truck";
 
       for (const c of changes) {
         // Log the count transaction FIRST. If this fails (e.g. due to a constraint),
@@ -2181,12 +2198,13 @@ function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
         } else {
           await sbPost("inventory", {
             product_id: c.product.id,
-            location_type: "truck",
+            location_type: locType,
             location_id: truckId,
             quantity: c.actual
           });
         }
       }
+      loadCountStatus();
       showToast(`Count saved — ${changes.length} adjustment${changes.length === 1 ? "" : "s"} on ${truckLabel}`);
       setCounts({});
       // Refetch
@@ -2226,19 +2244,72 @@ function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
     })).slice(0, 10);
   })();
 
+  // Count status helpers: a location is "done" if counted this calendar month
+  const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+  const countedThisMonth = (id) => lastCounts[id] && new Date(lastCounts[id]) >= monthStart;
+  const statusLocations = [
+    ...activeShops.map(sh => ({ id: sh.id, label: "🏪 " + sh.name, sub: sh.department ? sh.branch + " · " + sh.department : sh.branch })),
+    ...trucks
+      .slice()
+      .sort((a,b) => (parseInt(a.truck_number,10) || 0) - (parseInt(b.truck_number,10) || 0))
+      .map(t => ({ id: t.id, label: "🚛 Truck #" + t.truck_number, sub: driverOf(t, employees)?.name || "Unassigned" })),
+  ];
+  const doneCount = statusLocations.filter(l => countedThisMonth(l.id)).length;
+
   return (
     <div>
       <div className="alert blue" style={{marginBottom:14}}>
-        📋 <strong>Truck inventory count.</strong> Use this for <em>initial inventory</em> (set what's already on your truck when starting) and <em>monthly counts</em> (reconcile what's actually there vs what the system thinks). Enter the <strong>actual quantity</strong> for each product — the system will compute the variance and update accordingly.
+        📋 <strong>Monthly inventory count — shops & trucks.</strong> Use this for <em>initial inventory</em> (set what's already at a location when starting) and <em>monthly counts</em> (reconcile what's actually there vs what the system thinks). Enter the <strong>actual quantity</strong> for each product — the system computes the variance, updates quantities, and clears any negative discrepancies for that location.
       </div>
 
-      {/* Truck selector */}
+      {/* Monthly status board (managers/leads) */}
+      {isManager && (
+        <div className="mod-card" style={{marginBottom:14}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:6}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5}}>
+              {new Date().toLocaleString("en-US",{month:"long"})} count status
+            </div>
+            <Badge color={doneCount === statusLocations.length ? "green" : "amber"}>{doneCount} of {statusLocations.length} counted this month</Badge>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(185px,1fr))",gap:6}}>
+            {statusLocations.map(l => {
+              const done = countedThisMonth(l.id);
+              const last = lastCounts[l.id];
+              return (
+                <div key={l.id} onClick={() => setTruckId(l.id)}
+                  style={{padding:"7px 9px",background: truckId === l.id ? "rgba(34,197,94,0.1)" : "#1E2535",
+                    border:"1px solid " + (truckId === l.id ? "#22C55E" : done ? "#2A3348" : "rgba(245,158,11,0.45)"),
+                    borderRadius:6,cursor:"pointer"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",gap:6,alignItems:"center"}}>
+                    <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{l.label}</div>
+                    <span style={{fontSize:10,fontWeight:700,color: done ? "#22C55E" : "#F59E0B",whiteSpace:"nowrap"}}>{done ? "✓ DONE" : "DUE"}</span>
+                  </div>
+                  <div style={{fontSize:10,color:"#8A95A8",marginTop:2,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+                    {l.sub} · {last ? "last " + new Date(last).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "never counted"}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{fontSize:10,color:"#4A5568",marginTop:8,fontStyle:"italic"}}>Tap a location to start its count below.</div>
+        </div>
+      )}
+
+      {/* Location selector */}
       <div className="mod-card" style={{marginBottom:14}}>
-        <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>1 · Truck</div>
+        <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>1 · Location</div>
         <div className="form-group" style={{marginBottom:0}}>
-          <label className="form-label">Which truck are you counting?</label>
+          <label className="form-label">Which shop or truck are you counting?</label>
           <select className="form-input" value={truckId} onChange={e => setTruckId(e.target.value)}>
-            <option value="">— Select truck —</option>
+            <option value="">— Select location —</option>
+            {isManager && activeShops.length > 0 && (
+              <optgroup label="Shops">
+                {activeShops.map(sh => (
+                  <option key={sh.id} value={sh.id}>{sh.name} — {sh.department ? sh.branch + " · " + sh.department : sh.branch}</option>
+                ))}
+              </optgroup>
+            )}
+            <optgroup label="Trucks">
             {trucks
               .filter(t => isManager || driverOf(t, employees)?.id === user.id)
               .sort((a,b) => (parseInt(a.truck_number,10) || 0) - (parseInt(b.truck_number,10) || 0))
@@ -2246,6 +2317,7 @@ function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
                 const d = driverOf(t, employees);
                 return <option key={t.id} value={t.id}>Truck #{t.truck_number} · {d?.name || "Unassigned"} · {t.branch}{t.department ? " " + t.department : ""}</option>;
               })}
+            </optgroup>
           </select>
           {!isManager && trucks.filter(t => driverOf(t, employees)?.id === user.id).length === 0 && (
             <div style={{fontSize:11,color:"#F59E0B",marginTop:6}}>
@@ -2253,9 +2325,9 @@ function TruckInventoryPage({ user, products, trucks, employees, showToast }) {
             </div>
           )}
         </div>
-        {selectedTruck && (
+        {(selectedTruck || selectedShop) && (
           <div style={{marginTop:10,padding:"8px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,fontSize:11,color:"#8A95A8"}}>
-            Selected: <strong style={{color:"#E8EDF5"}}>Truck #{selectedTruck.truck_number}</strong> · {selectedDriver?.name || "Unassigned"} · {selectedTruck.year} {selectedTruck.make} {selectedTruck.model}
+            Selected: <strong style={{color:"#E8EDF5"}}>{selectedShop ? "🏪 " + selectedShop.name : "Truck #" + selectedTruck.truck_number}</strong> · {selectedShop ? (selectedShop.department ? selectedShop.branch + " · " + selectedShop.department : selectedShop.branch) : `${selectedDriver?.name || "Unassigned"} · ${selectedTruck.year} ${selectedTruck.make} ${selectedTruck.model}`}
             {hasNoExistingInventory && <div style={{color:"#22C55E",marginTop:3,fontSize:11}}>✓ No prior inventory recorded — this will be the starting baseline.</div>}
           </div>
         )}
@@ -2998,6 +3070,351 @@ function downloadHistoryCSV(history, shops, trucks) {
 }
 
 // ── Inventory Reports tab ────────────────────────────────────────────────────
+// ── Reports Center ────────────────────────────────────────────────────────────
+// One place to export every module as a real Excel workbook (.xlsx). Files
+// open in Excel and upload straight into Google Drive / Google Sheets.
+// SheetJS is loaded on demand from cdnjs; if it can't load, each sheet falls
+// back to a CSV download so exports always work.
+let _xlsxPromise = null;
+function loadXLSX() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (!_xlsxPromise) _xlsxPromise = new Promise((resolve, reject) => {
+    const el = document.createElement("script");
+    el.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+    el.onload = () => resolve(window.XLSX);
+    el.onerror = () => { _xlsxPromise = null; reject(new Error("Could not load the Excel library")); };
+    document.head.appendChild(el);
+  });
+  return _xlsxPromise;
+}
+
+// sheets: [{ name, headers, rows }]
+async function downloadWorkbook(filename, sheets, showToast) {
+  try {
+    const XLSX = await loadXLSX();
+    const wb = XLSX.utils.book_new();
+    const used = new Set();
+    for (const sh of sheets) {
+      let name = (sh.name || "Sheet").replace(/[\\/?*[\]:]/g, " ").slice(0, 31) || "Sheet";
+      let base = name, i = 2;
+      while (used.has(name)) name = (base.slice(0, 28) + " " + i++);
+      used.add(name);
+      const ws = XLSX.utils.aoa_to_sheet([sh.headers, ...sh.rows]);
+      ws["!cols"] = sh.headers.map((h, ci) => {
+        let w = String(h).length;
+        for (const r of sh.rows.slice(0, 200)) w = Math.max(w, String(r[ci] ?? "").length);
+        return { wch: Math.min(Math.max(w + 2, 8), 45) };
+      });
+      XLSX.utils.book_append_sheet(wb, ws, name);
+    }
+    XLSX.writeFile(wb, filename);
+  } catch (err) {
+    // Fallback: one CSV per sheet
+    showToast("Excel library unavailable — downloading CSV instead", "error");
+    for (const sh of sheets) {
+      downloadCSV(filename.replace(/\.xlsx$/i, "") + "_" + sh.name.replace(/[^a-zA-Z0-9]+/g, "_") + ".csv", sh.headers, sh.rows);
+    }
+  }
+}
+
+// Build a sheet from rows of unknown shape: scalar columns only, in first-seen order
+function autoSheet(name, rows, dropCols = []) {
+  const keys = [];
+  for (const r of rows) for (const k of Object.keys(r || {})) {
+    if (dropCols.includes(k) || keys.includes(k)) continue;
+    const v = r[k];
+    if (v !== null && typeof v === "object") continue;
+    keys.push(k);
+  }
+  return { name, headers: keys, rows: rows.map(r => keys.map(k => r?.[k] ?? "")) };
+}
+
+function monthsBetween(fromDate, toDate) {
+  if (!fromDate) return null;
+  const a = new Date(fromDate), b = toDate || new Date();
+  if (isNaN(a)) return null;
+  return Math.max(0, Math.round(((b - a) / 86400000 / 30.44) * 10) / 10);
+}
+
+function ReportsCenterPage({ user, employees, trucks, shops, products, creditCards, showToast }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const firstOfMonth = today.slice(0, 8) + "01";
+  const [periodStart, setPeriodStart] = useState(firstOfMonth);
+  const [periodEnd, setPeriodEnd] = useState(today);
+  const [busy, setBusy] = useState(null);
+
+  const isManager = ["super_admin","manager","lead"].includes(user.access_level);
+  if (!isManager) {
+    return <div className="alert">Reports are available to managers and leads.</div>;
+  }
+
+  const stamp = `${periodStart}_to_${periodEnd}`;
+  const locLabel = (locType, locId) => {
+    if (locType === "shop") {
+      const sh = (shops || []).find(x => x.id === locId);
+      return sh ? sh.name : "(Unknown shop)";
+    }
+    const t = (trucks || []).find(x => x.id === locId);
+    return t ? `Truck #${t.truck_number} (${driverOf(t, employees)?.name || "Unassigned"})` : "(Unknown)";
+  };
+  const anyLoc = (id) => {
+    const sh = (shops || []).find(x => x.id === id);
+    if (sh) return "🏪 " + sh.name;
+    const t = (trucks || []).find(x => x.id === id);
+    return t ? "🚛 Truck #" + t.truck_number : (id ? "(Unknown)" : "");
+  };
+
+  async function run(key, fn) {
+    setBusy(key);
+    try { await fn(); }
+    catch (err) { showToast("Report failed: " + (err.message || err), "error"); }
+    setBusy(null);
+  }
+
+  // ── Report builders ─────────────────────────────────────────────────────────
+  async function fleetReport() {
+    const truckSheet = {
+      name: "Trucks",
+      headers: ["Truck #","Driver","Branch","Department","Year","Make","Model","Trim","Plate","VIN","Mileage","Next oil (mi)","Registration expires","GPS"],
+      rows: trucks.slice().sort((a,b)=>(parseInt(a.truck_number,10)||0)-(parseInt(b.truck_number,10)||0)).map(t => [
+        t.truck_number ?? "", driverOf(t, employees)?.name || "Unassigned", t.branch || "", t.department || "",
+        t.year ?? "", t.make || "", t.model || "", t.trim || "", t.plate || "", t.vin || "",
+        t.mileage ?? "", t.next_oil_miles ?? "", t.reg_expires || "", t.has_gps ? "Yes" : "No",
+      ]),
+    };
+    let inspSheet = null;
+    try {
+      const insp = await sbAll("inspections", `?select=*,truck:trucks(truck_number,branch)&inspected_at=gte.${periodStart}T00:00:00&inspected_at=lte.${periodEnd}T23:59:59&order=inspected_at.desc`);
+      const flat = insp.map(r => ({ inspected_at: r.inspected_at, truck: r.truck ? "#" + r.truck.truck_number : "", branch: r.truck?.branch || "", ...r }));
+      inspSheet = autoSheet("Inspections", flat, ["id","truck_id","created_at"]);
+    } catch (e) { /* inspections optional */ }
+    await downloadWorkbook(`fleet_report_${stamp}.xlsx`, inspSheet ? [truckSheet, inspSheet] : [truckSheet], showToast);
+  }
+
+  async function inventoryReport() {
+    const inv = await sbAll("inventory", "?select=*,product:products(name,category,unit_cost,unit_of_measure)");
+    const stockRows = inv
+      .map(r => ({ r, label: locLabel(r.location_type, r.location_id) }))
+      .sort((a, b) => a.label.localeCompare(b.label) || (a.r.product?.name || "").localeCompare(b.r.product?.name || ""));
+    const stock = {
+      name: "Current Stock",
+      headers: ["Location","Type","Product","Category","Quantity","Unit","Unit cost ($)","Value ($)"],
+      rows: stockRows.map(({ r, label }) => [
+        label, r.location_type, r.product?.name || "", r.product?.category || "",
+        r.quantity ?? 0, r.product?.unit_of_measure || "",
+        Number(r.product?.unit_cost || 0).toFixed(2),
+        ((Number(r.quantity) || 0) * (Number(r.product?.unit_cost) || 0)).toFixed(2),
+      ]),
+    };
+    const disc = {
+      name: "Discrepancies",
+      headers: ["Location","Type","Product","Category","Quantity","Last updated"],
+      rows: stockRows.filter(({ r }) => (r.quantity || 0) < 0).map(({ r, label }) => [
+        label, r.location_type, r.product?.name || "", r.product?.category || "", r.quantity,
+        r.updated_at ? new Date(r.updated_at).toLocaleString() : "",
+      ]),
+    };
+    const tx = await sbAll("inventory_transactions",
+      `?select=*,product:products(name,category,unit_cost),employee:employees(name,branch)&created_at=gte.${periodStart}T00:00:00&created_at=lte.${periodEnd}T23:59:59&order=created_at.desc`);
+    const txSheet = {
+      name: "Transactions",
+      headers: ["Date","Action","Product","Category","Qty","Employee","Branch","From","To","Vendor","Invoice #","Total cost ($)","Notes"],
+      rows: tx.map(r => [
+        r.created_at ? new Date(r.created_at).toLocaleString() : "", r.action || "",
+        r.product?.name || "", r.product?.category || "", r.quantity ?? "",
+        r.employee?.name || "", r.employee?.branch || "",
+        anyLoc(r.from_location), anyLoc(r.to_location),
+        r.vendor || "", r.invoice_number || "",
+        r.total_cost != null ? Number(r.total_cost).toFixed(2) : "", r.notes || "",
+      ]),
+    };
+    await downloadWorkbook(`inventory_report_${stamp}.xlsx`, [stock, disc, txSheet], showToast);
+  }
+
+  async function hrReport() {
+    const rosterCols = (list) => list.map(e => [
+      e.name || "", e.branch || "", e.department || "", e.status || "",
+      e.start_date || "", monthsBetween(e.start_date) ?? "", e.email || "",
+      accessLabel(e.access_level), (trucks.find(t => t.id === e.truck_id)?.truck_number ? "#" + trucks.find(t => t.id === e.truck_id).truck_number : ""),
+    ]);
+    const headers = ["Name","Branch","Department","Status","Start date","Tenure (months)","Email","Access level","Truck"];
+    const sorted = employees.slice().sort((a,b)=>(a.name||"").localeCompare(b.name||""));
+    await downloadWorkbook(`hr_onboarding_report_${today}.xlsx`, [
+      { name: "Roster", headers, rows: rosterCols(sorted) },
+      { name: "Onboarding", headers, rows: rosterCols(sorted.filter(e => e.status === "onboarding")) },
+      { name: "Inactive", headers, rows: rosterCols(sorted.filter(e => e.status === "inactive")) },
+    ], showToast);
+  }
+
+  async function retentionReport() {
+    const groups = {};
+    for (const e of employees) {
+      const key = e.branch || "(No branch)";
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(e);
+    }
+    const inRange = (d) => d && d >= periodStart && d <= periodEnd;
+    const summaryRow = (label, list) => {
+      const active = list.filter(e => e.status === "active");
+      const hires = list.filter(e => inRange(e.start_date));
+      const hiresActive = hires.filter(e => e.status !== "inactive");
+      const tenures = active.map(e => monthsBetween(e.start_date)).filter(v => v != null);
+      return [
+        label, active.length, list.filter(e => e.status === "onboarding").length,
+        list.filter(e => e.status === "inactive").length,
+        hires.length, hiresActive.length,
+        hires.length ? Math.round((hiresActive.length / hires.length) * 100) + "%" : "—",
+        tenures.length ? (tenures.reduce((s,v)=>s+v,0) / tenures.length).toFixed(1) : "—",
+      ];
+    };
+    const summary = {
+      name: "Summary",
+      headers: ["Branch","Active","Onboarding","Inactive","Hires in period","Hires still active","Hire retention %","Avg tenure active (months)"],
+      rows: [
+        ...Object.entries(groups).sort((a,b)=>a[0].localeCompare(b[0])).map(([k, list]) => summaryRow(k, list)),
+        summaryRow("ALL BRANCHES", employees),
+      ],
+    };
+    const hireHeaders = ["Name","Branch","Department","Start date","Status","Tenure (months)"];
+    const hires = {
+      name: "Hires in Period",
+      headers: hireHeaders,
+      rows: employees.filter(e => inRange(e.start_date)).sort((a,b)=>(a.start_date||"").localeCompare(b.start_date||"")).map(e => [
+        e.name || "", e.branch || "", e.department || "", e.start_date || "", e.status || "", monthsBetween(e.start_date) ?? "",
+      ]),
+    };
+    const inactive = {
+      name: "Inactive Roster",
+      headers: hireHeaders,
+      rows: employees.filter(e => e.status === "inactive").sort((a,b)=>(a.name||"").localeCompare(b.name||"")).map(e => [
+        e.name || "", e.branch || "", e.department || "", e.start_date || "", e.status || "", monthsBetween(e.start_date) ?? "",
+      ]),
+    };
+    await downloadWorkbook(`retention_report_${stamp}.xlsx`, [summary, hires, inactive], showToast);
+  }
+
+  async function equipmentReport() {
+    const [eq, co] = await Promise.all([
+      sbAll("equipment", "?select=*&order=name"),
+      sbAll("equipment_checkouts", "?select=*,equipment:equipment(name,category),employee:employees(name,branch)&order=checked_out_at.desc"),
+    ]);
+    const outIds = new Set(co.filter(c => !c.checked_in_at).map(c => c.equipment_id));
+    const eqFlat = eq.map(e => ({ status: outIds.has(e.id) ? "Checked out" : "Available", ...e }));
+    const coSheet = (name, list) => ({
+      name,
+      headers: ["Equipment","Category","Employee","Branch","Checked out","Expected return","Checked in","Notes","Return notes"],
+      rows: list.map(c => [
+        c.equipment?.name || "", c.equipment?.category || "",
+        c.employee?.name || c.employee_name || "", c.employee?.branch || "",
+        c.checked_out_at ? new Date(c.checked_out_at).toLocaleString() : "",
+        c.expected_return || "",
+        c.checked_in_at ? new Date(c.checked_in_at).toLocaleString() : "STILL OUT",
+        c.notes || "", c.return_notes || "",
+      ]),
+    });
+    await downloadWorkbook(`equipment_report_${today}.xlsx`, [
+      coSheet("Currently Out", co.filter(c => !c.checked_in_at)),
+      coSheet("Checkout Log", co),
+      autoSheet("Equipment List", eqFlat, ["id","created_at","updated_at"]),
+    ], showToast);
+  }
+
+  async function timeoffReport() {
+    const rows = await sbAll("time_off",
+      `?select=*,employee:employees!time_off_employee_id_fkey(name,branch,department)&start_date=gte.${periodStart}&start_date=lte.${periodEnd}&order=start_date.desc`);
+    await downloadWorkbook(`timeoff_callouts_${stamp}.xlsx`, [{
+      name: "Time Off & Callouts",
+      headers: ["Type","Employee","Branch","Department","Start","End","Status","Callout type","Paid","Coverage found","Called in on time","Reason","Notes","Logged"],
+      rows: rows.map(r => [
+        r.type || "", r.employee?.name || "", r.employee?.branch || "", r.employee?.department || "",
+        r.start_date || "", r.end_date || "", r.status || "",
+        r.type === "callout" ? (r.callout_type || "") : "",
+        r.type === "callout" ? (r.paid ? "Yes" : "No") : "",
+        r.type === "callout" ? (r.coverage_found ? "Yes" : "No") : "",
+        r.type === "callout" ? (r.called_in_on_time ? "Yes" : "No") : "",
+        r.reason || "", r.notes || "", r.created_at ? new Date(r.created_at).toLocaleDateString() : "",
+      ]),
+    }], showToast);
+  }
+
+  async function evaluationsReport() {
+    const rows = await sbAll("evaluations", `?select=*&eval_date=gte.${periodStart}&eval_date=lte.${periodEnd}&order=eval_date.desc`);
+    await downloadWorkbook(`evaluations_${stamp}.xlsx`, [{
+      name: "Evaluations",
+      headers: ["Date","Employee","Rubric","Service type","Evaluator","Final score","Result","Auto fail","Auto fail reason","Address","Section averages","Progress on goals","New goals","Highpoints"],
+      rows: rows.map(ev => [
+        ev.eval_date || "", ev.employee_name || "",
+        ev.rubric_snapshot?.label || ev.rubric_type || "", ev.service_type || "", ev.evaluator_name || "",
+        ev.final_score != null ? Number(ev.final_score).toFixed(2) : "", ev.result || "",
+        ev.auto_fail ? "YES" : "", ev.auto_fail_reason || "", ev.address || "",
+        ev.section_averages ? Object.entries(ev.section_averages).map(([k, v]) => `${k}: ${v}`).join(" · ") : "",
+        ev.progress_goals || "", ev.new_goals || "", ev.highpoints || "",
+      ]),
+    }], showToast);
+  }
+
+  async function cardsReport() {
+    await downloadWorkbook(`credit_cards_${today}.xlsx`,
+      [autoSheet("Credit Cards", creditCards || [], ["id","created_at","updated_at"])], showToast);
+  }
+
+  const REPORTS = [
+    { key: "fleet",     icon: "◉",  title: "Fleet report",              usesPeriod: true,  fn: fleetReport,
+      desc: "Every truck with driver, branch, plate, VIN, mileage, oil and registration status, plus inspections in the period." },
+    { key: "inventory", icon: "◧",  title: "Inventory report",          usesPeriod: true,  fn: inventoryReport,
+      desc: "Current stock at every shop and truck with values, the discrepancy list, and all transactions in the period." },
+    { key: "hr",        icon: "✦",  title: "HR / Onboarding report",    usesPeriod: false, fn: hrReport,
+      desc: "Full roster with tenure, plus separate onboarding and inactive sheets." },
+    { key: "retention", icon: "📈", title: "Retention report",          usesPeriod: true,  fn: retentionReport,
+      desc: "Headcount, hires, and hire retention by branch, average tenure, hires-in-period detail, and the inactive roster." },
+    { key: "equipment", icon: "🔧", title: "Equipment checkout report", usesPeriod: false, fn: equipmentReport,
+      desc: "What is checked out right now and to whom, the full checkout log, and the equipment list." },
+    { key: "timeoff",   icon: "◈",  title: "Time off & callouts",       usesPeriod: true,  fn: timeoffReport,
+      desc: "PTO requests and callouts starting in the period, with status, coverage, and paid flags." },
+    { key: "evals",     icon: "✍️", title: "Evaluations report",        usesPeriod: true,  fn: evaluationsReport,
+      desc: "Every field care observation in the period with scores, section averages, results, and goals." },
+    { key: "cards",     icon: "◆",  title: "Credit cards report",       usesPeriod: false, fn: cardsReport,
+      desc: "All company cards and who they are assigned to." },
+  ];
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        📑 <strong>Reports Center.</strong> Download any module as a real Excel workbook (.xlsx). These files open directly in Excel and can be uploaded straight into Google Drive, where they open as Google Sheets. Reports marked with a calendar use the date range below.
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"flex-end"}}>
+        <div className="form-group" style={{marginBottom:0}}>
+          <label className="form-label" style={{fontSize:10}}>Period start</label>
+          <input className="form-input" type="date" value={periodStart} onChange={e => setPeriodStart(e.target.value)} style={{padding:"6px 9px"}} />
+        </div>
+        <div className="form-group" style={{marginBottom:0}}>
+          <label className="form-label" style={{fontSize:10}}>Period end</label>
+          <input className="form-input" type="date" value={periodEnd} onChange={e => setPeriodEnd(e.target.value)} style={{padding:"6px 9px"}} />
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:10}}>
+        {REPORTS.map(r => (
+          <div key={r.key} style={{background:"#1E2535",border:"1px solid #2A3348",borderRadius:8,padding:14,display:"flex",flexDirection:"column",gap:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{fontSize:14,fontWeight:700,color:"#E8EDF5"}}>{r.icon} {r.title}</div>
+              {r.usesPeriod && <span title="Uses the date range above" style={{fontSize:11,color:"#8A95A8"}}>📅 {periodStart} → {periodEnd}</span>}
+            </div>
+            <div style={{fontSize:12,color:"#8A95A8",lineHeight:1.45,flex:1}}>{r.desc}</div>
+            <Btn variant="primary" onClick={() => run(r.key, r.fn)} disabled={busy !== null}>
+              {busy === r.key ? "Building..." : "↓ Download Excel (.xlsx)"}
+            </Btn>
+          </div>
+        ))}
+      </div>
+      <div style={{fontSize:11,color:"#4A5568",marginTop:12,fontStyle:"italic"}}>
+        Note: exit dates aren't tracked for terminated employees, so tenure on the inactive sheet is measured from hire date to today and is approximate.
+      </div>
+    </div>
+  );
+}
+
 function InventoryReports({ user, products, trucks, employees, shops, showToast }) {
   const [discrepancies, setDiscrepancies] = useState([]);
   const [history, setHistory] = useState([]);
@@ -3170,7 +3587,7 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
                 <Btn onClick={downloadDiscrepancies}>↓ CSV</Btn>
               </div>
               <div style={{fontSize:11,color:"#8A95A8",padding:"0 13px 8px"}}>
-                More product left these locations than the system thought was there. Reconcile with a physical count (Truck Inventory page for trucks, Adjust / write-off for shops).
+                More product left these locations than the system thought was there. Reconcile with a physical count on the Inventory Count page (works for shops and trucks) — submitting a count sets the true quantity and clears the discrepancy.
               </div>
               <table>
                 <thead><tr><th>Location</th><th>Product</th><th>Category</th><th>Qty</th><th className="mobile-hide">Last updated</th></tr></thead>
@@ -8909,7 +9326,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",truck_inventory:"Truck Inventory Count",equipment:"Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",resources:"Resources",evaluations:"Evaluations",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",truck_inventory:"Monthly Inventory Count",equipment:"Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",resources:"Resources",evaluations:"Evaluations",reports:"Reports Center",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -8926,13 +9343,13 @@ export default function App() {
               <div className="sb-logo-icon">🦎</div>
               <div><div className="sb-logo-text">Critter Stop</div><div className="sb-logo-sub">OPS PLATFORM</div></div>
             </div>
-            {isManager && <div className="sb-section"><div className="sb-section-label">Overview</div>{navItem("home","Dashboard","⊡")}{navItem("people","People","◎")}</div>}
+            {isManager && <div className="sb-section"><div className="sb-section-label">Overview</div>{navItem("home","Dashboard","⊡")}{navItem("people","People","◎")}{navItem("reports","Reports","📑")}</div>}
             <div className="sb-section">
               <div className="sb-section-label">Modules</div>
               {navItem("hr","HR & Onboarding","✦")}
               {navItem("timeoff","Time Off & Callouts","◈")}
               {navItem("inventory","Inventory","◧")}
-              {navItem("truck_inventory","Truck Inventory","📋")}
+              {navItem("truck_inventory","Inventory Count","📋")}
               {navItem("equipment","Equipment","🔧")}
               {navItem("fleet","Fleet","◉")}
               {navItem("inspections","Inspections","✓")}
@@ -8965,13 +9382,14 @@ export default function App() {
             {dataLoaded && page === "hr" && <HR user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {page === "timeoff" && <TimeOff user={currentUser} employees={employees} showToast={showToast} />}
             {page === "inventory" && <Inventory user={currentUser} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />}
-            {page === "truck_inventory" && <TruckInventoryPage user={currentUser} products={products} trucks={trucks} employees={employees} showToast={showToast} />}
+            {page === "truck_inventory" && <TruckInventoryPage user={currentUser} products={products} trucks={trucks} shops={shops} employees={employees} showToast={showToast} />}
             {page === "equipment" && <EquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
             {dataLoaded && page === "inspections" && <InspectionsPage user={currentUser} trucks={trucks} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "cards" && <CardsPage user={currentUser} employees={employees} showToast={showToast} />}
             {page === "documents" && <CompanyDocsPage user={currentUser} showToast={showToast} />}
             {page === "resources" && <ResourcesPage user={currentUser} showToast={showToast} />}
+            {dataLoaded && page === "reports" && <ReportsCenterPage user={currentUser} employees={employees} trucks={trucks} shops={shops} products={products} creditCards={creditCards} showToast={showToast} />}
             {dataLoaded && page === "evaluations" && <EvaluationsPage user={currentUser} employees={employees} showToast={showToast} />}
             {page === "slack" && (
               <div className="table-wrap">
