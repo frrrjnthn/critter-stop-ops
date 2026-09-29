@@ -2068,16 +2068,19 @@ function TruckInventoryPage({ user, products, trucks, shops, employees, showToas
   // Shops and trucks share one picker; UUIDs are unique across both tables
   const locType = activeShops.some(sh => sh.id === truckId) ? "shop" : "truck";
   const selectedShop = locType === "shop" ? activeShops.find(sh => sh.id === truckId) : null;
-  // Monthly count status board (managers/leads)
-  const [lastCounts, setLastCounts] = useState({}); // location_id -> most recent count date
+  // Monthly count status board (managers/leads).
+  // September 2026 is the INITIAL inventory month (the baseline transfer);
+  // every month after that is a regular monthly count. The board can look
+  // back at any month since then.
+  const INITIAL_COUNT_MONTH = "2026-09";
+  const currentMonthKey = new Date().toISOString().slice(0, 7);
+  const [countTx, setCountTx] = useState([]); // [{from_location, created_at}] since initial month
+  const [statusMonth, setStatusMonth] = useState(currentMonthKey);
   async function loadCountStatus() {
     try {
-      const since = new Date(Date.now() - 100 * 86400000).toISOString();
       const rows = await sbAll("inventory_transactions",
-        `?action=eq.count&created_at=gte.${since}&select=from_location,created_at&order=created_at.desc`);
-      const m = {};
-      for (const r of rows) if (r.from_location && !m[r.from_location]) m[r.from_location] = r.created_at;
-      setLastCounts(m);
+        `?action=eq.count&created_at=gte.${INITIAL_COUNT_MONTH}-01T00:00:00&select=from_location,created_at&order=created_at.desc`);
+      setCountTx(rows.filter(r => r.from_location));
     } catch (err) { console.log("[count] status load failed:", err.message || err); }
   }
   useEffect(() => { loadCountStatus(); }, []); // eslint-disable-line
@@ -2244,9 +2247,30 @@ function TruckInventoryPage({ user, products, trucks, shops, employees, showToas
     })).slice(0, 10);
   })();
 
-  // Count status helpers: a location is "done" if counted this calendar month
-  const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
-  const countedThisMonth = (id) => lastCounts[id] && new Date(lastCounts[id]) >= monthStart;
+  // Month options: Initial (Sep 2026) through the current month
+  const monthOptions = (function () {
+    const opts = [];
+    let [y, m] = INITIAL_COUNT_MONTH.split("-").map(Number);
+    const [cy, cm] = currentMonthKey.split("-").map(Number);
+    while (y < cy || (y === cy && m <= cm)) {
+      const key = y + "-" + String(m).padStart(2, "0");
+      const label = new Date(y, m - 1, 1).toLocaleString("en-US", { month: "long", year: "numeric" });
+      opts.push({ key, label: key === INITIAL_COUNT_MONTH ? "Initial — " + label : label });
+      m++; if (m > 12) { m = 1; y++; }
+    }
+    return opts;
+  })();
+  // Latest count per location WITHIN the selected month, plus latest ever
+  const countsInMonth = {};
+  const lastEver = {};
+  for (const r of countTx) {
+    const key = String(r.created_at).slice(0, 7);
+    if (!lastEver[r.from_location]) lastEver[r.from_location] = r.created_at;
+    if (key === statusMonth && !countsInMonth[r.from_location]) countsInMonth[r.from_location] = r.created_at;
+  }
+  const countedThisMonth = (id) => !!countsInMonth[id];
+  const viewingCurrent = statusMonth === currentMonthKey;
+  const statusMonthLabel = monthOptions.find(o => o.key === statusMonth)?.label || statusMonth;
   const statusLocations = [
     ...activeShops.map(sh => ({ id: sh.id, label: "🏪 " + sh.name, sub: sh.department ? sh.branch + " · " + sh.department : sh.branch })),
     ...trucks
@@ -2265,27 +2289,43 @@ function TruckInventoryPage({ user, products, trucks, shops, employees, showToas
       {/* Monthly status board (managers/leads) */}
       {isManager && (
         <div className="mod-card" style={{marginBottom:14}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:6}}>
-            <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5}}>
-              {new Date().toLocaleString("en-US",{month:"long"})} count status
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5}}>Count status</div>
+              <select className="form-input" style={{padding:"5px 9px",fontSize:12,width:"auto"}}
+                value={statusMonth} onChange={e => setStatusMonth(e.target.value)}>
+                {monthOptions.slice().reverse().map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+              </select>
             </div>
-            <Badge color={doneCount === statusLocations.length ? "green" : "amber"}>{doneCount} of {statusLocations.length} counted this month</Badge>
+            <Badge color={doneCount === statusLocations.length ? "green" : viewingCurrent ? "amber" : "red"}>
+              {doneCount} of {statusLocations.length} counted in {statusMonthLabel.replace("Initial — ", "")}
+            </Badge>
           </div>
+          {statusMonth === INITIAL_COUNT_MONTH && (
+            <div style={{fontSize:11,color:"#8A95A8",marginBottom:8}}>
+              Initial inventory month — starting baselines were recorded here. Locations without a baseline had no stock to transfer.
+            </div>
+          )}
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(185px,1fr))",gap:6}}>
             {statusLocations.map(l => {
-              const done = countedThisMonth(l.id);
-              const last = lastCounts[l.id];
+              const inMonth = countsInMonth[l.id];
+              const done = !!inMonth;
+              const stateLabel = done ? "✓ DONE" : viewingCurrent ? "DUE" : "MISSED";
+              const stateColor = done ? "#22C55E" : viewingCurrent ? "#F59E0B" : "#EF4444";
+              const last = lastEver[l.id];
               return (
                 <div key={l.id} onClick={() => setTruckId(l.id)}
                   style={{padding:"7px 9px",background: truckId === l.id ? "rgba(34,197,94,0.1)" : "#1E2535",
-                    border:"1px solid " + (truckId === l.id ? "#22C55E" : done ? "#2A3348" : "rgba(245,158,11,0.45)"),
+                    border:"1px solid " + (truckId === l.id ? "#22C55E" : done ? "#2A3348" : viewingCurrent ? "rgba(245,158,11,0.45)" : "rgba(239,68,68,0.35)"),
                     borderRadius:6,cursor:"pointer"}}>
                   <div style={{display:"flex",justifyContent:"space-between",gap:6,alignItems:"center"}}>
                     <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{l.label}</div>
-                    <span style={{fontSize:10,fontWeight:700,color: done ? "#22C55E" : "#F59E0B",whiteSpace:"nowrap"}}>{done ? "✓ DONE" : "DUE"}</span>
+                    <span style={{fontSize:10,fontWeight:700,color:stateColor,whiteSpace:"nowrap"}}>{stateLabel}</span>
                   </div>
                   <div style={{fontSize:10,color:"#8A95A8",marginTop:2,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
-                    {l.sub} · {last ? "last " + new Date(last).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "never counted"}
+                    {l.sub} · {inMonth
+                      ? "counted " + new Date(inMonth).toLocaleDateString("en-US",{month:"short",day:"numeric"})
+                      : last ? "last counted " + new Date(last).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "never counted"}
                   </div>
                 </div>
               );
