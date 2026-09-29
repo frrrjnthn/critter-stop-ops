@@ -17,6 +17,23 @@ async function sb(table, params = "", opts = {}) {
   return res.json();
 }
 
+// Supabase REST silently caps responses at 1000 rows. Any table that can grow
+// past that (inventory, inventory_transactions) must be fetched in pages or
+// rows quietly vanish from the UI — which is exactly the class of bug where
+// "it's on the truck but the Trucks tab shows 0 SKUs."
+async function sbAll(table, params = "") {
+  const PAGE = 1000;
+  let all = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const sep = params.includes("?") ? "&" : "?";
+    const page = await sb(table, `${params}${sep}limit=${PAGE}&offset=${offset}`);
+    if (!Array.isArray(page)) break;
+    all = all.concat(page);
+    if (page.length < PAGE) break;
+  }
+  return all;
+}
+
 async function sbPost(table, body) {
   const res = await fetch(SUPABASE_URL + "/rest/v1/" + table, {
     method: "POST", headers, body: JSON.stringify(body)
@@ -1773,7 +1790,8 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
   async function loadInventory() {
     setLoadingInv(true);
     try {
-      const data = await sb("inventory", "?select=*,product:products(name,category,unit_cost,unit_of_measure)");
+      const data = await sbAll("inventory", "?select=*,product:products(name,category,unit_cost,unit_of_measure)");
+      console.log("[inventory] loaded " + data.length + " rows");
       setInventory(data);
     } catch (err) { showToast("Error loading inventory: " + (err.message || err), "error"); }
     setLoadingInv(false);
@@ -1826,10 +1844,14 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
     truckLocations[t.id] = { truck: t, items: 0, value: 0, products: {} };
   }
   for (const row of inventory) {
-    if (row.location_type === "truck" && row.quantity > 0 && truckLocations[row.location_id]) {
-      truckLocations[row.location_id].items += row.quantity;
-      truckLocations[row.location_id].value += (row.quantity * (row.product?.unit_cost || 0));
-      truckLocations[row.location_id].products[row.product_id] = row;
+    if (row.location_type === "truck" && truckLocations[row.location_id]) {
+      if (row.quantity > 0) {
+        truckLocations[row.location_id].items += row.quantity;
+        truckLocations[row.location_id].value += (row.quantity * (row.product?.unit_cost || 0));
+      }
+      // Keep zero/negative rows in the map so discrepancies are visible on the
+      // truck view instead of silently hidden.
+      if (row.quantity !== 0) truckLocations[row.location_id].products[row.product_id] = row;
     }
   }
 
@@ -2977,6 +2999,7 @@ function downloadHistoryCSV(history, shops, trucks) {
 
 // ── Inventory Reports tab ────────────────────────────────────────────────────
 function InventoryReports({ user, products, trucks, employees, shops, showToast }) {
+  const [discrepancies, setDiscrepancies] = useState([]);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
   const [periodStart, setPeriodStart] = useState(() => {
@@ -2991,10 +3014,12 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
   async function load() {
     setLoading(true);
     try {
-      const data = await sb("inventory_transactions",
+      const data = await sbAll("inventory_transactions",
         `?select=*,product:products(name,category,unit_cost,unit_of_measure),employee:employees(name,branch,department)&created_at=gte.${periodStart}T00:00:00&created_at=lte.${periodEnd}T23:59:59&order=created_at.desc`);
       console.log("[reports] loaded " + (data?.length ?? 0) + " transactions for " + periodStart + " → " + periodEnd);
       setHistory(Array.isArray(data) ? data : []);
+      const negRows = await sbAll("inventory", "?quantity=lt.0&select=*,product:products(name,category,unit_of_measure)").catch(() => []);
+      setDiscrepancies(Array.isArray(negRows) ? negRows : []);
     } catch (err) { showToast("Error loading reports: " + (err.message || err), "error"); }
     setLoading(false);
   }
@@ -3085,6 +3110,29 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
     downloadHistoryCSV(history, shops, trucks);
   }
 
+  function locationLabel(row) {
+    if (row.location_type === "shop") {
+      const shop = (shops || []).find(s => s.id === row.location_id);
+      return shop ? "🏪 " + shop.name : "🏪 (Unknown shop)";
+    }
+    const truck = (trucks || []).find(t => t.id === row.location_id);
+    if (!truck) return "🚛 (Unknown truck)";
+    return `🚛 Truck #${truck.truck_number} · ${driverOf(truck, employees)?.name || "Unassigned"}`;
+  }
+  const discRows = [...discrepancies].sort((a, b) => (a.quantity || 0) - (b.quantity || 0));
+  function downloadDiscrepancies() {
+    const rows = discRows.map(r => [
+      locationLabel(r).replace(/^[^ ]+ /, ""),
+      r.location_type,
+      r.product?.name || "—",
+      r.product?.category || "",
+      r.quantity,
+      r.updated_at ? new Date(r.updated_at).toLocaleString() : ""
+    ]);
+    downloadCSV(`inventory_discrepancies_${new Date().toISOString().slice(0,10)}.csv`,
+      ["Location","Type","Product","Category","Quantity","Last updated"], rows);
+  }
+
   return (
     <div>
       <div className="alert blue" style={{marginBottom:14}}>
@@ -3115,6 +3163,31 @@ function InventoryReports({ user, products, trucks, employees, shops, showToast 
 
       {loading ? <div className="loading">Loading reports...</div> : (
         <>
+          {discRows.length > 0 && (
+            <div className="table-wrap" style={{marginBottom:16,border:"1px solid rgba(239,68,68,0.4)"}}>
+              <div className="table-head">
+                <span className="table-title" style={{color:"#EF4444"}}>⚠ Discrepancies — negative inventory ({discRows.length})</span>
+                <Btn onClick={downloadDiscrepancies}>↓ CSV</Btn>
+              </div>
+              <div style={{fontSize:11,color:"#8A95A8",padding:"0 13px 8px"}}>
+                More product left these locations than the system thought was there. Reconcile with a physical count (Truck Inventory page for trucks, Adjust / write-off for shops).
+              </div>
+              <table>
+                <thead><tr><th>Location</th><th>Product</th><th>Category</th><th>Qty</th><th className="mobile-hide">Last updated</th></tr></thead>
+                <tbody>
+                  {discRows.map(r => (
+                    <tr key={r.id} style={{background:"rgba(239,68,68,0.05)"}}>
+                      <td>{locationLabel(r)}</td>
+                      <td><strong>{r.product?.name || "—"}</strong></td>
+                      <td><Badge color="gray">{r.product?.category || "—"}</Badge></td>
+                      <td style={{fontFamily:"monospace",color:"#EF4444",fontWeight:700}}>{r.quantity} {r.product?.unit_of_measure || ""}</td>
+                      <td className="mobile-hide" style={{fontSize:11,color:"#8A95A8"}}>{r.updated_at ? new Date(r.updated_at).toLocaleString() : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
           <div className="table-wrap" style={{marginBottom:16}}>
             <div className="table-head">
               <span className="table-title">Usage by product ({byProductRows.length})</span>
@@ -3367,13 +3440,16 @@ function InventoryMoveModal({ modal, inventory, products, trucks, shops, employe
                   <tbody>
                     {shownRows.map(r => {
                       const below = r.reorder_threshold != null && r.quantity <= r.reorder_threshold;
-                      const empty = r.quantity <= 0;
+                      const negative = r.quantity < 0;
+                      const empty = r.quantity === 0;
                       return (
                         <tr key={r.id || "cat-" + r.product_id}
-                          style={below ? {background:"rgba(245,158,11,0.05)"} : empty ? {opacity:0.55} : {}}>
-                          <td><strong>{r.product?.name || "—"}</strong>{below && <span style={{color:"#F59E0B",fontSize:10,marginLeft:6}}>⚠ reorder</span>}</td>
+                          style={negative ? {background:"rgba(239,68,68,0.07)"} : below ? {background:"rgba(245,158,11,0.05)"} : empty ? {opacity:0.55} : {}}>
+                          <td><strong>{r.product?.name || "—"}</strong>
+                            {negative && <span style={{color:"#EF4444",fontSize:10,marginLeft:6,fontWeight:700}}>⚠ DISCREPANCY</span>}
+                            {!negative && below && <span style={{color:"#F59E0B",fontSize:10,marginLeft:6}}>⚠ reorder</span>}</td>
                           <td><Badge color="gray">{r.product?.category || "—"}</Badge></td>
-                          <td style={{fontFamily:"monospace"}}>{r.quantity} {r.product?.unit_of_measure || ""}</td>
+                          <td style={{fontFamily:"monospace",color: negative ? "#EF4444" : undefined,fontWeight: negative ? 700 : undefined}}>{r.quantity} {r.product?.unit_of_measure || ""}</td>
                           <td>
                             {canEdit ? (
                               <input type="number" min="0" defaultValue={r.reorder_threshold ?? ""}
@@ -3581,23 +3657,24 @@ function InventoryCartModal({ action, products, trucks, shops, employees, invent
         ? crypto.randomUUID()
         : (Date.now() + "-" + Math.random()).toString();
 
-      // Helper: get/upsert inventory row
+      // Helper: get/upsert inventory row.
+      // Looks the row up FRESH on the server (never trusts the client cache,
+      // which can be stale or truncated). Moves are NEVER blocked: if a
+      // subtraction takes a location below zero, the quantity goes negative
+      // and the discrepancy surfaces on the Reports → Discrepancies list for
+      // reconciliation, instead of stopping a tech in the field.
+      const warnings = [];
       async function adjustQuantity(locType, locId, productId, delta) {
-        const existing = inventory.find(r =>
-          r.location_type === locType && r.location_id === locId && r.product_id === productId
-        );
+        const rows = await sb("inventory",
+          `?location_type=eq.${locType}&location_id=eq.${locId}&product_id=eq.${productId}&select=id,quantity`);
+        const existing = Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+        const p = products.find(p => p.id === productId);
         if (existing) {
           const newQty = (existing.quantity || 0) + delta;
-          if (newQty < 0) {
-            const p = products.find(p => p.id === productId);
-            throw new Error(`Not enough ${p?.name || "stock"} at this location (have ${existing.quantity}, need ${-delta})`);
-          }
+          if (newQty < 0) warnings.push(`${p?.name || "Product"}: location had ${existing.quantity}, now ${newQty}`);
           await sbPatch("inventory", existing.id, { quantity: newQty, updated_at: new Date().toISOString() });
         } else {
-          if (delta < 0) {
-            const p = products.find(p => p.id === productId);
-            throw new Error(`No ${p?.name || "stock"} exists at this location to subtract from`);
-          }
+          if (delta < 0) warnings.push(`${p?.name || "Product"}: location had 0, now ${delta}`);
           await sbPost("inventory", {
             product_id: productId,
             location_type: locType,
@@ -3640,7 +3717,11 @@ function InventoryCartModal({ action, products, trucks, shops, employees, invent
         await sbPost("inventory_transactions", txPayload);
       }
 
-      showToast(`Batch logged — ${cart.length} item${cart.length === 1 ? "" : "s"}`);
+      if (warnings.length > 0) {
+        showToast(`Batch logged with ${warnings.length} discrepancy warning${warnings.length === 1 ? "" : "s"} — ${warnings[0]}${warnings.length > 1 ? " (+" + (warnings.length - 1) + " more, see Reports → Discrepancies)" : " (see Reports → Discrepancies)"}`, "error");
+      } else {
+        showToast(`Batch logged — ${cart.length} item${cart.length === 1 ? "" : "s"}`);
+      }
       onSaved();
     } catch (err) {
       showToast("Error: " + (err.message || err), "error");
@@ -8782,7 +8863,7 @@ export default function App() {
       sb("trucks", "?select=*&order=truck_number").catch(() => []),
       sb("products", "?select=*&order=category,name").catch(() => []),
       sb("credit_cards", "?select=*&order=assigned_to").catch(() => []),
-      sb("inventory", "?select=*").catch(() => []),
+      sbAll("inventory", "?select=*").catch(() => []),
       sb("shops", "?select=*&order=name").catch(() => []),
     ]).then(([e, t, p, cc, inv, s]) => {
       setEmployees(e);
