@@ -9254,6 +9254,31 @@ export default function App() {
   const [shops, setShops] = useState([]);
   const [toast, setToast] = useState(null);
   const [dataLoaded, setDataLoaded] = useState(false);
+  const [updateReady, setUpdateReady] = useState(false);
+
+  // ── New-version detector ─────────────────────────────────────────────────────
+  // Field machines keep this tab open for days, and a browser never refetches
+  // the app's code while a tab stays open — so after a deploy, open tabs keep
+  // running the OLD version (old bugs included) until someone reloads. This
+  // compares the running bundle hash against the server's every 5 minutes and
+  // whenever the window regains focus, and shows an update bar when they differ.
+  useEffect(() => {
+    const current = (document.querySelector('script[src*="assets/index-"]')?.getAttribute("src") || "").match(/index-[a-z0-9]+\.js/)?.[0];
+    if (!current) return;
+    let stopped = false;
+    async function check() {
+      if (stopped || document.hidden) return;
+      try {
+        const html = await fetch("/?v=" + Date.now(), { cache: "no-store" }).then(r => r.text());
+        const latest = html.match(/index-[a-z0-9]+\.js/)?.[0];
+        if (latest && latest !== current) setUpdateReady(true);
+      } catch (e) { /* offline — try again later */ }
+    }
+    const iv = setInterval(check, 5 * 60 * 1000);
+    window.addEventListener("focus", check);
+    check();
+    return () => { stopped = true; clearInterval(iv); window.removeEventListener("focus", check); };
+  }, []);
 
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type, key: Date.now() });
@@ -9331,6 +9356,14 @@ export default function App() {
   return (
     <>
       <style>{css}</style>
+      {updateReady && (
+        <div onClick={() => window.location.reload()}
+          style={{position:"fixed",top:0,left:0,right:0,zIndex:9999,background:"#22C55E",color:"#0B0F17",
+            padding:"10px 14px",textAlign:"center",fontSize:13,fontWeight:700,cursor:"pointer",
+            fontFamily:"DM Sans,sans-serif",boxShadow:"0 2px 12px rgba(0,0,0,0.4)"}}>
+          ⬆ A new version of the ops platform is available — tap here to update (takes 2 seconds)
+        </div>
+      )}
       {toast && <Toast key={toast.key} msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
       {!currentUser ? (
         <Login onLogin={login} />
