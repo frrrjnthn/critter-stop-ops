@@ -96,6 +96,60 @@ async function sbStorageDelete(bucket, path) {
   return true;
 }
 
+// ── Slack notifications ──────────────────────────────────────────────────────
+// Settings are stored in the `slack_settings` key/value table. The webhook URL
+// row has key='webhook_url' with the URL in `value` and `enabled` as the
+// master switch. Each alert kind has its own row (alert_order_placed, etc.)
+// that can be toggled on/off without touching the URL.
+//
+// We cache the settings in memory for 60s to avoid hitting the DB on every
+// event. The cache is invalidated when the user saves Slack settings.
+let _slackSettingsCache = null;
+let _slackSettingsCachedAt = 0;
+function invalidateSlackCache() { _slackSettingsCache = null; _slackSettingsCachedAt = 0; }
+
+async function getSlackSettings() {
+  const now = Date.now();
+  if (_slackSettingsCache && (now - _slackSettingsCachedAt) < 60000) return _slackSettingsCache;
+  try {
+    const rows = await sb("slack_settings", "?select=*");
+    const map = {};
+    for (const r of rows) map[r.key] = r;
+    _slackSettingsCache = map;
+    _slackSettingsCachedAt = now;
+    return map;
+  } catch { return {}; }
+}
+
+// Fire-and-forget. Pass alertKey so we can respect the per-alert enabled flag.
+// Returns true if sent, false if skipped (not configured / disabled / failed).
+async function sendSlack(alertKey, text, extra = {}) {
+  try {
+    const settings = await getSlackSettings();
+    const hook = settings.webhook_url;
+    if (!hook?.enabled || !hook?.value) return false;
+    const alert = settings[alertKey];
+    if (alert && alert.enabled === false) return false;
+    // CORS note: Slack incoming webhooks accept POST from any origin, but some
+    // browsers block the preflight. Using text/plain content-type avoids the
+    // preflight entirely while Slack still parses the JSON body correctly.
+    const body = { text, ...extra };
+    const res = await fetch(hook.value, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=UTF-8" },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      console.warn("[slack] send failed:", res.status, await res.text());
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn("[slack] send error:", err);
+    return false;
+  }
+}
+
 function formatFileSize(bytes) {
   if (!bytes) return "—";
   if (bytes < 1024) return bytes + " B";
@@ -2714,6 +2768,14 @@ function OrderSubmit({ user, products, employees, showToast }) {
           notes: it.notes || null
         });
       }
+      // Fire a Slack ping (silent no-op if not configured)
+      const itemLines = items.map(it => {
+        const p = products.find(x => x.id === it.product_id);
+        return `• ${p?.name || "Unknown"} × ${it.quantity}`;
+      }).join("\n");
+      sendSlack("alert_order_placed",
+        `🧾 *New product order submitted*\n*By:* ${emp?.name || "Unknown"}${emp?.branch ? " (" + emp.branch + ")" : ""}\n*Needed by week of:* ${weekNeeded}\n${itemLines}${notes.trim() ? "\n*Notes:* " + notes.trim() : ""}`
+      );
       showToast("Order request submitted");
       setItems([]); setNotes("");
       loadRecent();
@@ -4179,6 +4241,32 @@ function InventoryCartModal({ action, products, trucks, shops, employees, invent
       } else {
         showToast(`Batch logged — ${cart.length} item${cart.length === 1 ? "" : "s"}`);
       }
+
+      // Reorder-threshold alert: for products that were decremented in this batch,
+      // check if their TOTAL inventory now sits at/below the reorder threshold.
+      // Fires one Slack ping per product that crossed (not per location).
+      try {
+        if (fromType && fromId) {
+          const touchedProductIds = Array.from(new Set(cart.map(c => c.product_id)));
+          for (const pid of touchedProductIds) {
+            const p = products.find(x => x.id === pid);
+            if (!p) continue;
+            // Pull all inventory rows for this product + any location's threshold
+            const invRows = await sb("inventory", `?product_id=eq.${pid}&select=quantity,reorder_threshold`).catch(() => []);
+            const total = (invRows || []).reduce((s, r) => s + (Number(r.quantity) || 0), 0);
+            const threshold = (invRows || [])
+              .map(r => r.reorder_threshold)
+              .filter(t => t != null)
+              .reduce((max, t) => Math.max(max, Number(t)), 0);
+            if (threshold > 0 && total <= threshold) {
+              sendSlack("alert_reorder_needed",
+                `📉 *Reorder needed:* ${p.name}\n*Total on hand:* ${total}${p.unit_of_measure ? " " + p.unit_of_measure : ""}\n*Reorder threshold:* ${threshold}\n*Last activity:* ${user?.name || "Unknown"}`
+              );
+            }
+          }
+        }
+      } catch (slackErr) { console.warn("[slack] reorder check failed:", slackErr); }
+
       onSaved();
     } catch (err) {
       showToast("Error: " + (err.message || err), "error");
@@ -4777,6 +4865,757 @@ function EquipmentModal({ equipment, onClose, onSaved, showToast }) {
   );
 }
 
+
+// ── Insulation Equipment ─────────────────────────────────────────────────────
+// Fixed-fleet maintenance tracking for insulation gear: trailers, gas-powered
+// vacuums, cellulose blowers (CM1500), and the AttiCat fiberglass blower.
+// Each piece carries its own maintenance history and auto-computes "next due"
+// based on type-specific schedules below.
+
+const INS_EQUIPMENT_TYPES = [
+  { value: "trailer",            label: "Trailer",            icon: "🚚", color: "blue"   },
+  { value: "vacuum",             label: "Vacuum",             icon: "🌀", color: "amber"  },
+  { value: "cellulose_blower",   label: "Cellulose Blower",   icon: "🌪", color: "green"  },
+  { value: "fiberglass_blower",  label: "Fiberglass Blower",  icon: "🧊", color: "purple" },
+  { value: "other",              label: "Other",              icon: "🔧", color: "gray"   }
+];
+function insTypeMeta(t) { return INS_EQUIPMENT_TYPES.find(x => x.value === t) || INS_EQUIPMENT_TYPES[INS_EQUIPMENT_TYPES.length - 1]; }
+
+const INS_SERVICE_TYPES = [
+  { value: "oil_change",         label: "Oil + filter change", icon: "🛢" },
+  { value: "air_filter",         label: "Air filter",           icon: "🌬" },
+  { value: "spark_plug",         label: "Spark plug",           icon: "⚡" },
+  { value: "chain_grease",       label: "Chain grease",         icon: "⛓" },
+  { value: "belt",               label: "Belt",                 icon: "〰" },
+  { value: "wheel_bearings",     label: "Wheel bearings",       icon: "⚙" },
+  { value: "brakes",             label: "Brakes",               icon: "🛑" },
+  { value: "tire_pressure",      label: "Tire pressure/condition", icon: "🛞" },
+  { value: "lights_inspection",  label: "Lights inspection",    icon: "💡" },
+  { value: "axle_inspection",    label: "Axle inspection",      icon: "🔩" },
+  { value: "general_inspection", label: "General inspection",   icon: "✓"  },
+  { value: "repair",             label: "Repair",               icon: "🔧" },
+  { value: "other",              label: "Other",                icon: "📎" }
+];
+function insServiceMeta(s) { return INS_SERVICE_TYPES.find(x => x.value === s) || INS_SERVICE_TYPES[INS_SERVICE_TYPES.length - 1]; }
+
+// Per-type maintenance schedules. Hours = engine run-hours, days = calendar days.
+// Each entry defines the service kind and the interval at which it recurs.
+const INS_MAINTENANCE_SCHEDULES = {
+  vacuum: [
+    { service_type: "oil_change",  intervalHours: 80,  label: "Oil + filter"  },
+    { service_type: "air_filter",  intervalHours: 100, label: "Air filter"    },
+    { service_type: "spark_plug",  intervalDays: 365,  label: "Spark plug"    }
+  ],
+  cellulose_blower: [
+    { service_type: "chain_grease",       intervalHours: 40, intervalDays: 7, label: "Chain grease (whichever first)" },
+    { service_type: "general_inspection", intervalDays: 90,  label: "Airlock seals + drive belt check" }
+  ],
+  fiberglass_blower: [
+    { service_type: "chain_grease",       intervalDays: 30,  label: "Drive chain lube" },
+    { service_type: "general_inspection", intervalDays: 90,  label: "Shredders + belt" }
+  ],
+  trailer: [
+    { service_type: "wheel_bearings",    intervalDays: 365, label: "Wheel bearing repack" },
+    { service_type: "brakes",            intervalDays: 365, label: "Brake inspection" },
+    { service_type: "tire_pressure",     intervalDays: 30,  label: "Tire pressure/condition" },
+    { service_type: "lights_inspection", intervalDays: 90,  label: "Lights" },
+    { service_type: "axle_inspection",   intervalDays: 365, label: "Axle + springs" },
+    { service_type: "general_inspection",intervalDays: 365, label: "Floor + coupler + chains" }
+  ],
+  other: []
+};
+
+// For a given piece of equipment and its maintenance history, compute what's
+// due now, soon, or overdue. Returns an array of status entries.
+function computeDueServices(eq, history) {
+  const schedule = INS_MAINTENANCE_SCHEDULES[eq.type] || [];
+  const now = new Date();
+  const curHours = Number(eq.current_hours) || 0;
+  return schedule.map(s => {
+    const past = history
+      .filter(h => h.service_type === s.service_type)
+      .sort((a, b) => (b.service_date || "").localeCompare(a.service_date || ""));
+    const last = past[0] || null;
+    let dueByHours = null, dueByDate = null, status = "ok", reason = "";
+
+    if (s.intervalHours != null) {
+      const lastHours = last && last.hours_at_service != null ? Number(last.hours_at_service) : 0;
+      const hoursSince = curHours - lastHours;
+      const hoursUntil = s.intervalHours - hoursSince;
+      dueByHours = hoursUntil;
+      if (hoursUntil <= 0)                   { status = "overdue"; reason = `${Math.abs(hoursUntil).toFixed(0)} hrs over`; }
+      else if (hoursUntil <= s.intervalHours * 0.15) { status = "soon"; reason = `${hoursUntil.toFixed(0)} hrs left`; }
+      else                                    { reason = `${hoursUntil.toFixed(0)} hrs left`; }
+    }
+    if (s.intervalDays != null) {
+      const baseDate = last ? parseLocalDate(last.service_date) : (eq.created_at ? new Date(eq.created_at) : now);
+      const dueDate = new Date(baseDate.getTime() + s.intervalDays * 86400000);
+      const daysUntil = Math.round((dueDate - now) / 86400000);
+      dueByDate = daysUntil;
+      // Only overwrite status if more urgent than hours-based
+      const dateStatus = daysUntil <= 0 ? "overdue" : (daysUntil <= Math.max(7, s.intervalDays * 0.15) ? "soon" : "ok");
+      const rank = { ok: 0, soon: 1, overdue: 2 };
+      if (rank[dateStatus] > rank[status]) {
+        status = dateStatus;
+        reason = daysUntil <= 0 ? `${Math.abs(daysUntil)} days over` : `${daysUntil} days left`;
+      } else if (status === "ok") {
+        reason = `${daysUntil} days left`;
+      }
+    }
+    return {
+      service_type: s.service_type,
+      label: s.label,
+      status, reason,
+      lastDate: last?.service_date || null,
+      lastHours: last?.hours_at_service != null ? Number(last.hours_at_service) : null,
+      intervalHours: s.intervalHours || null,
+      intervalDays: s.intervalDays || null,
+      dueByHours, dueByDate
+    };
+  });
+}
+
+function worstStatus(items) {
+  if (items.some(i => i.status === "overdue")) return "overdue";
+  if (items.some(i => i.status === "soon")) return "soon";
+  return "ok";
+}
+
+function InsulationEquipmentPage({ user, employees, showToast }) {
+  const [equipment, setEquipment] = useState([]);
+  const [maintenance, setMaintenance] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [typeFilter, setTypeFilter] = useState("All");
+  const [branchFilter, setBranchFilter] = useState("All");
+  const [detailOpen, setDetailOpen] = useState(null); // equipment id or null
+  const [addEquipOpen, setAddEquipOpen] = useState(false);
+  const [editEquip, setEditEquip] = useState(null);
+
+  const isManager = ["super_admin","manager","lead"].includes(user.access_level);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const [eq, mx] = await Promise.all([
+        sb("insulation_equipment", "?select=*&order=type,name").catch(() => []),
+        sb("insulation_equipment_maintenance", "?select=*&order=service_date.desc&limit=1000").catch(() => [])
+      ]);
+      setEquipment(eq || []);
+      setMaintenance(mx || []);
+    } catch (err) { showToast("Error loading: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, []); // eslint-disable-line
+
+  // Group maintenance by equipment_id
+  const maintByEquip = {};
+  for (const m of maintenance) {
+    if (!maintByEquip[m.equipment_id]) maintByEquip[m.equipment_id] = [];
+    maintByEquip[m.equipment_id].push(m);
+  }
+
+  // Filter + sort
+  const filtered = equipment.filter(e => {
+    if (!e.active) return false;
+    if (typeFilter !== "All" && e.type !== typeFilter) return false;
+    if (branchFilter !== "All" && e.branch !== branchFilter) return false;
+    return true;
+  });
+
+  // Rollup for KPI tiles
+  const allWithStatus = equipment.filter(e => e.active).map(e => {
+    const dues = computeDueServices(e, maintByEquip[e.id] || []);
+    return { eq: e, dues, worst: worstStatus(dues) };
+  });
+  const overdueCount = allWithStatus.filter(x => x.worst === "overdue").length;
+  const soonCount    = allWithStatus.filter(x => x.worst === "soon").length;
+  const okCount      = allWithStatus.filter(x => x.worst === "ok").length;
+
+  // Group filtered equipment by type for the main grid
+  const groupedByType = {};
+  for (const e of filtered) {
+    if (!groupedByType[e.type]) groupedByType[e.type] = [];
+    groupedByType[e.type].push(e);
+  }
+  const typeOrder = INS_EQUIPMENT_TYPES.map(t => t.value).filter(t => groupedByType[t]);
+
+  const branches = Array.from(new Set(equipment.map(e => e.branch).filter(Boolean))).sort();
+  const detailEquip = detailOpen ? equipment.find(e => e.id === detailOpen) : null;
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        🧰 <strong>Insulation equipment maintenance.</strong> Tracks every trailer, vacuum, and blower in the fleet with per-type service schedules. Tap any piece of equipment to log a service, update its run hours, or view its history.
+      </div>
+
+      {/* KPI tiles */}
+      <div className="stat-row" style={{marginBottom:14}}>
+        {[
+          { label: "Equipment pieces", value: allWithStatus.length, color: "#E8EDF5" },
+          { label: "OK",                value: okCount,              color: "#22C55E" },
+          { label: "Due soon",          value: soonCount,            color: "#F59E0B" },
+          { label: "Overdue",           value: overdueCount,         color: overdueCount > 0 ? "#EF4444" : "#8A95A8" }
+        ].map((t, i) => (
+          <div key={i} className="stat-tile">
+            <div className="stat-label">{t.label}</div>
+            <div className="stat-value" style={{color: t.color}}>{t.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Filter bar */}
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+        <select className="form-input" value={typeFilter} onChange={e => setTypeFilter(e.target.value)}
+          style={{width:160,padding:"6px 9px"}}>
+          <option value="All">All types</option>
+          {INS_EQUIPMENT_TYPES.map(t => <option key={t.value} value={t.value}>{t.icon} {t.label}</option>)}
+        </select>
+        {branches.length > 0 && (
+          <select className="form-input" value={branchFilter} onChange={e => setBranchFilter(e.target.value)}
+            style={{width:140,padding:"6px 9px"}}>
+            <option value="All">All branches</option>
+            {branches.map(b => <option key={b} value={b}>{b}</option>)}
+          </select>
+        )}
+        <div style={{flex:1}} />
+        {isManager && <Btn variant="primary" onClick={() => { setEditEquip(null); setAddEquipOpen(true); }}>+ Add equipment</Btn>}
+      </div>
+
+      {loading ? (
+        <div style={{padding:"30px 0",fontSize:13,color:"#8A95A8",textAlign:"center"}}>Loading...</div>
+      ) : filtered.length === 0 ? (
+        <div style={{padding:"30px 12px",fontSize:13,color:"#8A95A8",textAlign:"center",fontStyle:"italic",background:"#161B25",border:"1px solid #2A3348",borderRadius:8}}>
+          {equipment.length === 0
+            ? (isManager ? "No equipment logged yet. Click \"+ Add equipment\" to add your trailers, vacuums, and blowers." : "No equipment set up yet. Ask your admin.")
+            : "No equipment matches those filters."}
+        </div>
+      ) : typeOrder.map(type => {
+        const meta = insTypeMeta(type);
+        const list = groupedByType[type];
+        return (
+          <div key={type} style={{marginBottom:18}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,fontSize:12,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5}}>
+              <span>{meta.icon}</span>
+              <span>{meta.label}</span>
+              <span style={{fontWeight:400,textTransform:"none",letterSpacing:0}}>({list.length})</span>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:8}}>
+              {list.map(e => {
+                const dues = computeDueServices(e, maintByEquip[e.id] || []);
+                const worst = worstStatus(dues);
+                return <InsEquipCard key={e.id} eq={e} dues={dues} worst={worst} onClick={() => setDetailOpen(e.id)} />;
+              })}
+            </div>
+          </div>
+        );
+      })}
+
+      {detailOpen && detailEquip && (
+        <InsEquipDetailModal
+          eq={detailEquip}
+          history={maintByEquip[detailOpen] || []}
+          user={user}
+          canManage={isManager}
+          onClose={() => setDetailOpen(null)}
+          onChanged={load}
+          onEdit={() => { setEditEquip(detailEquip); setAddEquipOpen(true); setDetailOpen(null); }}
+          showToast={showToast}
+        />
+      )}
+
+      {addEquipOpen && (
+        <InsEquipFormModal
+          editing={editEquip}
+          onClose={() => { setAddEquipOpen(false); setEditEquip(null); }}
+          onSaved={() => { setAddEquipOpen(false); setEditEquip(null); load(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function InsEquipCard({ eq, dues, worst, onClick }) {
+  const meta = insTypeMeta(eq.type);
+  const borderColor = worst === "overdue" ? "#EF4444" : worst === "soon" ? "#F59E0B" : "#2A3348";
+  const statusLabel = worst === "overdue" ? "Overdue" : worst === "soon" ? "Due soon" : "OK";
+  const statusColor = worst === "overdue" ? "#EF4444" : worst === "soon" ? "#F59E0B" : "#22C55E";
+  const nextDues = dues.filter(d => d.status !== "ok").slice(0, 2);
+  return (
+    <div onClick={onClick}
+      style={{background:"#1E2535",border:"1px solid " + borderColor,borderRadius:8,padding:12,cursor:"pointer",display:"flex",flexDirection:"column",gap:6}}>
+      <div style={{display:"flex",alignItems:"flex-start",gap:8}}>
+        <div style={{fontSize:20,flexShrink:0}}>{meta.icon}</div>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5"}}>{eq.name}</div>
+          <div style={{fontSize:10,color:"#8A95A8",marginTop:1}}>
+            {eq.model || meta.label}{eq.branch ? " · " + eq.branch : ""}
+          </div>
+        </div>
+        <Badge color={worst === "overdue" ? "red" : worst === "soon" ? "amber" : "green"}>{statusLabel}</Badge>
+      </div>
+      {eq.current_hours != null && (eq.type === "vacuum" || eq.type === "cellulose_blower" || eq.type === "fiberglass_blower") && (
+        <div style={{fontSize:11,color:"#8A95A8"}}>
+          Run hours: <span style={{fontFamily:"monospace",color:"#E8EDF5"}}>{Number(eq.current_hours).toFixed(1)}</span>
+        </div>
+      )}
+      {nextDues.length > 0 && (
+        <div style={{marginTop:4,paddingTop:6,borderTop:"1px solid #2A3348"}}>
+          {nextDues.map((d, i) => (
+            <div key={i} style={{fontSize:10,color: d.status === "overdue" ? "#EF4444" : "#F59E0B",marginBottom:2}}>
+              <strong>{insServiceMeta(d.service_type).icon}</strong> {d.label}: {d.reason}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InsEquipDetailModal({ eq, history, user, canManage, onClose, onChanged, onEdit, showToast }) {
+  const [logOpen, setLogOpen] = useState(false);
+  const [hoursInput, setHoursInput] = useState(eq.current_hours != null ? String(eq.current_hours) : "");
+  const [savingHours, setSavingHours] = useState(false);
+  const dues = computeDueServices(eq, history);
+  const meta = insTypeMeta(eq.type);
+  const needsHours = eq.type === "vacuum" || eq.type === "cellulose_blower" || eq.type === "fiberglass_blower";
+
+  async function saveHours() {
+    const h = parseFloat(hoursInput);
+    if (isNaN(h) || h < 0) { showToast("Hours must be a non-negative number", "error"); return; }
+    setSavingHours(true);
+    try {
+      await sbPatch("insulation_equipment", eq.id, { current_hours: h, updated_at: new Date().toISOString() });
+      showToast("Run hours updated");
+      onChanged();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    setSavingHours(false);
+  }
+
+  async function deleteMaintRow(m) {
+    if (!window.confirm(`Delete this ${insServiceMeta(m.service_type).label} record from ${formatLocalDate(m.service_date)}?`)) return;
+    try {
+      if (m.storage_path) await sbStorageDelete("insulation-equipment", m.storage_path).catch(() => {});
+      await sbDelete("insulation_equipment_maintenance", m.id);
+      showToast("Record deleted");
+      onChanged();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+  }
+
+  async function downloadReceipt(m) {
+    try {
+      const url = await sbStorageSignedUrl("insulation-equipment", m.storage_path, 300);
+      window.open(url, "_blank");
+    } catch (err) { showToast("Open failed: " + (err.message || err), "error"); }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:620,maxHeight:"92vh",display:"flex",flexDirection:"column"}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">{meta.icon} {eq.name}</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+              {meta.label}{eq.model ? " · " + eq.model : ""}{eq.serial_number ? " · SN " + eq.serial_number : ""}{eq.branch ? " · " + eq.branch : ""}
+            </div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body" style={{overflowY:"auto",flex:1}}>
+          {/* Due services */}
+          <div className="mod-card" style={{marginBottom:12}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Service schedule</div>
+            {dues.length === 0 ? (
+              <div style={{fontSize:12,color:"#8A95A8",fontStyle:"italic"}}>No scheduled maintenance defined for this equipment type.</div>
+            ) : (
+              <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {dues.map((d, i) => {
+                  const sMeta = insServiceMeta(d.service_type);
+                  const color = d.status === "overdue" ? "#EF4444" : d.status === "soon" ? "#F59E0B" : "#22C55E";
+                  return (
+                    <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 10px",background:"#1E2535",border:"1px solid " + (d.status === "ok" ? "#2A3348" : color),borderRadius:6,fontSize:12}}>
+                      <div style={{fontSize:16,flexShrink:0}}>{sMeta.icon}</div>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontWeight:500,color:"#E8EDF5"}}>{d.label}</div>
+                        <div style={{fontSize:10,color:"#8A95A8",marginTop:2}}>
+                          {d.lastDate
+                            ? <>Last: {formatLocalDate(d.lastDate)}{d.lastHours != null ? ` at ${d.lastHours.toFixed(0)} hrs` : ""}</>
+                            : <>Never recorded</>}
+                          {" · Interval: "}
+                          {d.intervalHours && <>{d.intervalHours} hrs</>}
+                          {d.intervalHours && d.intervalDays && " or "}
+                          {d.intervalDays && <>{d.intervalDays} days</>}
+                        </div>
+                      </div>
+                      <div style={{fontSize:11,fontWeight:600,color,textAlign:"right"}}>
+                        {d.status === "ok" ? "OK" : d.status === "soon" ? "Due soon" : "Overdue"}
+                        <div style={{fontSize:10,color:"#8A95A8",fontWeight:400,marginTop:1}}>{d.reason}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Hours updater */}
+          {needsHours && (
+            <div className="mod-card" style={{marginBottom:12}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Run hours</div>
+              <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+                <div className="form-group" style={{flex:1,marginBottom:0}}>
+                  <label className="form-label" style={{fontSize:10}}>Current hours on meter</label>
+                  <input className="form-input" type="number" step="0.1" min="0"
+                    value={hoursInput} onChange={e => setHoursInput(e.target.value)}
+                    style={{fontFamily:"monospace"}} />
+                </div>
+                <Btn variant="primary" onClick={saveHours} disabled={savingHours}>
+                  {savingHours ? "Saving..." : "Update"}
+                </Btn>
+              </div>
+              <div style={{fontSize:10,color:"#8A95A8",marginTop:6}}>Keep this updated — the schedule above uses hours since last service to compute what's due.</div>
+            </div>
+          )}
+
+          {/* History */}
+          <div className="mod-card">
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5}}>Maintenance history ({history.length})</div>
+              <Btn variant="primary" onClick={() => setLogOpen(true)}>+ Log maintenance</Btn>
+            </div>
+            {history.length === 0 ? (
+              <div style={{fontSize:12,color:"#8A95A8",padding:"10px 0",fontStyle:"italic",textAlign:"center"}}>No maintenance recorded yet.</div>
+            ) : (
+              <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                {history.map(m => {
+                  const sMeta = insServiceMeta(m.service_type);
+                  return (
+                    <div key={m.id} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,fontSize:12}}>
+                      <div style={{fontSize:16,flexShrink:0}}>{sMeta.icon}</div>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{color:"#E8EDF5"}}>
+                          <strong>{sMeta.label}</strong> · {formatLocalDate(m.service_date)}
+                        </div>
+                        <div style={{fontSize:10,color:"#8A95A8",marginTop:2}}>
+                          {m.hours_at_service != null && <>At {Number(m.hours_at_service).toFixed(0)} hrs · </>}
+                          {m.cost != null && <>${Number(m.cost).toFixed(2)} · </>}
+                          {m.vendor && <>{m.vendor} · </>}
+                          {m.performed_by && <>by {m.performed_by} · </>}
+                          logged by {m.uploader_name || "—"}
+                        </div>
+                        {m.notes && <div style={{fontSize:10,color:"#8A95A8",marginTop:2,fontStyle:"italic"}}>{m.notes}</div>}
+                      </div>
+                      <div style={{display:"flex",gap:5,flexShrink:0}}>
+                        {m.storage_path && <Btn onClick={() => downloadReceipt(m)} style={{padding:"4px 8px",fontSize:11}}>Receipt</Btn>}
+                        {canManage && <Btn variant="red" onClick={() => deleteMaintRow(m)} style={{padding:"4px 8px",fontSize:11}}>×</Btn>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8,padding:"12px 18px",borderTop:"1px solid #2A3348"}}>
+          {canManage && <Btn onClick={onEdit}>Edit equipment</Btn>}
+          <div style={{flex:1}} />
+          <Btn onClick={onClose}>Close</Btn>
+        </div>
+      </div>
+      {logOpen && (
+        <InsMaintLogModal
+          eq={eq}
+          user={user}
+          onClose={() => setLogOpen(false)}
+          onSaved={() => { setLogOpen(false); onChanged(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function InsMaintLogModal({ eq, user, onClose, onSaved, showToast }) {
+  const [form, setForm] = useState({
+    service_type: (INS_MAINTENANCE_SCHEDULES[eq.type]?.[0]?.service_type) || "general_inspection",
+    service_date: new Date().toISOString().slice(0,10),
+    hours_at_service: eq.current_hours != null ? String(eq.current_hours) : "",
+    cost: "",
+    vendor: "",
+    performed_by: "",
+    notes: "",
+    update_current_hours: true
+  });
+  const [file, setFile] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const needsHours = eq.type === "vacuum" || eq.type === "cellulose_blower" || eq.type === "fiberglass_blower";
+
+  function update(k, v) { setForm(p => ({ ...p, [k]: v })); }
+
+  function handleFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) { setFile(null); return; }
+    if (f.size > 25 * 1024 * 1024) {
+      showToast("File too large (25 MB max)", "error");
+      e.target.value = "";
+      return;
+    }
+    setFile(f);
+  }
+
+  async function save() {
+    if (!form.service_type) { showToast("Pick a service type", "error"); return; }
+    if (!form.service_date) { showToast("Pick a service date", "error"); return; }
+    const h = form.hours_at_service === "" ? null : parseFloat(form.hours_at_service);
+    if (h != null && (isNaN(h) || h < 0)) { showToast("Hours must be a non-negative number", "error"); return; }
+    const c = form.cost === "" ? null : parseFloat(form.cost);
+    if (c != null && (isNaN(c) || c < 0)) { showToast("Cost must be a non-negative number", "error"); return; }
+
+    setSaving(true);
+    try {
+      let storagePath = null, fileName = null, mimeType = null, fileSize = null;
+      if (file) {
+        const safe = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const path = `${eq.id}/${Date.now()}-${safe}`;
+        await sbStorageUpload("insulation-equipment", path, file);
+        storagePath = path;
+        fileName = file.name;
+        mimeType = file.type || null;
+        fileSize = file.size;
+      }
+      await sbPost("insulation_equipment_maintenance", {
+        equipment_id: eq.id,
+        service_type: form.service_type,
+        service_date: form.service_date,
+        hours_at_service: h,
+        cost: c,
+        vendor: form.vendor.trim() || null,
+        performed_by: form.performed_by.trim() || null,
+        notes: form.notes.trim() || null,
+        file_name: fileName,
+        storage_path: storagePath,
+        mime_type: mimeType,
+        file_size: fileSize,
+        uploaded_by: user?.id || null,
+        uploader_name: user?.name || null
+      });
+      // If user bumped hours, update the equipment's current_hours too
+      if (needsHours && form.update_current_hours && h != null) {
+        await sbPatch("insulation_equipment", eq.id, { current_hours: h, updated_at: new Date().toISOString() });
+      }
+      showToast("Maintenance logged");
+      onSaved();
+    } catch (err) {
+      console.error("[insulation_equipment_maintenance] save failed:", err);
+      showToast("Save failed: " + (err.message || err), "error");
+    }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" style={{zIndex:600}} onClick={e => e.target === e.currentTarget && !saving && onClose()}>
+      <div className="modal" style={{maxWidth:500}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">+ Log maintenance</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>{eq.name}</div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Service type *</label>
+            <select className="form-input" value={form.service_type}
+              onChange={e => update("service_type", e.target.value)}>
+              {INS_SERVICE_TYPES.map(s => <option key={s.value} value={s.value}>{s.icon} {s.label}</option>)}
+            </select>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns: needsHours ? "1fr 1fr" : "1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Service date *</label>
+              <input className="form-input" type="date" value={form.service_date}
+                onChange={e => update("service_date", e.target.value)} />
+            </div>
+            {needsHours && (
+              <div className="form-group" style={{marginBottom:0}}>
+                <label className="form-label">Hours at service</label>
+                <input className="form-input" type="number" step="0.1" min="0"
+                  value={form.hours_at_service} onChange={e => update("hours_at_service", e.target.value)}
+                  style={{fontFamily:"monospace"}} />
+              </div>
+            )}
+          </div>
+          {needsHours && (
+            <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,cursor:"pointer",marginBottom:10,color:"#8A95A8"}}>
+              <input type="checkbox" checked={!!form.update_current_hours}
+                onChange={e => update("update_current_hours", e.target.checked)} />
+              Update equipment's current hours to this value
+            </label>
+          )}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Cost</label>
+              <input className="form-input" type="number" step="0.01" min="0"
+                value={form.cost} onChange={e => update("cost", e.target.value)}
+                style={{fontFamily:"monospace"}} placeholder="0.00" />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Vendor / shop</label>
+              <input className="form-input" value={form.vendor}
+                onChange={e => update("vendor", e.target.value)}
+                placeholder="e.g. Northside Mobile" />
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Performed by</label>
+            <input className="form-input" value={form.performed_by}
+              onChange={e => update("performed_by", e.target.value)}
+              placeholder="e.g. Jacob, or shop tech name" />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Notes</label>
+            <textarea className="form-input" rows={2} value={form.notes}
+              onChange={e => update("notes", e.target.value)}
+              placeholder="Anything else — parts replaced, follow-up needed..." />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Receipt / photo (optional)</label>
+            <input type="file" onChange={handleFile}
+              style={{width:"100%",padding:"6px 8px",background:"#0F1623",border:"1px solid #2A3348",borderRadius:6,color:"#E8EDF5",fontSize:12}} />
+            {file && <div style={{fontSize:11,color:"#8A95A8",marginTop:4}}>{file.name} · {formatFileSize(file.size)}</div>}
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+              {saving ? "Saving..." : "Save"}
+            </Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InsEquipFormModal({ editing, onClose, onSaved, showToast }) {
+  const isEdit = !!editing;
+  const [form, setForm] = useState(() => editing ? {
+    name: editing.name || "",
+    type: editing.type || "trailer",
+    model: editing.model || "",
+    serial_number: editing.serial_number || "",
+    branch: editing.branch || "",
+    current_hours: editing.current_hours != null ? String(editing.current_hours) : "",
+    notes: editing.notes || "",
+    active: editing.active !== false
+  } : {
+    name: "", type: "trailer", model: "", serial_number: "", branch: "", current_hours: "", notes: "", active: true
+  });
+  const [saving, setSaving] = useState(false);
+
+  function update(k, v) { setForm(p => ({ ...p, [k]: v })); }
+  const needsHours = form.type === "vacuum" || form.type === "cellulose_blower" || form.type === "fiberglass_blower";
+
+  async function save() {
+    if (!form.name.trim()) { showToast("Name required", "error"); return; }
+    const h = form.current_hours === "" ? null : parseFloat(form.current_hours);
+    if (h != null && (isNaN(h) || h < 0)) { showToast("Hours must be a non-negative number", "error"); return; }
+    setSaving(true);
+    try {
+      const payload = {
+        name: form.name.trim(),
+        type: form.type,
+        model: form.model.trim() || null,
+        serial_number: form.serial_number.trim() || null,
+        branch: form.branch || null,
+        current_hours: needsHours ? h : null,
+        notes: form.notes.trim() || null,
+        active: !!form.active,
+        updated_at: new Date().toISOString()
+      };
+      if (isEdit) await sbPatch("insulation_equipment", editing.id, payload);
+      else        await sbPost("insulation_equipment", payload);
+      showToast(isEdit ? "Equipment updated" : "Equipment added");
+      onSaved();
+    } catch (err) { showToast("Save failed: " + (err.message || err), "error"); }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && !saving && onClose()}>
+      <div className="modal" style={{maxWidth:460}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">{isEdit ? "Edit equipment" : "+ Add equipment"}</div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Name *</label>
+            <input className="form-input" value={form.name} autoFocus
+              onChange={e => update("name", e.target.value)}
+              placeholder="e.g. Vacuum #3, Trailer A, CM1500 Unit 1" />
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Type *</label>
+              <select className="form-input" value={form.type}
+                onChange={e => update("type", e.target.value)}>
+                {INS_EQUIPMENT_TYPES.map(t => <option key={t.value} value={t.value}>{t.icon} {t.label}</option>)}
+              </select>
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Branch</label>
+              <select className="form-input" value={form.branch}
+                onChange={e => update("branch", e.target.value)}>
+                <option value="">—</option>
+                {BASE_BRANCHES.map(b => <option key={b} value={b}>{b}</option>)}
+              </select>
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Model</label>
+              <input className="form-input" value={form.model}
+                onChange={e => update("model", e.target.value)}
+                placeholder="e.g. CM1500, AttiCat" />
+            </div>
+            <div className="form-group" style={{marginBottom:0}}>
+              <label className="form-label">Serial #</label>
+              <input className="form-input" value={form.serial_number}
+                onChange={e => update("serial_number", e.target.value)}
+                style={{fontFamily:"monospace"}} />
+            </div>
+          </div>
+          {needsHours && (
+            <div className="form-group">
+              <label className="form-label">Current run hours</label>
+              <input className="form-input" type="number" step="0.1" min="0"
+                value={form.current_hours} onChange={e => update("current_hours", e.target.value)}
+                style={{fontFamily:"monospace"}} placeholder="0" />
+              <div style={{fontSize:10,color:"#8A95A8",marginTop:3}}>What the hour meter shows right now. Used to compute oil-change and other hour-based intervals.</div>
+            </div>
+          )}
+          <div className="form-group">
+            <label className="form-label">Notes</label>
+            <textarea className="form-input" rows={2} value={form.notes}
+              onChange={e => update("notes", e.target.value)} />
+          </div>
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,cursor:"pointer",marginBottom:14}}>
+            <input type="checkbox" checked={!!form.active} onChange={e => update("active", e.target.checked)} />
+            Active (in service)
+          </label>
+          <div style={{display:"flex",gap:8}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>
+              {saving ? "Saving..." : isEdit ? "Save changes" : "Add equipment"}
+            </Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ── Fleet ─────────────────────────────────────────────────────────────────────
 function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) {
@@ -6171,12 +7010,20 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
     has_gps: editing.has_gps ?? false,
     mileage: editing.mileage != null ? String(editing.mileage) : "",
     next_oil_miles: editing.next_oil_miles != null ? String(editing.next_oil_miles) : "",
-    reg_expires: editing.reg_expires || ""
+    reg_expires: editing.reg_expires || "",
+    oil_change_scheduled: !!editing.oil_change_scheduled,
+    oil_change_scheduled_date: editing.oil_change_scheduled_date || "",
+    state_inspection_scheduled: !!editing.state_inspection_scheduled,
+    state_inspection_scheduled_date: editing.state_inspection_scheduled_date || "",
+    state_inspection_expires: editing.state_inspection_expires || ""
   } : {
     truck_number: "",
     year: "", make: "", model: "", vin: "", plate: "",
     branch: "DFW", department: "", driver_id: "",
-    has_gps: false, mileage: "", next_oil_miles: "", reg_expires: ""
+    has_gps: false, mileage: "", next_oil_miles: "", reg_expires: "",
+    oil_change_scheduled: false, oil_change_scheduled_date: "",
+    state_inspection_scheduled: false, state_inspection_scheduled_date: "",
+    state_inspection_expires: ""
   });
   const [saving, setSaving] = useState(false);
 
@@ -6217,7 +7064,12 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
         has_gps: !!form.has_gps,
         mileage: mileageNum,
         next_oil_miles: nextOilNum,
-        reg_expires: form.reg_expires || null
+        reg_expires: form.reg_expires || null,
+        oil_change_scheduled: !!form.oil_change_scheduled,
+        oil_change_scheduled_date: form.oil_change_scheduled ? (form.oil_change_scheduled_date || null) : null,
+        state_inspection_scheduled: !!form.state_inspection_scheduled,
+        state_inspection_scheduled_date: form.state_inspection_scheduled ? (form.state_inspection_scheduled_date || null) : null,
+        state_inspection_expires: form.state_inspection_expires || null
       };
       let savedTruck;
       if (isEdit) {
@@ -6359,11 +7211,57 @@ function NewTruckModal({ employees, trucks, onClose, onSaved, showToast, editing
                   placeholder="e.g. 110000" />
               </div>
             </div>
-            <div className="form-group" style={{marginBottom:0}}>
+            <div className="form-group" style={{marginBottom:12}}>
               <label className="form-label">Registration expires</label>
               <input className="form-input" type="date" value={form.reg_expires}
                 onChange={e => update("reg_expires", e.target.value)} />
               <div style={{fontSize:10,color:"#8A95A8",marginTop:3}}>Quick reference. The Documents section below can hold the actual reg paperwork.</div>
+            </div>
+
+            {/* Scheduled service suppression flags — turn OFF Slack reminders for this
+                truck once service is scheduled but not yet performed. Clear the box
+                when the service is complete. */}
+            <div style={{borderTop:"1px solid #2A3348",paddingTop:12}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:8}}>Service scheduling</div>
+
+              <div style={{marginBottom:10}}>
+                <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,cursor:"pointer",marginBottom:4}}>
+                  <input type="checkbox" checked={!!form.oil_change_scheduled}
+                    onChange={e => update("oil_change_scheduled", e.target.checked)} />
+                  <span>Oil change scheduled — suppress Slack reminder for this truck</span>
+                </label>
+                {form.oil_change_scheduled && (
+                  <div style={{marginLeft:24,marginTop:4,display:"flex",gap:8,alignItems:"center"}}>
+                    <label className="form-label" style={{fontSize:10,marginBottom:0}}>Scheduled date</label>
+                    <input className="form-input" type="date" value={form.oil_change_scheduled_date}
+                      onChange={e => update("oil_change_scheduled_date", e.target.value)}
+                      style={{width:160,padding:"4px 8px"}} />
+                  </div>
+                )}
+              </div>
+
+              <div style={{marginBottom:10}}>
+                <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,cursor:"pointer",marginBottom:4}}>
+                  <input type="checkbox" checked={!!form.state_inspection_scheduled}
+                    onChange={e => update("state_inspection_scheduled", e.target.checked)} />
+                  <span>State inspection scheduled — suppress Slack reminder for this truck</span>
+                </label>
+                {form.state_inspection_scheduled && (
+                  <div style={{marginLeft:24,marginTop:4,display:"flex",gap:8,alignItems:"center"}}>
+                    <label className="form-label" style={{fontSize:10,marginBottom:0}}>Scheduled date</label>
+                    <input className="form-input" type="date" value={form.state_inspection_scheduled_date}
+                      onChange={e => update("state_inspection_scheduled_date", e.target.value)}
+                      style={{width:160,padding:"4px 8px"}} />
+                  </div>
+                )}
+              </div>
+
+              <div className="form-group" style={{marginBottom:0}}>
+                <label className="form-label">State inspection expires</label>
+                <input className="form-input" type="date" value={form.state_inspection_expires}
+                  onChange={e => update("state_inspection_expires", e.target.value)} />
+                <div style={{fontSize:10,color:"#8A95A8",marginTop:3}}>When the current state inspection sticker runs out. Used by the scheduled daily Slack reminder.</div>
+              </div>
             </div>
           </div>
 
@@ -7244,6 +8142,190 @@ function ShopModal({ shop, onClose, onSaved, showToast }) {
   );
 }
 
+// ── Slack Settings tab ───────────────────────────────────────────────────────
+// Super-admin only. Holds the webhook URL and per-alert enabled toggles.
+// Also lets you fire a test message to confirm the webhook works.
+const SLACK_ALERT_KEYS = [
+  { key: "alert_order_placed",            label: "Order placed",            desc: "Fires immediately when someone places a product order in the Order tab." },
+  { key: "alert_reorder_needed",          label: "Reorder needed",          desc: "Fires immediately when a product's inventory crosses below its reorder threshold." },
+  { key: "alert_truck_inventory_due",     label: "Truck inventory count due", desc: "Scheduled daily reminder: trucks that haven't had a monthly count. Requires the Supabase Edge Function (see walkthrough)." },
+  { key: "alert_truck_oil_due",           label: "Truck oil change due",    desc: "Scheduled daily reminder: trucks approaching their oil change interval. Suppressed if the \"Oil change scheduled\" checkbox is on for that truck." },
+  { key: "alert_truck_inspection_due",    label: "Truck state inspection due", desc: "Scheduled daily reminder: trucks with state inspection coming up or expired. Suppressed if the \"State inspection scheduled\" checkbox is on." },
+  { key: "alert_insulation_equipment_due", label: "Insulation equipment due", desc: "Scheduled daily reminder: vacuums, blowers, or trailers overdue for maintenance." }
+];
+
+function SlackSettingsTab({ user, showToast }) {
+  const [settings, setSettings] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [webhook, setWebhook] = useState("");
+  const [webhookEnabled, setWebhookEnabled] = useState(false);
+  const [savingWebhook, setSavingWebhook] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const rows = await sb("slack_settings", "?select=*");
+      const map = {};
+      for (const r of rows) map[r.key] = r;
+      setSettings(map);
+      setWebhook(map.webhook_url?.value || "");
+      setWebhookEnabled(!!map.webhook_url?.enabled);
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, []); // eslint-disable-line
+
+  // slack_settings uses `key` as PK, not `id`, so we hit the REST endpoint directly
+  async function patchSlackSetting(key, body) {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/slack_settings?key=eq." + encodeURIComponent(key), {
+      method: "PATCH", headers, body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
+
+  async function saveWebhook() {
+    const url = webhook.trim();
+    if (url && !url.startsWith("https://hooks.slack.com/")) {
+      if (!window.confirm("That doesn't look like a Slack webhook URL (should start with https://hooks.slack.com/). Save anyway?")) return;
+    }
+    setSavingWebhook(true);
+    try {
+      await patchSlackSetting("webhook_url", {
+        value: url || null,
+        enabled: !!url && webhookEnabled,
+        updated_at: new Date().toISOString(),
+        updated_by: user?.id || null
+      });
+      invalidateSlackCache();
+      showToast("Webhook saved");
+      load();
+    } catch (err) { showToast("Save failed: " + (err.message || err), "error"); }
+    setSavingWebhook(false);
+  }
+
+  async function toggleAlert(key, enabled) {
+    try {
+      await patchSlackSetting(key, { enabled, updated_at: new Date().toISOString(), updated_by: user?.id || null });
+      invalidateSlackCache();
+      setSettings(prev => ({ ...prev, [key]: { ...(prev[key] || { key }), enabled } }));
+    } catch (err) { showToast("Save failed: " + (err.message || err), "error"); }
+  }
+
+  async function sendTest() {
+    if (!webhook.trim()) { showToast("Save a webhook URL first", "error"); return; }
+    setTesting(true);
+    try {
+      // Send directly rather than through sendSlack so we bypass the enabled check
+      const res = await fetch(webhook.trim(), {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        body: JSON.stringify({ text: "✓ Test message from Critter Stop Ops. If you see this in Slack, the webhook works." })
+      });
+      if (res.ok) showToast("Test sent — check your Slack channel");
+      else showToast("Slack rejected the message: " + res.status + " " + (await res.text()), "error");
+    } catch (err) { showToast("Send failed: " + (err.message || err), "error"); }
+    setTesting(false);
+  }
+
+  if (loading) return <div style={{padding:20,textAlign:"center",color:"#8A95A8"}}>Loading...</div>;
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        💬 <strong>Slack notifications.</strong> Paste your Slack incoming webhook URL below, flip the master switch on, then enable the alerts you want. Event-driven alerts (order placed, reorder needed) fire immediately. Scheduled alerts (daily reminders) require a one-time Supabase Edge Function setup — walkthrough is below.
+      </div>
+
+      {/* Webhook URL + master switch */}
+      <div className="mod-card" style={{marginBottom:14}}>
+        <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>1 · Webhook URL</div>
+        <div className="form-group" style={{marginBottom:10}}>
+          <label className="form-label">Slack incoming webhook URL</label>
+          <input className="form-input" type="url" value={webhook}
+            onChange={e => setWebhook(e.target.value)}
+            placeholder="https://hooks.slack.com/services/T0000/B0000/..."
+            style={{fontFamily:"monospace",fontSize:11}} />
+          <div style={{fontSize:10,color:"#8A95A8",marginTop:4}}>
+            Create one in Slack: your workspace → Settings → Manage apps → search "Incoming Webhooks" → Add to Slack → pick a channel → copy the URL. Full walkthrough at the bottom of this page.
+          </div>
+        </div>
+        <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,cursor:"pointer",marginBottom:10}}>
+          <input type="checkbox" checked={webhookEnabled} onChange={e => setWebhookEnabled(e.target.checked)} />
+          <span><strong>Master switch:</strong> enable Slack notifications</span>
+        </label>
+        <div style={{display:"flex",gap:8}}>
+          <Btn variant="primary" onClick={saveWebhook} disabled={savingWebhook}>
+            {savingWebhook ? "Saving..." : "Save webhook"}
+          </Btn>
+          <Btn onClick={sendTest} disabled={testing || !webhook.trim()}>
+            {testing ? "Sending..." : "Send test message"}
+          </Btn>
+        </div>
+      </div>
+
+      {/* Per-alert toggles */}
+      <div className="mod-card" style={{marginBottom:14}}>
+        <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>2 · Alert toggles</div>
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {SLACK_ALERT_KEYS.map(a => {
+            const row = settings[a.key];
+            const on = row?.enabled !== false; // default on if row missing
+            const isScheduled = a.key.includes("due");
+            return (
+              <div key={a.key} style={{padding:"10px 12px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,display:"flex",alignItems:"flex-start",gap:10}}>
+                <label style={{display:"flex",alignItems:"center",cursor:"pointer",paddingTop:1}}>
+                  <input type="checkbox" checked={on} onChange={e => toggleAlert(a.key, e.target.checked)} />
+                </label>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5"}}>
+                    {a.label}
+                    {isScheduled && <span style={{marginLeft:8,fontSize:9,fontWeight:600,color:"#F59E0B"}}>⏰ SCHEDULED</span>}
+                    {!isScheduled && <span style={{marginLeft:8,fontSize:9,fontWeight:600,color:"#22C55E"}}>⚡ EVENT</span>}
+                  </div>
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>{a.desc}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Walkthrough */}
+      <div className="mod-card">
+        <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>3 · Setup walkthroughs</div>
+        <details style={{marginBottom:10}}>
+          <summary style={{cursor:"pointer",fontSize:13,fontWeight:600,color:"#E8EDF5",padding:"6px 0"}}>Creating a Slack webhook URL</summary>
+          <ol style={{fontSize:12,color:"#8A95A8",lineHeight:1.6,paddingLeft:20,marginTop:6}}>
+            <li>In Slack, click your workspace name (top left) → <strong>Tools & settings</strong> → <strong>Manage apps</strong>.</li>
+            <li>In the search bar at the top of the App Directory, type <strong>Incoming Webhooks</strong> and open it.</li>
+            <li>Click <strong>Add to Slack</strong>.</li>
+            <li>Pick the channel the messages should post into (e.g. <code>#ops-alerts</code>). Click <strong>Add Incoming Webhooks integration</strong>.</li>
+            <li>Copy the <strong>Webhook URL</strong> shown. It starts with <code>https://hooks.slack.com/services/...</code>.</li>
+            <li>Paste it above, check the master switch, click Save, then Send test message to verify.</li>
+          </ol>
+        </details>
+
+        <details style={{marginBottom:10}}>
+          <summary style={{cursor:"pointer",fontSize:13,fontWeight:600,color:"#E8EDF5",padding:"6px 0"}}>Setting up scheduled alerts (Supabase Edge Function)</summary>
+          <div style={{fontSize:12,color:"#8A95A8",lineHeight:1.6,marginTop:6}}>
+            <p>Scheduled alerts (daily "truck X is overdue for oil change" type pings) can't run from a browser — they need to fire even when no one has the dashboard open. Supabase Edge Functions + pg_cron handle this for free.</p>
+            <p><strong>One-time setup:</strong></p>
+            <ol style={{paddingLeft:20}}>
+              <li>In Supabase, click <strong>Edge Functions</strong> in the left nav → <strong>Deploy a new function</strong>.</li>
+              <li>Name it <code>daily-slack-check</code>. Paste the function code from the walkthrough file.</li>
+              <li>Go to <strong>Database → Extensions</strong>, enable <code>pg_cron</code> and <code>pg_net</code>.</li>
+              <li>Run the pg_cron schedule SQL (also in the walkthrough file).</li>
+              <li>The function will run daily at 7am Central Time and post reminders.</li>
+            </ol>
+            <p style={{marginTop:8}}>Full code + SQL are in the <code>slack_edge_function_setup.md</code> file I sent alongside this update.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  );
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 function Settings({ user, employees, setEmployees, products, setProducts, reloadProducts, trucks, setTrucks, shops, reloadShops, showToast }) {
   const [tab, setTab] = useState("users");
@@ -7386,7 +8468,9 @@ function Settings({ user, employees, setEmployees, products, setProducts, reload
   return (
     <div>
       <div className="tabs">
-        {[["users","Users & PINs"],["products","Products"],["employees","Employees"],["shops","Shops"],["inspection","Inspection Form"]].map(([t,l]) => (
+        {([
+          ["users","Users & PINs"],["products","Products"],["employees","Employees"],["shops","Shops"],["inspection","Inspection Form"]
+        ].concat(user.access_level === "super_admin" ? [["slack","Slack Alerts"]] : [])).map(([t,l]) => (
           <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
         ))}
       </div>
@@ -7470,6 +8554,10 @@ function Settings({ user, employees, setEmployees, products, setProducts, reload
       {tab === "shops" && <SettingsShopsTab shops={shops} reloadShops={reloadShops} showToast={showToast} />}
 
       {tab === "inspection" && <InspectionTemplateEditor showToast={showToast} />}
+
+      {tab === "slack" && user.access_level === "super_admin" && (
+        <SlackSettingsTab user={user} showToast={showToast} />
+      )}
 
       {tab === "trucks" && (
         <div>
@@ -9391,7 +10479,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",truck_inventory:"Monthly Inventory Count",equipment:"Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",resources:"Resources",evaluations:"Evaluations",reports:"Reports Center",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",truck_inventory:"Monthly Inventory Count",equipment:"Equipment",insulation_equipment:"Insulation Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",resources:"Resources",evaluations:"Evaluations",reports:"Reports Center",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -9424,6 +10512,7 @@ export default function App() {
               {navItem("inventory","Inventory","◧")}
               {navItem("truck_inventory","Inventory Count","📋")}
               {navItem("equipment","Equipment","🔧")}
+              {navItem("insulation_equipment","Insulation Equipment","🧰")}
               {navItem("fleet","Fleet","◉")}
               {navItem("inspections","Inspections","✓")}
               {navItem("cards","Credit Cards","◆")}
@@ -9457,6 +10546,7 @@ export default function App() {
             {page === "inventory" && <Inventory user={currentUser} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />}
             {page === "truck_inventory" && <TruckInventoryPage user={currentUser} products={products} trucks={trucks} shops={shops} employees={employees} showToast={showToast} />}
             {page === "equipment" && <EquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
+            {page === "insulation_equipment" && <InsulationEquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
             {dataLoaded && page === "inspections" && <InspectionsPage user={currentUser} trucks={trucks} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "cards" && <CardsPage user={currentUser} employees={employees} showToast={showToast} />}
