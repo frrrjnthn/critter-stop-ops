@@ -1152,6 +1152,27 @@ function TimeOff({ user, employees, showToast }) {
       if (editingId) saved = await sbPatch("time_off", editingId, payload);
       else           saved = await sbPost("time_off", payload);
       console.log("[time_off] saved successfully:", saved);
+      // Fire Slack alert on new submissions only (not edits, to avoid double pings).
+      // Callouts use their own key so they can be toggled separately from requests.
+      if (!editingId) {
+        const emp = employees.find(e => e.id === form.employee_id);
+        const empLabel = emp?.name || "Someone";
+        const branchLabel = emp?.branch ? ` (${emp.branch}${emp.department ? " " + emp.department : ""})` : "";
+        const dateLabel = form.start_date + (form.end_date && form.end_date !== form.start_date ? ` through ${form.end_date}` : "");
+        if (form.type === "callout") {
+          const typeLabel = form.callout_type ? form.callout_type.replace(/_/g, " ") : "callout";
+          const paidLabel = form.paid ? "paid" : "unpaid";
+          const coverageLabel = form.coverage_found ? "coverage found" : "no coverage yet";
+          sendSlack("alert_callout",
+            `Callout logged for ${empLabel}${branchLabel}\nDate: ${dateLabel}\nType: ${typeLabel} (${paidLabel}, ${coverageLabel})${form.reason ? "\nReason: " + form.reason.trim() : ""}`
+          );
+        } else {
+          const typeLabel = (form.type || "time off").replace(/_/g, " ");
+          sendSlack("alert_timeoff_request",
+            `Time off request from ${empLabel}${branchLabel}\nType: ${typeLabel}\nDates: ${dateLabel}${form.reason ? "\nReason: " + form.reason.trim() : ""}\nStatus: pending approval`
+          );
+        }
+      }
       // Refetch from DB so the new row shows up with its joined employee relation.
       // This is more reliable than trying to patch state with the POST response.
       await refreshRequests();
@@ -8148,6 +8169,8 @@ function ShopModal({ shop, onClose, onSaved, showToast }) {
 const SLACK_ALERT_KEYS = [
   { key: "alert_order_placed",            label: "Order placed",            desc: "Fires immediately when someone places a product order in the Order tab." },
   { key: "alert_reorder_needed",          label: "Reorder needed",          desc: "Fires immediately when a product's inventory crosses below its reorder threshold." },
+  { key: "alert_timeoff_request",         label: "Time off request",        desc: "Fires immediately when an employee submits a time off request so it doesn't get missed." },
+  { key: "alert_callout",                 label: "Callout logged",          desc: "Fires immediately when a callout is logged so coverage can be arranged." },
   { key: "alert_truck_inventory_due",     label: "Truck inventory count due", desc: "Scheduled daily reminder: trucks that haven't had a monthly count. Requires the Supabase Edge Function (see walkthrough)." },
   { key: "alert_truck_oil_due",           label: "Truck oil change due",    desc: "Scheduled daily reminder: trucks approaching their oil change interval. Suppressed if the \"Oil change scheduled\" checkbox is on for that truck." },
   { key: "alert_truck_inspection_due",    label: "Truck state inspection due", desc: "Scheduled daily reminder: trucks with state inspection coming up or expired. Suppressed if the \"State inspection scheduled\" checkbox is on." },
