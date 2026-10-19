@@ -1941,7 +1941,7 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
 
   function openMove(action) {
     // Managers can do anything. Employees can do truck-related actions for their own work.
-    const employeeAllowed = ["usage","load_truck","return","distributor_purchase"];
+    const employeeAllowed = ["usage","load_truck","return","distributor_purchase","truck_transfer"];
     if (!isManager && !employeeAllowed.includes(action)) {
       showToast("Only managers and leads can perform this action", "error");
       return;
@@ -2047,6 +2047,11 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
               <div style={{fontSize:22,marginBottom:6}}>↩</div>
               <div style={{fontSize:13,fontWeight:600}}>Return to shop</div>
               <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Pull stock off a truck back to shop</div>
+            </div>
+            <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("truck_transfer")}>
+              <div style={{fontSize:22,marginBottom:6}}>🔁</div>
+              <div style={{fontSize:13,fontWeight:600}}>Transfer truck → truck</div>
+              <div style={{fontSize:11,color:"#8A95A8",marginTop:3}}>Hand off stock between two trucks in the field</div>
             </div>
             <div className="mod-card" style={{cursor:"pointer"}} onClick={() => openMove("usage")}>
               <div style={{fontSize:22,marginBottom:6}}>📊</div>
@@ -2649,7 +2654,7 @@ function InventoryHistoryTable({ history, shops, trucks }) {
                 onClick={g.is_batch ? () => toggleExpand(g.batch_id) : undefined}>
                 <td style={{fontSize:11,color:"#8A95A8"}}>{new Date(g.created_at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</td>
                 <td>
-                  <Badge color={g.action === "load_truck" ? "blue" : g.action === "return" ? "amber" : g.action === "usage" ? "green" : g.action === "adjust" ? "red" : g.action === "distributor_purchase" ? "purple" : g.action === "count" ? "teal" : "gray"}>{g.action === "count" ? "Count" : g.action}</Badge>
+                  <Badge color={g.action === "load_truck" ? "blue" : g.action === "return" ? "amber" : g.action === "usage" ? "green" : g.action === "adjust" ? "red" : g.action === "distributor_purchase" ? "purple" : g.action === "count" ? "teal" : g.action === "truck_transfer" ? "blue" : "gray"}>{g.action === "count" ? "Count" : g.action === "truck_transfer" ? "Transfer" : g.action}</Badge>
                 </td>
                 <td>
                   {g.is_batch ? (
@@ -4068,6 +4073,7 @@ function InventoryCartModal({ action, products, trucks, shops, employees, invent
   const titles = {
     load_truck:           "🚛 Load truck",
     return:               "↩ Return to shop",
+    truck_transfer:       "🔁 Transfer truck → truck",
     add_stock:            "📥 Add shop stock",
     adjust:               "⚠ Adjust / write-off",
     usage:                "📊 Log product usage",
@@ -4076,6 +4082,7 @@ function InventoryCartModal({ action, products, trucks, shops, employees, invent
   const titleHint = {
     load_truck:           "Move multiple items from a shop to a truck in one batch",
     return:               "Pull multiple items off a truck back to a shop",
+    truck_transfer:       "Hand off stock between two trucks (common in the field when one truck runs out and another has extra)",
     add_stock:            "Receive multiple items into a shop (e.g. a Veseris delivery)",
     adjust:               "Correct quantities or write off damaged/lost stock at a single location",
     usage:                "Record multiple products used on a job",
@@ -4083,12 +4090,14 @@ function InventoryCartModal({ action, products, trucks, shops, employees, invent
   };
 
   // Determine field labels based on action
-  const fromLabel = action === "load_truck" ? "From shop" :
-                    action === "return"     ? "From truck" :
+  const fromLabel = action === "load_truck"     ? "From shop" :
+                    action === "return"         ? "From truck" :
+                    action === "truck_transfer" ? "From truck" :
                     null;
-  const toLabel   = action === "load_truck" ? "To truck" :
-                    action === "return"     ? "To shop" :
-                    action === "add_stock"  ? "To shop" :
+  const toLabel   = action === "load_truck"     ? "To truck" :
+                    action === "return"         ? "To shop" :
+                    action === "truck_transfer" ? "To truck" :
+                    action === "add_stock"      ? "To shop" :
                     action === "distributor_purchase" ? "Goes to truck" :
                     null;
   const singleLabel = action === "adjust" ? "Adjust at" :
@@ -4100,6 +4109,13 @@ function InventoryCartModal({ action, products, trucks, shops, employees, invent
     // slot: "from" or "to" or "single"
     if (action === "load_truck")  return slot === "from" ? shopOptions  : truckOptions;
     if (action === "return")      return slot === "from" ? truckOptions : shopOptions;
+    if (action === "truck_transfer") {
+      // Both pickers are trucks, but the "to" dropdown excludes whatever's
+      // already picked as "from" so you can't transfer a truck to itself.
+      if (slot === "from") return truckOptions.filter(t => t.value !== destination.to);
+      if (slot === "to")   return truckOptions.filter(t => t.value !== destination.from);
+      return truckOptions;
+    }
     if (action === "add_stock")   return slot === "to"   ? shopOptions  : [];
     if (action === "distributor_purchase") return slot === "to" ? truckOptions : [];
     if (action === "adjust" || action === "usage") {
@@ -4178,6 +4194,11 @@ function InventoryCartModal({ action, products, trucks, shops, employees, invent
       if (!destination.from || !destination.to) { showToast("Select both truck and shop", "error"); return; }
       fromType = "truck"; fromId = destination.from;
       toType   = "shop";  toId   = destination.to;
+    } else if (action === "truck_transfer") {
+      if (!destination.from || !destination.to) { showToast("Select both source truck and destination truck", "error"); return; }
+      if (destination.from === destination.to) { showToast("From and to trucks must be different", "error"); return; }
+      fromType = "truck"; fromId = destination.from;
+      toType   = "truck"; toId   = destination.to;
     } else if (action === "add_stock") {
       if (!destination.to) { showToast("Select a shop", "error"); return; }
       toType = "shop"; toId = destination.to;
