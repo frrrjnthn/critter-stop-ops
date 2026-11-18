@@ -1956,7 +1956,7 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
       </div>
 
       <div className="tabs" style={{marginBottom:14}}>
-        {[["shops","Shops"],["trucks","Trucks"],["log","Log Move"],["history","History"],["order","Order"],["reports","Reports"]].map(([t,l]) => (
+        {[["shops","Shops"],["trucks","Trucks"],["log","Log Move"],["history","History"],["reports","Reports"]].map(([t,l]) => (
           <button key={t} className={"tab-btn"+(tab===t?" active":"")} onClick={()=>setTab(t)}>{l}</button>
         ))}
       </div>
@@ -2092,10 +2092,6 @@ function Inventory({ user, products, trucks, employees, shops, showToast }) {
           </div>
           <InventoryHistoryTable history={history} shops={shops} trucks={trucks} />
         </div>
-      )}
-
-      {tab === "order" && (
-        <OrderTab user={user} products={products} employees={employees} showToast={showToast} />
       )}
 
       {tab === "reports" && (
@@ -2700,26 +2696,62 @@ function InventoryHistoryTable({ history, shops, trucks }) {
 }
 
 // ── Order tab (inside Inventory) — tech submits a need; manager consolidates ─
-function OrderTab({ user, products, employees, showToast }) {
+// Named fulfillers for Pull From Shop who may not have manager access_level
+// but should still see the branch's pending queue. Match by name (case-insensitive)
+// since access_level upgrades are brittle to track; this is explicit and easy to edit.
+const PULL_FROM_SHOP_FULFILLERS = [
+  "megan delph",       // DFW Pest service manager
+  "bryan bovee",       // DFW Insulation service manager
+  "kyle oktay",        // DFW Wildlife
+  "mathew hughes",     // DFW Wildlife
+  "jacob fenton",      // ATX
+  "cynthia barrientos",// CStat
+  "adrian valerio"     // OKC
+];
+function isPullFromShopFulfiller(user) {
+  if (!user?.name) return false;
+  return PULL_FROM_SHOP_FULFILLERS.includes(user.name.toLowerCase().trim());
+}
+
+function OrderTab({ user, products, employees, showToast, requestType, shops, trucks }) {
+  // requestType: 'pull_from_shop' (default, legacy) or 'veseris'
+  const rt = requestType || "pull_from_shop";
   const [subtab, setSubtab] = useState("submit");
-  const isManager = ["super_admin","manager","lead"].includes(user.access_level);
+  const isManagerRole = ["super_admin","manager","lead"].includes(user.access_level);
+  // For Pull From Shop, named fulfillers also see the Manager view.
+  // For Veseris, only actual managers/leads/super_admin can approve/order.
+  const canSeeManagerView = rt === "pull_from_shop"
+    ? (isManagerRole || isPullFromShopFulfiller(user))
+    : isManagerRole;
 
   return (
     <div>
       <div className="tabs" style={{marginBottom:14}}>
         <button className={"tab-btn"+(subtab==="submit"?" active":"")} onClick={()=>setSubtab("submit")}>📋 Submit Request</button>
-        {isManager && (
-          <button className={"tab-btn"+(subtab==="manager"?" active":"")} onClick={()=>setSubtab("manager")}>📦 Manager View</button>
+        {canSeeManagerView && (
+          <button className={"tab-btn"+(subtab==="manager"?" active":"")} onClick={()=>setSubtab("manager")}>
+            {rt === "pull_from_shop" ? "📦 Fulfill Queue" : "📦 Manager View"}
+          </button>
         )}
       </div>
-      {subtab === "submit"  && <OrderSubmit  user={user} products={products} employees={employees} showToast={showToast} />}
-      {subtab === "manager" && isManager && <OrderManager user={user} products={products} showToast={showToast} />}
+      {subtab === "submit"  && <OrderSubmit  user={user} products={products} employees={employees} shops={shops} trucks={trucks} requestType={rt} showToast={showToast} />}
+      {subtab === "manager" && canSeeManagerView && <OrderManager user={user} products={products} shops={shops} trucks={trucks} employees={employees} requestType={rt} showToast={showToast} />}
     </div>
   );
 }
 
 // ── Order: technician submits a request ──────────────────────────────────────
-function OrderSubmit({ user, products, employees, showToast }) {
+// Handles both request types:
+//   pull_from_shop: tech picks the shop they want product pulled from. On
+//                   submit, lands in the Pull From Shop queue. When a manager
+//                   fulfills it, a load_truck inventory transaction fires.
+//   veseris:        tech picks reason (shop out / add new / better alternative).
+//                   Lands in the Veseris queue for leadership to order from
+//                   the distributor. When received, add_stock transaction
+//                   fires to update shop inventory.
+function OrderSubmit({ user, products, employees, shops, trucks, requestType, showToast }) {
+  const rt = requestType || "pull_from_shop";
+  const isVeseris = rt === "veseris";
   const [name, setName] = useState(user?.id || "");
   const [weekNeeded, setWeekNeeded] = useState(() => {
     // Default to next Monday
@@ -2729,21 +2761,45 @@ function OrderSubmit({ user, products, employees, showToast }) {
     return d.toISOString().slice(0,10);
   });
   const [notes, setNotes] = useState("");
+  const [reason, setReason] = useState("shop_out"); // Veseris only
+  const [fromShopId, setFromShopId] = useState(""); // Pull From Shop only
+  const [shopInventory, setShopInventory] = useState({}); // {product_id: qty} for the picked shop
   const [items, setItems] = useState([]); // [{ product_id, quantity, notes }]
   const [pickProduct, setPickProduct] = useState("");
   const [pickQty, setPickQty] = useState(1);
   const [recent, setRecent] = useState([]);
   const [saving, setSaving] = useState(false);
 
+  // Default the shop: user's branch shop if we can match one; otherwise first shop
+  useEffect(() => {
+    if (fromShopId || !shops?.length || isVeseris) return;
+    const userBranch = (user?.branch || "").toUpperCase();
+    const match = shops.find(s => (s.branch || "").toUpperCase() === userBranch) || shops[0];
+    if (match) setFromShopId(match.id);
+  }, [shops, user, isVeseris]); // eslint-disable-line
+
+  // Load the picked shop's on-hand inventory so techs can see what's available
+  useEffect(() => {
+    if (!fromShopId || isVeseris) { setShopInventory({}); return; }
+    (async () => {
+      try {
+        const rows = await sb("inventory", `?location_type=eq.shop&location_id=eq.${fromShopId}&select=product_id,quantity`);
+        const map = {};
+        for (const r of (rows || [])) map[r.product_id] = Number(r.quantity) || 0;
+        setShopInventory(map);
+      } catch { setShopInventory({}); }
+    })();
+  }, [fromShopId, isVeseris]);
+
   async function loadRecent() {
     if (!user?.id) return;
     try {
       const data = await sb("orders",
-        `?requester_id=eq.${user.id}&select=*,items:order_items(*,product:products(name))&order=created_at.desc&limit=10`);
+        `?requester_id=eq.${user.id}&request_type=eq.${rt}&select=*,items:order_items(*,product:products(name))&order=created_at.desc&limit=10`);
       setRecent(data);
     } catch (err) { /* silent */ }
   }
-  useEffect(() => { loadRecent(); }, []); // eslint-disable-line
+  useEffect(() => { loadRecent(); }, [rt]); // eslint-disable-line
 
   function addItem() {
     if (!pickProduct) { showToast("Select a product first", "error"); return; }
@@ -2775,15 +2831,20 @@ function OrderSubmit({ user, products, employees, showToast }) {
   async function submitOrder() {
     if (!name) { showToast("Pick your name", "error"); return; }
     if (items.length === 0) { showToast("Add at least one product", "error"); return; }
+    if (!isVeseris && !fromShopId) { showToast("Pick which shop to pull from", "error"); return; }
     const emp = employees.find(e => e.id === name) || user;
     setSaving(true);
     try {
-      const created = await sbPost("orders", {
+      const payload = {
         requester_id: name,
         requester_name: emp?.name || "Unknown",
         week_needed: weekNeeded,
-        notes: notes.trim() || null
-      });
+        notes: notes.trim() || null,
+        request_type: rt
+      };
+      if (!isVeseris) payload.from_shop_id = fromShopId;
+      else            payload.reason = reason;
+      const created = await sbPost("orders", payload);
       const order = Array.isArray(created) ? created[0] : created;
       // Insert items
       for (const it of items) {
@@ -2799,10 +2860,13 @@ function OrderSubmit({ user, products, employees, showToast }) {
         const p = products.find(x => x.id === it.product_id);
         return `• ${p?.name || "Unknown"} × ${it.quantity}`;
       }).join("\n");
+      const headline = isVeseris
+        ? `📦 *New Veseris request*\n*From:* ${emp?.name || "Unknown"}${emp?.branch ? " (" + emp.branch + ")" : ""}\n*Reason:* ${reason.replace(/_/g," ")}`
+        : `🧾 *Pull From Shop request*\n*From:* ${emp?.name || "Unknown"}${emp?.branch ? " (" + emp.branch + ")" : ""}\n*Pull from:* ${(shops || []).find(s => s.id === fromShopId)?.name || "?"}`;
       sendSlack("alert_order_placed",
-        `🧾 *New product order submitted*\n*By:* ${emp?.name || "Unknown"}${emp?.branch ? " (" + emp.branch + ")" : ""}\n*Needed by week of:* ${weekNeeded}\n${itemLines}${notes.trim() ? "\n*Notes:* " + notes.trim() : ""}`
+        `${headline}\n*Needed by week of:* ${weekNeeded}\n${itemLines}${notes.trim() ? "\n*Notes:* " + notes.trim() : ""}`
       );
-      showToast("Order request submitted");
+      showToast(isVeseris ? "Veseris request submitted" : "Pull From Shop request submitted");
       setItems([]); setNotes("");
       loadRecent();
     } catch (err) { showToast("Error: " + (err.message || err), "error"); }
@@ -2818,8 +2882,42 @@ function OrderSubmit({ user, products, employees, showToast }) {
   return (
     <div>
       <div className="alert blue" style={{marginBottom:14}}>
-        📋 Tell us what you need for the week. Submissions go to your manager for ordering.
+        {isVeseris ? (
+          <>📦 <strong>Request from Veseris.</strong> Use this when the shop is out of something, or you want to add/try a new product. Your request goes to leadership to actually place with Veseris.</>
+        ) : (
+          <>🧾 <strong>Pull From Shop.</strong> Request product to be pulled from shop onto your truck. Your branch's service manager gets notified and will stage it for you. If the shop is out, submit a Request from Veseris instead.</>
+        )}
       </div>
+
+      {!isVeseris && (
+        <div className="mod-card" style={{marginBottom:14}}>
+          <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Which shop are we pulling from?</div>
+          <select className="form-input" value={fromShopId} onChange={e => setFromShopId(e.target.value)}>
+            <option value="">Select shop...</option>
+            {(shops || []).filter(s => s.active !== false).sort((a,b) => (a.name||"").localeCompare(b.name||"")).map(s => (
+              <option key={s.id} value={s.id}>{s.name}{s.branch ? ` · ${s.branch}` : ""}</option>
+            ))}
+          </select>
+          {fromShopId && Object.keys(shopInventory).length > 0 && (
+            <div style={{fontSize:10,color:"#8A95A8",marginTop:6}}>
+              Showing on-hand quantities at this shop next to each product below. If the product you need shows 0, that shop is out — submit a Request from Veseris instead.
+            </div>
+          )}
+        </div>
+      )}
+
+      {isVeseris && (
+        <div className="mod-card" style={{marginBottom:14}}>
+          <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Why are we ordering from Veseris?</div>
+          <select className="form-input" value={reason} onChange={e => setReason(e.target.value)}>
+            <option value="shop_out">Shop is out of this product</option>
+            <option value="low_stock">Shop stock is low, need to restock</option>
+            <option value="add_new">Want to start carrying this product</option>
+            <option value="better_alternative">Better alternative to something we use</option>
+            <option value="other">Other (explain in notes below)</option>
+          </select>
+        </div>
+      )}
 
       <div className="mod-card" style={{marginBottom:14}}>
         <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>My Info</div>
@@ -2851,9 +2949,14 @@ function OrderSubmit({ user, products, employees, showToast }) {
           <div style={{flex:1}}>
             <select className="form-input" value={pickProduct} onChange={e => setPickProduct(e.target.value)}>
               <option value="">Select product...</option>
-              {products.filter(p => p.active).sort((a,b)=>a.name.localeCompare(b.name)).map(p => (
-                <option key={p.id} value={p.id}>{p.name} ({p.category})</option>
-              ))}
+              {products.filter(p => p.active).sort((a,b)=>a.name.localeCompare(b.name)).map(p => {
+                // Show on-hand at the picked shop for Pull From Shop
+                const onHand = !isVeseris && fromShopId ? (shopInventory[p.id] || 0) : null;
+                const stockHint = onHand != null ? ` — shop has ${onHand}` : "";
+                return (
+                  <option key={p.id} value={p.id}>{p.name} ({p.category}){stockHint}</option>
+                );
+              })}
             </select>
           </div>
           <input className="form-input" type="number" min="1" value={pickQty}
@@ -2926,17 +3029,22 @@ function OrderSubmit({ user, products, employees, showToast }) {
 }
 
 // ── Order: manager view — consolidate all techs' requests for a week ──────────
-function OrderManager({ user, products, showToast }) {
+function OrderManager({ user, products, shops, trucks, employees, requestType, showToast }) {
+  const rt = requestType || "pull_from_shop";
+  const isVeseris = rt === "veseris";
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [weekFilter, setWeekFilter] = useState("");
   const [allWeeks, setAllWeeks] = useState([]);
+  const [fulfillingOrder, setFulfillingOrder] = useState(null); // order being fulfilled
 
   async function load() {
     setLoading(true);
     try {
+      // Only pull orders of this request type, keep open statuses
+      const openStatuses = isVeseris ? "(pending,ordered)" : "(pending)";
       const data = await sb("orders",
-        "?select=*,items:order_items(*,product:products(id,name,category,unit_cost,unit_of_measure))&order=week_needed.desc,created_at.desc&status=in.(pending,ordered)");
+        `?request_type=eq.${rt}&select=*,items:order_items(*,product:products(id,name,category,unit_cost,unit_of_measure))&order=week_needed.desc,created_at.desc&status=in.${openStatuses}`);
       setOrders(data);
       // Build week list
       const weeks = Array.from(new Set(data.map(o => o.week_needed))).sort().reverse();
@@ -3055,6 +3163,139 @@ function OrderManager({ user, products, showToast }) {
     win.document.close();
   }
 
+  // Fulfill a Pull From Shop request: creates a load_truck transaction for each
+  // item (shop → truck), marks the order fulfilled, and refreshes. Tech sees it
+  // move from pending to fulfilled on their recent-requests list.
+  async function fulfillOrder(o, truckId) {
+    if (!truckId) { showToast("Pick which truck to load", "error"); return; }
+    if (!o.from_shop_id) { showToast("This request has no source shop set", "error"); return; }
+    try {
+      const batchId = (typeof crypto !== "undefined" && crypto.randomUUID)
+        ? crypto.randomUUID() : (Date.now() + "-" + Math.random()).toString();
+      for (const it of (o.items || [])) {
+        await sbPost("inventory_transactions", {
+          product_id: it.product_id,
+          employee_id: user.id,
+          action: "load_truck",
+          quantity: it.quantity,
+          from_location: o.from_shop_id,
+          to_location: truckId,
+          notes: `Fulfilled Pull From Shop request from ${o.requester_name}`,
+          batch_id: batchId
+        });
+        // Decrement shop inventory
+        const shopRows = await sb("inventory",
+          `?location_type=eq.shop&location_id=eq.${o.from_shop_id}&product_id=eq.${it.product_id}&select=id,quantity`);
+        if (shopRows && shopRows[0]) {
+          const newQty = Math.max(0, (Number(shopRows[0].quantity) || 0) - it.quantity);
+          await sbPatch("inventory", shopRows[0].id, { quantity: newQty, updated_at: new Date().toISOString() });
+        }
+        // Increment truck inventory
+        const truckRows = await sb("inventory",
+          `?location_type=eq.truck&location_id=eq.${truckId}&product_id=eq.${it.product_id}&select=id,quantity`);
+        if (truckRows && truckRows[0]) {
+          await sbPatch("inventory", truckRows[0].id, {
+            quantity: (Number(truckRows[0].quantity) || 0) + it.quantity,
+            updated_at: new Date().toISOString()
+          });
+        } else {
+          await sbPost("inventory", {
+            product_id: it.product_id, location_type: "truck", location_id: truckId, quantity: it.quantity
+          });
+        }
+      }
+      await sbPatch("orders", o.id, {
+        status: "fulfilled",
+        fulfilled_at: new Date().toISOString(),
+        fulfilled_by: user.id,
+        fulfilled_truck_id: truckId
+      });
+      showToast(`Fulfilled ${o.requester_name}'s request`);
+      setFulfillingOrder(null);
+      load();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+  }
+  // Alias for clarity when called from the picker
+  async function fulfillPullFromShop(o, truckId) { return fulfillOrder(o, truckId); }
+
+  async function denyOrder(o) {
+    if (!window.confirm(`Deny ${o.requester_name}'s request? They'll see it as cancelled.`)) return;
+    try {
+      await sbPatch("orders", o.id, { status: "cancelled" });
+      showToast("Request cancelled");
+      load();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+  }
+
+  // Pull From Shop uses a simpler per-request queue instead of the consolidated week view
+  if (!isVeseris) {
+    // Branch filter: super_admin sees all, everyone else sees their branch only.
+    // This covers both managers and specifically named fulfillers (Megan, Bryan,
+    // etc) since they sit in the branch they fulfill for. If we add a
+    // cross-branch fulfiller later, we'd extend this rule.
+    const myBranch = (user?.branch || "").toUpperCase();
+    const filteredOrders = (user?.access_level === "super_admin")
+      ? orders
+      : orders.filter(o => {
+          const emp = (employees || []).find(e => e.id === o.requester_id);
+          return (emp?.branch || "").toUpperCase() === myBranch;
+        });
+    return (
+      <div>
+        <div className="alert blue" style={{marginBottom:14}}>
+          🧾 <strong>Pull From Shop queue.</strong> Each request below is a tech asking for product pulled from shop onto their truck. Click Fulfill, pick which truck to load, and the system automatically updates shop and truck inventory.
+          {user?.access_level !== "super_admin" && <div style={{fontSize:11,color:"#8A95A8",marginTop:4}}>Showing requests from <strong>{user?.branch}</strong> only.</div>}
+        </div>
+        {loading ? <div className="loading">Loading...</div> : filteredOrders.length === 0 ? (
+          <div className="empty-state">No pending Pull From Shop requests{user?.access_level !== "super_admin" ? ` for ${user?.branch}` : ""}</div>
+        ) : (
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {filteredOrders.map(o => {
+              const shop = (shops || []).find(s => s.id === o.from_shop_id);
+              const emp = (employees || []).find(e => e.id === o.requester_id);
+              const empBranch = emp?.branch || "?";
+              return (
+                <div key={o.id} className="mod-card" style={{marginBottom:0}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:10}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:14,fontWeight:600}}>{o.requester_name} <span style={{fontSize:11,color:"#8A95A8",fontWeight:400}}>· {empBranch}</span></div>
+                      <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
+                        Pull from <strong>{shop?.name || "?"}</strong> · needed week of {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                      </div>
+                      {o.notes && <div style={{fontSize:11,color:"#8A95A8",marginTop:4,fontStyle:"italic"}}>"{o.notes}"</div>}
+                    </div>
+                    <Badge color="amber">pending</Badge>
+                  </div>
+                  <div style={{borderTop:"1px solid #2A3348",paddingTop:8,marginBottom:10}}>
+                    {(o.items || []).map(it => (
+                      <div key={it.id} style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"3px 0"}}>
+                        <span><strong>{it.product?.name || "?"}</strong> <span style={{color:"#8A95A8"}}>· {it.product?.category}</span></span>
+                        <span style={{fontFamily:"monospace",color:"#E8EDF5"}}>{it.quantity} {it.product?.unit_of_measure || "ea"}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{display:"flex",gap:8}}>
+                    <Btn variant="primary" onClick={() => setFulfillingOrder(o)}>✓ Fulfill (load to truck)</Btn>
+                    <Btn variant="red" onClick={() => denyOrder(o)}>Cancel request</Btn>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {fulfillingOrder && (
+          <FulfillTruckPicker
+            order={fulfillingOrder}
+            trucks={trucks || []}
+            employees={employees || []}
+            onCancel={() => setFulfillingOrder(null)}
+            onConfirm={(truckId) => fulfillPullFromShop(fulfillingOrder, truckId)}
+          />
+        )}
+      </div>
+    );
+  }
+
   return (
     <div>
       <div className="alert blue" style={{marginBottom:14}}>
@@ -3143,6 +3384,82 @@ function OrderManager({ user, products, showToast }) {
       )}
     </div>
   );
+}
+
+// Modal shown when a service manager clicks Fulfill on a Pull From Shop request.
+// They pick which truck to load; defaults to the requester's assigned truck.
+function FulfillTruckPicker({ order, trucks, employees, onCancel, onConfirm }) {
+  // Default truck: the one assigned to the requester, if we can find it
+  const defaultTruck = (() => {
+    const reqId = order?.requester_id;
+    if (!reqId) return "";
+    const match = trucks.find(t => {
+      const d = driverOf(t, employees);
+      return d?.id === reqId;
+    });
+    return match?.id || "";
+  })();
+  const [truckId, setTruckId] = useState(defaultTruck);
+  const [confirming, setConfirming] = useState(false);
+
+  return (
+    <div className="modal-overlay" style={{zIndex:600}} onClick={e => e.target === e.currentTarget && !confirming && onCancel()}>
+      <div className="modal" style={{maxWidth:460}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">Fulfill request</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>Load this stock onto a truck — inventory updates automatically.</div>
+          </div>
+          <div className="modal-close" onClick={onCancel}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div style={{padding:"8px 10px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,marginBottom:12,fontSize:12}}>
+            <div><strong>Requested by:</strong> {order.requester_name}</div>
+            <div style={{marginTop:4}}><strong>Items:</strong></div>
+            <div style={{marginTop:3}}>
+              {(order.items || []).map(it => (
+                <div key={it.id} style={{display:"flex",justifyContent:"space-between",fontSize:11,padding:"2px 0"}}>
+                  <span>{it.product?.name || "?"}</span>
+                  <span style={{fontFamily:"monospace"}}>{it.quantity}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Load onto which truck? *</label>
+            <select className="form-input" value={truckId} onChange={e => setTruckId(e.target.value)} autoFocus>
+              <option value="">Select truck...</option>
+              {[...trucks].sort((a,b) => (parseInt(a.truck_number,10)||0) - (parseInt(b.truck_number,10)||0)).map(t => {
+                const d = driverOf(t, employees);
+                return <option key={t.id} value={t.id}>Truck #{t.truck_number} · {d?.name || "Unassigned"} · {t.branch}{t.department ? " " + t.department : ""}</option>;
+              })}
+            </select>
+            {defaultTruck && <div style={{fontSize:10,color:"#8A95A8",marginTop:4}}>Defaulted to the requester's assigned truck. Change it if you're loading someone else.</div>}
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <Btn style={{flex:1}} onClick={onCancel} disabled={confirming}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={async () => { setConfirming(true); await onConfirm(truckId); setConfirming(false); }} disabled={confirming || !truckId}>
+              {confirming ? "Loading..." : "Fulfill + update inventory"}
+            </Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Standalone page wrappers for the split modules ───────────────────────────
+// These replace the old combined "Inventory" entry with purpose-built pages
+// so each tech knows exactly where to go for exactly what they need to do.
+
+function PullFromShopPage(props) {
+  // Tech-friendly page: just the Submit form + Recent, no tabs. Managers who
+  // navigate here see the Manager tab bar as well.
+  return <OrderTab {...props} requestType="pull_from_shop" />;
+}
+
+function RequestFromVeserisPage(props) {
+  return <OrderTab {...props} requestType="veseris" />;
 }
 
 // ── CSV download helpers ─────────────────────────────────────────────────────
@@ -10412,6 +10729,34 @@ function ProfileModal({ person, trucks, creditCards, currentUser, onClose, onSav
   );
 }
 
+// ── Transition banner for the inventory reorg ────────────────────────────────
+// Shows for 2 weeks after this deploy. Dismiss is remembered per-browser in
+// localStorage. The hard cutoff on the end date auto-retires the banner so
+// nobody has to touch the code to remove it.
+const INVENTORY_REORG_BANNER_UNTIL = "2026-12-01"; // 2 weeks from deploy
+function InventoryReorgBanner() {
+  const [dismissed, setDismissed] = useState(() => {
+    try { return localStorage.getItem("inv_reorg_banner_dismissed") === "1"; }
+    catch { return false; }
+  });
+  const expired = new Date() > new Date(INVENTORY_REORG_BANNER_UNTIL + "T23:59:59");
+  if (dismissed || expired) return null;
+  return (
+    <div style={{background:"rgba(59,130,246,0.12)",border:"1px solid #3B82F6",borderRadius:8,padding:"10px 14px",marginBottom:14,display:"flex",alignItems:"flex-start",gap:12}}>
+      <div style={{fontSize:16}}>ℹ</div>
+      <div style={{flex:1,fontSize:12,color:"#E8EDF5",lineHeight:1.5}}>
+        <div style={{fontWeight:600,marginBottom:3}}>Inventory has been reorganized.</div>
+        <div style={{color:"#8A95A8"}}>
+          The old "Inventory" and "Inventory Count" menus are gone. Use <strong>Pull From Shop</strong> to request product from shop onto your truck,
+          <strong> Request from Veseris</strong> when the shop is out or you want a new product, and <strong>Count My Truck</strong> for your monthly inventory count. Questions, ask Jon.
+        </div>
+      </div>
+      <button onClick={() => { try { localStorage.setItem("inv_reorg_banner_dismissed","1"); } catch {} setDismissed(true); }}
+        style={{background:"none",border:"none",color:"#8A95A8",fontSize:18,cursor:"pointer",padding:"0 4px"}} aria-label="Dismiss">✕</button>
+    </div>
+  );
+}
+
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
@@ -10509,7 +10854,7 @@ export default function App() {
 
   const isManager = currentUser && ["super_admin","manager","lead"].includes(currentUser.access_level);
   const isSuperAdmin = currentUser && ["super_admin"].includes(currentUser.access_level);
-  const MANAGER_PAGES = ["home","people","hr","fleet","inspections","cards","slack","settings"];
+  const MANAGER_PAGES = ["home","people","hr","fleet","inspections","cards","slack","settings","inventory_mgmt"];
 
   function navItem(id, label, icon, badge) {
     if (!currentUser) return null;
@@ -10523,7 +10868,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",inventory:"Inventory",truck_inventory:"Monthly Inventory Count",equipment:"Equipment",insulation_equipment:"Insulation Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",resources:"Resources",evaluations:"Evaluations",reports:"Reports Center",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",pull_from_shop:"Pull From Shop",request_veseris:"Request from Veseris",count_my_truck:"Count My Truck",inventory_mgmt:"Inventory Management",equipment:"Equipment",insulation_equipment:"Insulation Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",resources:"Resources",evaluations:"Evaluations",reports:"Reports Center",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -10553,8 +10898,10 @@ export default function App() {
               <div className="sb-section-label">Modules</div>
               {navItem("hr","HR & Onboarding","✦")}
               {navItem("timeoff","Time Off & Callouts","◈")}
-              {navItem("inventory","Inventory","◧")}
-              {navItem("truck_inventory","Inventory Count","📋")}
+              {navItem("pull_from_shop","Pull From Shop","🧾")}
+              {navItem("request_veseris","Request from Veseris","📦")}
+              {navItem("count_my_truck","Count My Truck","📋")}
+              {navItem("inventory_mgmt","Inventory Management","⚙")}
               {navItem("equipment","Equipment","🔧")}
               {navItem("insulation_equipment","Insulation Equipment","🧰")}
               {navItem("fleet","Fleet","◉")}
@@ -10577,18 +10924,21 @@ export default function App() {
             </div>
           </nav>
           <div className="main">
-            {page !== "inventory" && (
+            {page !== "inventory_mgmt" && (
               <div className="page-header">
                 <div><div className="page-title">{titles[page]}</div><div className="page-sub">Critter Stop · {currentUser.branch === "All" ? "All branches" : currentUser.branch}</div></div>
               </div>
             )}
-            {!dataLoaded && page !== "inventory" && <div className="loading">Loading data from database...</div>}
+            <InventoryReorgBanner />
+            {!dataLoaded && page !== "inventory_mgmt" && <div className="loading">Loading data from database...</div>}
             {dataLoaded && page === "home" && <Dashboard user={currentUser} employees={employees} trucks={trucks} inventory={inventory} shops={shops} />}
             {dataLoaded && page === "people" && <People user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {dataLoaded && page === "hr" && <HR user={currentUser} employees={employees} setEmployees={setEmployees} onProfile={setProfile} showToast={showToast} />}
             {page === "timeoff" && <TimeOff user={currentUser} employees={employees} showToast={showToast} />}
-            {page === "inventory" && <Inventory user={currentUser} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />}
-            {page === "truck_inventory" && <TruckInventoryPage user={currentUser} products={products} trucks={trucks} shops={shops} employees={employees} showToast={showToast} />}
+            {page === "pull_from_shop"  && <PullFromShopPage      user={currentUser} products={products} trucks={trucks} shops={shops} employees={employees} showToast={showToast} />}
+            {page === "request_veseris" && <RequestFromVeserisPage user={currentUser} products={products} trucks={trucks} shops={shops} employees={employees} showToast={showToast} />}
+            {page === "count_my_truck"  && <TruckInventoryPage    user={currentUser} products={products} trucks={trucks} shops={shops} employees={employees} showToast={showToast} />}
+            {page === "inventory_mgmt"  && <Inventory             user={currentUser} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />}
             {page === "equipment" && <EquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
             {page === "insulation_equipment" && <InsulationEquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
