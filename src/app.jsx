@@ -2865,7 +2865,7 @@ function OrderSubmit({ user, products, employees, shops, trucks, requestType, sh
       const headline = isVeseris
         ? `📦 *New Veseris request*\n*From:* ${emp?.name || "Unknown"}${emp?.branch ? " (" + emp.branch + ")" : ""}\n*Reason:* ${reason.replace(/_/g," ")}`
         : `🧾 *Pull From Shop request*\n*From:* ${emp?.name || "Unknown"}${emp?.branch ? " (" + emp.branch + ")" : ""}\n*Pull from:* ${(shops || []).find(s => s.id === fromShopId)?.name || "?"}`;
-      const neededLabel = isVeseris ? `*Needed by week of:* ${weekNeeded}` : `*Needed by:* ${weekNeeded}`;
+      const neededLabel = isVeseris ? `*Needed by week of:* ${weekNeeded}` : `*Ordered On:* ${weekNeeded}`;
       sendSlack("alert_order_placed",
         `${headline}\n${neededLabel}\n${itemLines}${notes.trim() ? "\n*Notes:* " + notes.trim() : ""}`
       );
@@ -2937,7 +2937,7 @@ function OrderSubmit({ user, products, employees, shops, trucks, requestType, sh
           <label className="form-label">
             {isVeseris
               ? <>Week needed <span style={{color:"#8A95A8"}}>(select the week start)</span></>
-              : <>Needed by <span style={{color:"#8A95A8"}}>(defaults to today)</span></>}
+              : <>Ordered On <span style={{color:"#8A95A8"}}>(defaults to today)</span></>}
           </label>
           <input className="form-input" type="date" value={weekNeeded}
             onChange={e => setWeekNeeded(e.target.value)} />
@@ -3012,7 +3012,7 @@ function OrderSubmit({ user, products, employees, shops, trucks, requestType, sh
                 <div>
                   <strong>{o.requester_name}</strong>
                   <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
-                    {isVeseris ? "Week of" : "Need by"} {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · Submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                    {isVeseris ? "Week of" : "Ordered On"} {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · Submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
                   </div>
                 </div>
                 <Badge color={o.status === "pending" ? "amber" : o.status === "ordered" ? "blue" : o.status === "received" ? "green" : "gray"}>{o.status}</Badge>
@@ -3267,7 +3267,7 @@ function OrderManager({ user, products, shops, trucks, employees, requestType, s
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontSize:14,fontWeight:600}}>{o.requester_name} <span style={{fontSize:11,color:"#8A95A8",fontWeight:400}}>· {empBranch}</span></div>
                       <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
-                        Pull from <strong>{shop?.name || "?"}</strong> · needed by {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                        Pull from <strong>{shop?.name || "?"}</strong> · ordered on {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
                       </div>
                       {o.notes && <div style={{fontSize:11,color:"#8A95A8",marginTop:4,fontStyle:"italic"}}>"{o.notes}"</div>}
                     </div>
