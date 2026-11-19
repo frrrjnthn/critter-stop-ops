@@ -2754,7 +2754,9 @@ function OrderSubmit({ user, products, employees, shops, trucks, requestType, sh
   const isVeseris = rt === "veseris";
   const [name, setName] = useState(user?.id || "");
   const [weekNeeded, setWeekNeeded] = useState(() => {
-    // Default to next Monday
+    // Pull From Shop: default to today (tech needs it now).
+    // Veseris: default to next Monday (weekly ordering cadence).
+    if (!isVeseris) return new Date().toISOString().slice(0,10);
     const d = new Date();
     const dow = d.getDay() || 7;
     d.setDate(d.getDate() + (8 - dow));
@@ -2863,8 +2865,9 @@ function OrderSubmit({ user, products, employees, shops, trucks, requestType, sh
       const headline = isVeseris
         ? `📦 *New Veseris request*\n*From:* ${emp?.name || "Unknown"}${emp?.branch ? " (" + emp.branch + ")" : ""}\n*Reason:* ${reason.replace(/_/g," ")}`
         : `🧾 *Pull From Shop request*\n*From:* ${emp?.name || "Unknown"}${emp?.branch ? " (" + emp.branch + ")" : ""}\n*Pull from:* ${(shops || []).find(s => s.id === fromShopId)?.name || "?"}`;
+      const neededLabel = isVeseris ? `*Needed by week of:* ${weekNeeded}` : `*Needed by:* ${weekNeeded}`;
       sendSlack("alert_order_placed",
-        `${headline}\n*Needed by week of:* ${weekNeeded}\n${itemLines}${notes.trim() ? "\n*Notes:* " + notes.trim() : ""}`
+        `${headline}\n${neededLabel}\n${itemLines}${notes.trim() ? "\n*Notes:* " + notes.trim() : ""}`
       );
       showToast(isVeseris ? "Veseris request submitted" : "Pull From Shop request submitted");
       setItems([]); setNotes("");
@@ -2931,7 +2934,11 @@ function OrderSubmit({ user, products, employees, shops, trucks, requestType, sh
           </select>
         </div>
         <div className="form-group">
-          <label className="form-label">Week needed <span style={{color:"#8A95A8"}}>(select the week start)</span></label>
+          <label className="form-label">
+            {isVeseris
+              ? <>Week needed <span style={{color:"#8A95A8"}}>(select the week start)</span></>
+              : <>Needed by <span style={{color:"#8A95A8"}}>(defaults to today)</span></>}
+          </label>
           <input className="form-input" type="date" value={weekNeeded}
             onChange={e => setWeekNeeded(e.target.value)} />
         </div>
@@ -3005,7 +3012,7 @@ function OrderSubmit({ user, products, employees, shops, trucks, requestType, sh
                 <div>
                   <strong>{o.requester_name}</strong>
                   <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
-                    Week of {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · Submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                    {isVeseris ? "Week of" : "Need by"} {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · Submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
                   </div>
                 </div>
                 <Badge color={o.status === "pending" ? "amber" : o.status === "ordered" ? "blue" : o.status === "received" ? "green" : "gray"}>{o.status}</Badge>
@@ -3260,7 +3267,7 @@ function OrderManager({ user, products, shops, trucks, employees, requestType, s
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontSize:14,fontWeight:600}}>{o.requester_name} <span style={{fontSize:11,color:"#8A95A8",fontWeight:400}}>· {empBranch}</span></div>
                       <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>
-                        Pull from <strong>{shop?.name || "?"}</strong> · needed week of {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                        Pull from <strong>{shop?.name || "?"}</strong> · needed by {new Date(o.week_needed + "T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})} · submitted {new Date(o.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
                       </div>
                       {o.notes && <div style={{fontSize:11,color:"#8A95A8",marginTop:4,fontStyle:"italic"}}>"{o.notes}"</div>}
                     </div>
@@ -5976,6 +5983,699 @@ function InsEquipFormModal({ editing, onClose, onSaved, showToast }) {
   );
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Reveal Cameras module
+// Tracks cellular wildlife cameras (Reveal Tactacam X, X Pro, XB, 360).
+// Primary flows: Deploy (shop → customer job), Recover (field → shop),
+// Transfer (shop → shop), Add Update (daily check-in while deployed).
+// Imports from Google Sheet in one-time SQL migration, becomes source of truth.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// A camera is "overdue" if its deployed_at + overdue_days (default 60) has
+// passed, OR it hasn't had an update in 14+ days. Keeps the real forgotten
+// cameras surfaced vs. ones being checked daily.
+function cameraOverdueState(cam) {
+  if (cam.status !== "deployed" || !cam.deployed_at) return { overdue: false, days: 0 };
+  const now = new Date();
+  const deployed = new Date(cam.deployed_at + "T12:00:00");
+  const daysDeployed = Math.floor((now - deployed) / 86400000);
+  const threshold = cam.overdue_days || 60;
+  const overdueByTime = daysDeployed > threshold;
+  const lastUpdate = cam.last_update_date ? new Date(cam.last_update_date + "T12:00:00") : deployed;
+  const daysSinceUpdate = Math.floor((now - lastUpdate) / 86400000);
+  const overdueByUpdates = daysSinceUpdate > 14;
+  return {
+    overdue: overdueByTime || overdueByUpdates,
+    daysDeployed,
+    daysSinceUpdate,
+    threshold,
+    reason: overdueByTime ? `${daysDeployed}d deployed (threshold ${threshold}d)` : overdueByUpdates ? `${daysSinceUpdate}d since last update` : null
+  };
+}
+
+function cameraStatusColor(status, overdue) {
+  if (overdue && status === "deployed") return "amber";
+  if (status === "deployed")   return "blue";
+  if (status === "in_shop")    return "green";
+  if (status === "in_repair")  return "amber";
+  if (status === "lost")       return "red";
+  if (status === "retired")    return "gray";
+  return "gray";
+}
+
+function cameraStatusLabel(status) {
+  if (status === "in_shop")   return "In Shop";
+  if (status === "deployed")  return "Deployed";
+  if (status === "in_repair") return "In Repair";
+  if (status === "lost")      return "Lost";
+  if (status === "retired")   return "Retired";
+  return status;
+}
+
+function RevealCamerasPage({ user, employees, shops, showToast }) {
+  const [cameras, setCameras] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState(null); // detail-modal camera
+  const [editing, setEditing] = useState(null);   // edit-form camera (null = closed, {} = new)
+  const [q, setQ] = useState("");
+  const [branchFilter, setBranchFilter] = useState(user.branch === "All" ? "All" : user.branch);
+  const [statusFilter, setStatusFilter] = useState("all");
+  const canManage = ["super_admin","manager","lead"].includes(user?.access_level);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const rows = await sb("reveal_cameras", "?select=*&order=branch,name&limit=1000");
+      setCameras(rows || []);
+    } catch (err) {
+      showToast("Error loading cameras: " + (err.message || err), "error");
+    }
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, []); // eslint-disable-line
+
+  const enriched = cameras.map(c => ({ ...c, _state: cameraOverdueState(c) }));
+
+  const filtered = enriched.filter(c => {
+    if (branchFilter !== "All" && (c.branch || "Unknown") !== branchFilter) return false;
+    if (statusFilter === "overdue") { if (!c._state.overdue || c.status !== "deployed") return false; }
+    else if (statusFilter !== "all" && c.status !== statusFilter) return false;
+    if (q) {
+      const needle = q.toLowerCase();
+      const hay = `${c.name || ""} ${c.current_customer || ""} ${c.current_tech_name || ""} ${c.notes || ""}`.toLowerCase();
+      if (!hay.includes(needle)) return false;
+    }
+    return true;
+  });
+
+  // KPI tiles
+  const total = cameras.length;
+  const deployed = cameras.filter(c => c.status === "deployed").length;
+  const inShop   = cameras.filter(c => c.status === "in_shop").length;
+  const overdue  = enriched.filter(c => c.status === "deployed" && c._state.overdue).length;
+
+  return (
+    <div>
+      <div className="alert blue" style={{marginBottom:14}}>
+        📷 <strong>Reveal Cameras.</strong> Every cellular camera in the fleet.
+        {" "}Techs can deploy, recover, transfer, and log daily updates. The sheet is retired — this is the source of truth now.
+      </div>
+
+      {/* KPI row */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:14}}>
+        <KpiTile label="Total cameras" value={total} color="#3B82F6" />
+        <KpiTile label="Deployed" value={deployed} color="#60A5FA" />
+        <KpiTile label="In shop" value={inShop} color="#10B981" />
+        <KpiTile label="Overdue" value={overdue} color={overdue > 0 ? "#F59E0B" : "#8A95A8"} />
+      </div>
+
+      {/* Controls */}
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+        <input className="form-input" placeholder="Search camera, customer, tech, notes..." value={q}
+          onChange={e => setQ(e.target.value)} style={{flex:1,minWidth:200}} />
+        <select className="form-input" value={branchFilter} onChange={e => setBranchFilter(e.target.value)} style={{maxWidth:140}}>
+          <option value="All">All branches</option>
+          <option value="DFW">DFW</option>
+          <option value="ATX">ATX</option>
+          <option value="OKC">OKC</option>
+          <option value="CStat">CStat</option>
+        </select>
+        <select className="form-input" value={statusFilter} onChange={e => setStatusFilter(e.target.value)} style={{maxWidth:150}}>
+          <option value="all">All statuses</option>
+          <option value="deployed">Deployed</option>
+          <option value="in_shop">In Shop</option>
+          <option value="overdue">Overdue</option>
+          <option value="in_repair">In Repair</option>
+          <option value="lost">Lost</option>
+          <option value="retired">Retired</option>
+        </select>
+        {canManage && <Btn variant="primary" onClick={() => setEditing({})}>+ Add Camera</Btn>}
+      </div>
+
+      {loading ? <div className="loading">Loading cameras...</div> : filtered.length === 0 ? (
+        <div className="empty-state">No cameras match the filters</div>
+      ) : (
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10}}>
+          {filtered.map(c => {
+            const color = cameraStatusColor(c.status, c._state.overdue);
+            const borderColor = color === "amber" ? "#F59E0B" : color === "red" ? "#EF4444" : color === "blue" ? "#3B82F6" : color === "green" ? "#10B981" : "#2A3348";
+            return (
+              <div key={c.id} onClick={() => setSelected(c)}
+                className="mod-card"
+                style={{cursor:"pointer",borderLeft:`3px solid ${borderColor}`,marginBottom:0,padding:12}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8,marginBottom:6}}>
+                  <div style={{fontSize:14,fontWeight:600,flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.name}</div>
+                  <Badge color={color}>{cameraStatusLabel(c.status)}</Badge>
+                </div>
+                <div style={{fontSize:11,color:"#8A95A8",marginBottom:4}}>{c.branch || "Unknown branch"}</div>
+                {c.status === "deployed" && (
+                  <>
+                    <div style={{fontSize:12,marginTop:6,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                      📍 {c.current_customer || "(no customer set)"}
+                    </div>
+                    {c.current_tech_name && <div style={{fontSize:11,color:"#8A95A8",marginTop:2}}>Tech: {c.current_tech_name}</div>}
+                    {c._state.overdue && (
+                      <div style={{fontSize:11,color:"#F59E0B",marginTop:4,fontWeight:500}}>⚠ {c._state.reason}</div>
+                    )}
+                    {!c._state.overdue && c.last_update_date && (
+                      <div style={{fontSize:10,color:"#8A95A8",marginTop:4}}>Last update: {c.last_update_date}{c.last_update_remark ? ` · ${c.last_update_remark}` : ""}</div>
+                    )}
+                  </>
+                )}
+                {c.status === "in_shop" && (
+                  <div style={{fontSize:11,color:"#8A95A8",marginTop:6}}>
+                    At: {(shops || []).find(s => s.id === c.current_shop_id)?.name || "(no shop set)"}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {selected && (
+        <RevealCameraDetailModal
+          camera={selected} user={user} employees={employees} shops={shops} canManage={canManage}
+          onClose={() => setSelected(null)}
+          onChanged={() => { load(); setSelected(null); }}
+          onEdit={() => { setEditing(selected); setSelected(null); }}
+          showToast={showToast}
+        />
+      )}
+      {editing && (
+        <RevealCameraFormModal
+          editing={editing.id ? editing : null}
+          shops={shops || []}
+          onClose={() => setEditing(null)}
+          onSaved={() => { load(); setEditing(null); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+// Detail view: full history, deploy/recover/update actions
+function RevealCameraDetailModal({ camera, user, employees, shops, canManage, onClose, onChanged, onEdit, showToast }) {
+  const [history, setHistory] = useState([]);
+  const [loadingHist, setLoadingHist] = useState(true);
+  const [action, setAction] = useState(null); // 'deploy' | 'recover' | 'transfer' | 'update' | null
+  const overdueState = cameraOverdueState(camera);
+
+  async function loadHistory() {
+    setLoadingHist(true);
+    try {
+      const rows = await sb("reveal_camera_events",
+        `?camera_id=eq.${camera.id}&select=*,shop_from:shops!reveal_camera_events_from_shop_id_fkey(name),shop_to:shops!reveal_camera_events_to_shop_id_fkey(name)&order=event_date.desc,created_at.desc&limit=200`);
+      setHistory(rows || []);
+    } catch (err) { showToast("Error loading history: " + (err.message || err), "error"); }
+    setLoadingHist(false);
+  }
+  useEffect(() => { loadHistory(); }, [camera.id]); // eslint-disable-line
+
+  const shopName = (shops || []).find(s => s.id === camera.current_shop_id)?.name;
+
+  async function onActionComplete() {
+    setAction(null);
+    await loadHistory();
+    onChanged();
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{maxWidth:640, maxHeight:"92vh", overflowY:"auto"}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">{camera.name}</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>
+              {camera.branch || "Unknown branch"} · <Badge color={cameraStatusColor(camera.status, overdueState.overdue)}>{cameraStatusLabel(camera.status)}</Badge>
+              {overdueState.overdue && <span style={{color:"#F59E0B",marginLeft:8}}>⚠ {overdueState.reason}</span>}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            {canManage && <Btn onClick={onEdit}>Edit</Btn>}
+            <div className="modal-close" onClick={onClose}>✕</div>
+          </div>
+        </div>
+        <div className="modal-body">
+          {/* Current status panel */}
+          <div style={{padding:"12px 14px",background:"#1E2535",border:"1px solid #2A3348",borderRadius:6,marginBottom:14}}>
+            {camera.status === "deployed" ? (
+              <>
+                <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:6}}>Currently Deployed</div>
+                <div style={{fontSize:13,marginBottom:3}}><strong>📍 Customer:</strong> {camera.current_customer || "(not set)"}</div>
+                {camera.current_address && <div style={{fontSize:12,color:"#8A95A8",marginBottom:3}}>{camera.current_address}</div>}
+                {camera.current_tech_name && <div style={{fontSize:12,marginBottom:3}}><strong>Tech:</strong> {camera.current_tech_name}</div>}
+                {camera.deployed_at && <div style={{fontSize:12,color:"#8A95A8"}}>Deployed {camera.deployed_at} ({overdueState.daysDeployed} days ago)</div>}
+                {camera.last_update_date && <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>Last update: {camera.last_update_date}{camera.last_update_remark ? ` — "${camera.last_update_remark}"` : ""}</div>}
+              </>
+            ) : camera.status === "in_shop" ? (
+              <>
+                <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:6}}>In Shop</div>
+                <div style={{fontSize:13}}>At <strong>{shopName || "(no shop set)"}</strong></div>
+              </>
+            ) : (
+              <div style={{fontSize:13,color:"#8A95A8"}}>Status: {cameraStatusLabel(camera.status)}</div>
+            )}
+          </div>
+
+          {/* Action buttons based on current status */}
+          <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+            {camera.status === "in_shop" && (
+              <Btn variant="primary" onClick={() => setAction("deploy")}>📍 Deploy to a customer</Btn>
+            )}
+            {camera.status === "deployed" && (
+              <>
+                <Btn variant="primary" onClick={() => setAction("update")}>📝 Add Update</Btn>
+                <Btn onClick={() => setAction("recover")}>⬅ Recover to shop</Btn>
+              </>
+            )}
+            {camera.status === "in_shop" && (
+              <Btn onClick={() => setAction("transfer")}>🔁 Transfer to another shop</Btn>
+            )}
+            {canManage && camera.status !== "retired" && camera.status !== "lost" && (
+              <Btn variant="red" onClick={() => setAction("markLost")}>Mark Lost</Btn>
+            )}
+          </div>
+
+          {/* Metadata */}
+          {(camera.reveal_id || camera.phone_number || camera.model || camera.monthly_plan_cost) && (
+            <div style={{fontSize:11,color:"#8A95A8",marginBottom:14,padding:"8px 10px",background:"#161C2B",borderRadius:6}}>
+              {camera.model && <div>Model: {camera.model}</div>}
+              {camera.reveal_id && <div>Reveal ID: {camera.reveal_id}</div>}
+              {camera.phone_number && <div>SIM: {camera.phone_number}</div>}
+              {camera.monthly_plan_cost != null && <div>Plan: ${Number(camera.monthly_plan_cost).toFixed(2)}/mo</div>}
+            </div>
+          )}
+
+          {camera.notes && (
+            <div style={{padding:"8px 10px",background:"#161C2B",borderRadius:6,marginBottom:14,fontSize:12,color:"#B8C1D1",fontStyle:"italic"}}>
+              Notes: {camera.notes}
+            </div>
+          )}
+
+          {/* History */}
+          <div style={{fontSize:11,fontWeight:600,color:"#8A95A8",textTransform:"uppercase",letterSpacing:0.5,marginBottom:8}}>History ({history.length})</div>
+          {loadingHist ? <div className="loading">Loading history...</div> : history.length === 0 ? (
+            <div style={{fontSize:12,color:"#8A95A8",fontStyle:"italic"}}>No history yet</div>
+          ) : (
+            <div style={{maxHeight:300,overflowY:"auto"}}>
+              {history.map(e => (
+                <div key={e.id} style={{padding:"8px 10px",borderLeft:"2px solid #2A3348",marginBottom:6,fontSize:12}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <strong>{e.event_type}</strong>
+                    <span style={{fontSize:11,color:"#8A95A8"}}>{e.event_date}</span>
+                  </div>
+                  {e.customer && <div style={{color:"#B8C1D1",marginTop:2}}>Customer: {e.customer}</div>}
+                  {e.employee_name && <div style={{color:"#8A95A8",fontSize:11,marginTop:2}}>By: {e.employee_name}</div>}
+                  {e.remark && <div style={{color:"#B8C1D1",marginTop:2,fontStyle:"italic"}}>"{e.remark}"</div>}
+                  {e.condition && <div style={{color:"#8A95A8",fontSize:11,marginTop:2}}>Condition: {e.condition}</div>}
+                  {e.notes && <div style={{color:"#8A95A8",fontSize:11,marginTop:2}}>{e.notes}</div>}
+                  {(e.shop_from?.name || e.shop_to?.name) && (
+                    <div style={{color:"#8A95A8",fontSize:11,marginTop:2}}>
+                      {e.shop_from?.name && `from ${e.shop_from.name}`} {e.shop_to?.name && `→ ${e.shop_to.name}`}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+      {action && (
+        <RevealCameraActionModal
+          action={action} camera={camera} user={user} employees={employees} shops={shops}
+          onClose={() => setAction(null)}
+          onDone={onActionComplete}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+// One modal that handles all status-change actions with a tailored form per action
+function RevealCameraActionModal({ action, camera, user, employees, shops, onClose, onDone, showToast }) {
+  const [customer, setCustomer] = useState("");
+  const [address, setAddress]   = useState("");
+  const [techId, setTechId]     = useState(user?.id || "");
+  const [shopId, setShopId]     = useState("");
+  const [eventDate, setEventDate] = useState(() => new Date().toISOString().slice(0,10));
+  const [remark, setRemark]     = useState("");
+  const [notes, setNotes]       = useState("");
+  const [condition, setCondition] = useState("good");
+  const [saving, setSaving] = useState(false);
+
+  const titles = {
+    deploy:   "Deploy camera to customer",
+    recover:  "Recover camera to shop",
+    transfer: "Transfer between shops",
+    update:   "Add field update",
+    markLost: "Mark camera as Lost"
+  };
+
+  async function submit() {
+    setSaving(true);
+    try {
+      const empName = (employees || []).find(e => e.id === techId)?.name || null;
+      const eventRow = {
+        camera_id: camera.id,
+        event_type: action === "markLost" ? "lost" : action,
+        event_date: eventDate,
+        employee_id: techId || null,
+        employee_name: empName,
+        remark: remark.trim() || null,
+        notes: notes.trim() || null
+      };
+      const camUpdates = { updated_at: new Date().toISOString() };
+
+      if (action === "deploy") {
+        if (!customer.trim()) { showToast("Enter the customer name", "error"); setSaving(false); return; }
+        eventRow.customer = customer.trim();
+        eventRow.address  = address.trim() || null;
+        eventRow.from_shop_id = camera.current_shop_id || null;
+        camUpdates.status = "deployed";
+        camUpdates.current_shop_id = null;
+        camUpdates.current_customer = customer.trim();
+        camUpdates.current_address  = address.trim() || null;
+        camUpdates.current_tech_id   = techId || null;
+        camUpdates.current_tech_name = empName;
+        camUpdates.deployed_at = eventDate;
+        camUpdates.last_update_date = eventDate;
+        camUpdates.last_update_remark = "Deployed";
+      }
+      else if (action === "recover") {
+        if (!shopId) { showToast("Pick which shop to recover to", "error"); setSaving(false); return; }
+        eventRow.to_shop_id = shopId;
+        eventRow.condition  = condition;
+        camUpdates.status = "in_shop";
+        camUpdates.current_shop_id = shopId;
+        camUpdates.current_customer = null;
+        camUpdates.current_address  = null;
+        camUpdates.current_tech_id   = null;
+        camUpdates.current_tech_name = null;
+        camUpdates.deployed_at = null;
+        camUpdates.last_update_date = eventDate;
+        camUpdates.last_update_remark = `Recovered (${condition})`;
+      }
+      else if (action === "transfer") {
+        if (!shopId) { showToast("Pick which shop to transfer to", "error"); setSaving(false); return; }
+        if (shopId === camera.current_shop_id) { showToast("Pick a different shop", "error"); setSaving(false); return; }
+        eventRow.from_shop_id = camera.current_shop_id || null;
+        eventRow.to_shop_id = shopId;
+        camUpdates.current_shop_id = shopId;
+      }
+      else if (action === "update") {
+        if (!remark.trim()) { showToast("Enter a remark (what you saw on the camera)", "error"); setSaving(false); return; }
+        camUpdates.last_update_date = eventDate;
+        camUpdates.last_update_remark = remark.trim();
+      }
+      else if (action === "markLost") {
+        if (!window.confirm("Mark this camera as Lost? It stays in the registry but is removed from active rotations.")) { setSaving(false); return; }
+        camUpdates.status = "lost";
+        camUpdates.current_shop_id = null;
+        camUpdates.current_customer = null;
+      }
+
+      await sbPost("reveal_camera_events", eventRow);
+      await sbPatch("reveal_cameras", camera.id, camUpdates);
+
+      // Slack ping for deploy/recover/lost — not for every update since those happen daily
+      if (action === "deploy") {
+        sendSlack("alert_order_placed",
+          `📷 *Camera deployed:* ${camera.name}\n*By:* ${empName || "(not set)"}\n*Customer:* ${customer.trim()}${address.trim() ? "\n*Address:* " + address.trim() : ""}`);
+      } else if (action === "recover") {
+        const shopName = (shops || []).find(s => s.id === shopId)?.name;
+        sendSlack("alert_order_placed",
+          `📷 *Camera recovered:* ${camera.name}\n*By:* ${empName || "(not set)"}\n*To:* ${shopName}\n*Condition:* ${condition}`);
+      } else if (action === "markLost") {
+        sendSlack("alert_order_placed",
+          `📷 *Camera marked LOST:* ${camera.name}\n*By:* ${empName || "(not set)"}`);
+      }
+
+      showToast(`${titles[action]}: saved`);
+      onDone();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    setSaving(false);
+  }
+
+  const shopsForBranch = (shops || []).filter(s => s.active !== false &&
+    (camera.branch ? (s.branch === camera.branch || camera.branch === "DFW") : true));
+
+  return (
+    <div className="modal-overlay" style={{zIndex:600}} onClick={e => e.target === e.currentTarget && !saving && onClose()}>
+      <div className="modal" style={{maxWidth:480}}>
+        <div className="modal-top">
+          <div>
+            <div className="modal-title">{titles[action]}</div>
+            <div style={{fontSize:12,color:"#8A95A8",marginTop:3}}>{camera.name}</div>
+          </div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Date</label>
+            <input type="date" className="form-input" value={eventDate} onChange={e => setEventDate(e.target.value)} />
+          </div>
+
+          {action === "deploy" && (
+            <>
+              <div className="form-group">
+                <label className="form-label">Customer name *</label>
+                <input className="form-input" value={customer} onChange={e => setCustomer(e.target.value)} placeholder="e.g. Jane Doe" autoFocus />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Address <span style={{color:"#8A95A8"}}>(optional)</span></label>
+                <input className="form-input" value={address} onChange={e => setAddress(e.target.value)} placeholder="Street address or job notes" />
+              </div>
+            </>
+          )}
+
+          {(action === "recover" || action === "transfer") && (
+            <div className="form-group">
+              <label className="form-label">{action === "recover" ? "Recover to which shop? *" : "Transfer to which shop? *"}</label>
+              <select className="form-input" value={shopId} onChange={e => setShopId(e.target.value)}>
+                <option value="">Select shop...</option>
+                {shopsForBranch.map(s => (
+                  <option key={s.id} value={s.id} disabled={s.id === camera.current_shop_id}>
+                    {s.name}{s.branch ? ` · ${s.branch}` : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {action === "recover" && (
+            <div className="form-group">
+              <label className="form-label">Condition when returned</label>
+              <select className="form-input" value={condition} onChange={e => setCondition(e.target.value)}>
+                <option value="good">Good — ready to redeploy</option>
+                <option value="dead_battery">Dead battery — needs charge</option>
+                <option value="damaged">Damaged — needs repair</option>
+                <option value="missing">Missing accessories (SD card, mount, etc)</option>
+              </select>
+            </div>
+          )}
+
+          {action === "update" && (
+            <div className="form-group">
+              <label className="form-label">What's happening? *</label>
+              <select className="form-input" value={remark} onChange={e => setRemark(e.target.value)} autoFocus>
+                <option value="">Select...</option>
+                <option value="No Activity">No Activity</option>
+                <option value="For Trap Check">For Trap Check</option>
+                <option value="Trap check Scheduled">Trap check Scheduled</option>
+                <option value="Trap check rescheduled">Trap check rescheduled</option>
+                <option value="OTS">OTS (on the schedule)</option>
+                <option value="Relocation">Relocation</option>
+                <option value="Dead battery">Dead battery</option>
+                <option value="Camera fell">Camera fell</option>
+                <option value="Not sending updates">Not sending updates</option>
+                <option value="Closed Out">Closed Out</option>
+                <option value="other">Other (type below)</option>
+              </select>
+              {remark === "other" && (
+                <input className="form-input" style={{marginTop:6}} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Describe..." />
+              )}
+            </div>
+          )}
+
+          {action !== "markLost" && (
+            <>
+              <div className="form-group">
+                <label className="form-label">Tech <span style={{color:"#8A95A8"}}>(defaults to you)</span></label>
+                <select className="form-input" value={techId} onChange={e => setTechId(e.target.value)}>
+                  <option value="">—</option>
+                  {(employees || []).filter(e => e.status === "active").sort((a,b) => a.name.localeCompare(b.name)).map(e => (
+                    <option key={e.id} value={e.id}>{e.name}{e.branch ? ` · ${e.branch}` : ""}</option>
+                  ))}
+                </select>
+              </div>
+              {action !== "update" && (
+                <div className="form-group">
+                  <label className="form-label">Notes <span style={{color:"#8A95A8"}}>(optional)</span></label>
+                  <textarea className="form-input" rows={2} value={notes} onChange={e => setNotes(e.target.value)} />
+                </div>
+              )}
+            </>
+          )}
+
+          <div style={{display:"flex",gap:8,marginTop:14}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant={action === "markLost" ? "red" : "primary"} style={{flex:1}} onClick={submit} disabled={saving}>
+              {saving ? "Saving..." : (action === "markLost" ? "Mark Lost" : "Save")}
+            </Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Add/Edit camera form (managers only)
+function RevealCameraFormModal({ editing, shops, onClose, onSaved, showToast }) {
+  const isNew = !editing;
+  const [form, setForm] = useState(() => editing ? { ...editing } : {
+    name: "", branch: "DFW", status: "in_shop", current_shop_id: "",
+    reveal_id: "", phone_number: "", model: "Reveal X Pro", overdue_days: 60,
+    monthly_plan_cost: "", purchase_cost: "", purchase_date: "", notes: ""
+  });
+  const [saving, setSaving] = useState(false);
+  function set(k, v) { setForm(prev => ({ ...prev, [k]: v })); }
+
+  async function save() {
+    if (!form.name?.trim()) { showToast("Enter a camera name", "error"); return; }
+    setSaving(true);
+    try {
+      const payload = {
+        name: form.name.trim(),
+        branch: form.branch || null,
+        status: form.status || "in_shop",
+        current_shop_id: form.current_shop_id || null,
+        reveal_id: form.reveal_id?.trim() || null,
+        phone_number: form.phone_number?.trim() || null,
+        model: form.model?.trim() || null,
+        overdue_days: parseInt(form.overdue_days, 10) || 60,
+        monthly_plan_cost: form.monthly_plan_cost ? Number(form.monthly_plan_cost) : null,
+        purchase_cost: form.purchase_cost ? Number(form.purchase_cost) : null,
+        purchase_date: form.purchase_date || null,
+        notes: form.notes?.trim() || null,
+        updated_at: new Date().toISOString()
+      };
+      if (isNew) {
+        await sbPost("reveal_cameras", payload);
+      } else {
+        await sbPatch("reveal_cameras", editing.id, payload);
+      }
+      showToast(isNew ? "Camera added" : "Camera updated");
+      onSaved();
+    } catch (err) { showToast("Error: " + (err.message || err), "error"); }
+    setSaving(false);
+  }
+
+  return (
+    <div className="modal-overlay" style={{zIndex:600}} onClick={e => e.target === e.currentTarget && !saving && onClose()}>
+      <div className="modal" style={{maxWidth:520, maxHeight:"92vh", overflowY:"auto"}}>
+        <div className="modal-top">
+          <div className="modal-title">{isNew ? "Add Reveal Camera" : "Edit Camera"}</div>
+          <div className="modal-close" onClick={onClose}>✕</div>
+        </div>
+        <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Camera name *</label>
+            <input className="form-input" value={form.name || ""} onChange={e => set("name", e.target.value)} placeholder="e.g. DAL #117, OKC 42" autoFocus />
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div className="form-group">
+              <label className="form-label">Branch</label>
+              <select className="form-input" value={form.branch || ""} onChange={e => set("branch", e.target.value)}>
+                <option value="">—</option>
+                <option value="DFW">DFW</option>
+                <option value="ATX">ATX</option>
+                <option value="OKC">OKC</option>
+                <option value="CStat">CStat</option>
+                <option value="Unknown">Unknown</option>
+              </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Status</label>
+              <select className="form-input" value={form.status || "in_shop"} onChange={e => set("status", e.target.value)}>
+                <option value="in_shop">In Shop</option>
+                <option value="deployed">Deployed</option>
+                <option value="in_repair">In Repair</option>
+                <option value="lost">Lost</option>
+                <option value="retired">Retired</option>
+              </select>
+            </div>
+          </div>
+          {form.status === "in_shop" && (
+            <div className="form-group">
+              <label className="form-label">Current shop</label>
+              <select className="form-input" value={form.current_shop_id || ""} onChange={e => set("current_shop_id", e.target.value)}>
+                <option value="">—</option>
+                {(shops || []).filter(s => s.active !== false).map(s => (
+                  <option key={s.id} value={s.id}>{s.name}{s.branch ? ` · ${s.branch}` : ""}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div className="form-group">
+              <label className="form-label">Model</label>
+              <select className="form-input" value={form.model || ""} onChange={e => set("model", e.target.value)}>
+                <option value="">—</option>
+                <option value="Reveal X">Reveal X</option>
+                <option value="Reveal X Pro">Reveal X Pro</option>
+                <option value="Reveal XB">Reveal XB</option>
+                <option value="Reveal 360">Reveal 360</option>
+                <option value="Other">Other</option>
+              </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Overdue days threshold</label>
+              <input className="form-input" type="number" min="1" value={form.overdue_days || 60} onChange={e => set("overdue_days", e.target.value)} />
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div className="form-group">
+              <label className="form-label">Reveal account ID</label>
+              <input className="form-input" value={form.reveal_id || ""} onChange={e => set("reveal_id", e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Phone / SIM</label>
+              <input className="form-input" value={form.phone_number || ""} onChange={e => set("phone_number", e.target.value)} />
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+            <div className="form-group">
+              <label className="form-label">Purchase date</label>
+              <input className="form-input" type="date" value={form.purchase_date || ""} onChange={e => set("purchase_date", e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Purchase cost</label>
+              <input className="form-input" type="number" step="0.01" value={form.purchase_cost || ""} onChange={e => set("purchase_cost", e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Plan $/month</label>
+              <input className="form-input" type="number" step="0.01" value={form.monthly_plan_cost || ""} onChange={e => set("monthly_plan_cost", e.target.value)} />
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Notes</label>
+            <textarea className="form-input" rows={3} value={form.notes || ""} onChange={e => set("notes", e.target.value)} />
+          </div>
+          <div style={{display:"flex",gap:8,marginTop:14}}>
+            <Btn style={{flex:1}} onClick={onClose} disabled={saving}>Cancel</Btn>
+            <Btn variant="primary" style={{flex:1}} onClick={save} disabled={saving}>{saving ? "Saving..." : (isNew ? "Add Camera" : "Save")}</Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 // ── Fleet ─────────────────────────────────────────────────────────────────────
 function Fleet({ user, trucks, setTrucks, employees, setEmployees, showToast }) {
   const [branch, setBranch] = useState(user.branch === "All" ? "All" : user.branch);
@@ -8512,7 +9212,8 @@ const SLACK_ALERT_KEYS = [
   { key: "alert_truck_inventory_due",     label: "Truck inventory count due", desc: "Scheduled daily reminder: trucks that haven't had a monthly count. Requires the Supabase Edge Function (see walkthrough)." },
   { key: "alert_truck_oil_due",           label: "Truck oil change due",    desc: "Scheduled daily reminder: trucks approaching their oil change interval. Suppressed if the \"Oil change scheduled\" checkbox is on for that truck." },
   { key: "alert_truck_inspection_due",    label: "Truck state inspection due", desc: "Scheduled daily reminder: trucks with state inspection coming up or expired. Suppressed if the \"State inspection scheduled\" checkbox is on." },
-  { key: "alert_insulation_equipment_due", label: "Insulation equipment due", desc: "Scheduled daily reminder: vacuums, blowers, or trailers overdue for maintenance." }
+  { key: "alert_insulation_equipment_due", label: "Insulation equipment due", desc: "Scheduled daily reminder: vacuums, blowers, or trailers overdue for maintenance." },
+  { key: "alert_camera_overdue",          label: "Camera overdue",          desc: "Scheduled daily reminder: Reveal cameras deployed longer than their overdue threshold (default 60 days)." }
 ];
 
 function SlackSettingsTab({ user, showToast }) {
@@ -10868,7 +11569,7 @@ export default function App() {
     );
   }
 
-  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",pull_from_shop:"Pull From Shop",request_veseris:"Request from Veseris",count_my_truck:"Count My Truck",inventory_mgmt:"Inventory Management",equipment:"Equipment",insulation_equipment:"Insulation Equipment",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",resources:"Resources",evaluations:"Evaluations",reports:"Reports Center",slack:"Slack Alerts",settings:"Settings"};
+  const titles = {home:"Dashboard",people:"People",hr:"HR & Onboarding",timeoff:"Time Off & Callouts",pull_from_shop:"Pull From Shop",request_veseris:"Request from Veseris",count_my_truck:"Count My Truck",inventory_mgmt:"Inventory Management",equipment:"Equipment",insulation_equipment:"Insulation Equipment",reveal_cameras:"Reveal Cameras",fleet:"Fleet",inspections:"Inspections",cards:"Credit Cards",documents:"Company Documents",resources:"Resources",evaluations:"Evaluations",reports:"Reports Center",slack:"Slack Alerts",settings:"Settings"};
 
   return (
     <>
@@ -10904,6 +11605,7 @@ export default function App() {
               {navItem("inventory_mgmt","Inventory Management","⚙")}
               {navItem("equipment","Equipment","🔧")}
               {navItem("insulation_equipment","Insulation Equipment","🧰")}
+              {navItem("reveal_cameras","Reveal Cameras","📷")}
               {navItem("fleet","Fleet","◉")}
               {navItem("inspections","Inspections","✓")}
               {navItem("cards","Credit Cards","◆")}
@@ -10941,6 +11643,7 @@ export default function App() {
             {page === "inventory_mgmt"  && <Inventory             user={currentUser} products={products} trucks={trucks} employees={employees} shops={shops} showToast={showToast} />}
             {page === "equipment" && <EquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
             {page === "insulation_equipment" && <InsulationEquipmentPage user={currentUser} employees={employees} showToast={showToast} />}
+            {page === "reveal_cameras" && <RevealCamerasPage user={currentUser} employees={employees} shops={shops} showToast={showToast} />}
             {dataLoaded && page === "fleet" && <Fleet user={currentUser} trucks={trucks} setTrucks={setTrucks} employees={employees} setEmployees={setEmployees} showToast={showToast} />}
             {dataLoaded && page === "inspections" && <InspectionsPage user={currentUser} trucks={trucks} employees={employees} showToast={showToast} />}
             {dataLoaded && page === "cards" && <CardsPage user={currentUser} employees={employees} showToast={showToast} />}
